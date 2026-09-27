@@ -1847,3 +1847,132 @@ HTTP 429 {"code":"1113","message":"余额不足或无可用资源包,请充值�
 
 **唯一可用路径仍然是**：`createTask` + `sendPrompt`（agent turn），8-28 秒/轮。
 
+
+---
+
+## 二十四、第 7 条路径：agent 开终端跑 CLI（失败，架构性）
+
+### 24.1 动机
+
+用户提出：「开一个 agent，agent 开终端，终端跑 CLI」。
+
+**思路**：桥的 `providerId` 是硬编码的，但如果让 agent 自己开终端跑 CLI，
+那就不是桥在发请求 —— 是 CLI 在发，而 CLI 用**它自己的 provider 配置**。
+
+### 24.2 逐步验证（全部实测）
+
+**① 闭源版 `zcode.cjs` 能独立跑**（`node zcode.cjs --version` → `0.16.9`，exit 0）
+
+**② CLI 的配置格式**（从 `legacy-cli-model-config.ts` 提取）：
+
+```ts
+const modelSelectionSchema = z.string().refine(
+  (value) => parseModelTarget(value) !== undefined,
+  { message: "Model references must use provider/model format" },
+);
+const legacyRootSchema = z.object({
+  provider: z.record(z.string(), providerSchema).optional(),
+  model: z.union([
+    modelSelectionSchema,
+    z.object({ main: modelSelectionSchema.optional(), lite: modelSelectionSchema.optional() })
+      .strict(),
+  ]).optional(),
+  small_model: z.never().optional(),
+}).passthrough();
+```
+
+**③ 写入 `C:\Users\Administrator\.zcode\cli\config.json`**（已备份原文件）：
+
+```json
+{
+  "model": { "main": "account:bigmodel-individual-coding-plan/GLM-5.3-Flash" },
+  "plugins": { "enabledPlugins": { ... } }
+}
+```
+
+**④ 跑 CLI** → **8.4 秒后**：
+
+```
+Error: Model creation failed (traceId: f0391134-293e-41a6-a346-124cdd424c6b)
+```
+
+### 24.3 根因（代码级）
+
+**① 抛错点**（`zcode.cjs` 偏移 14993371）：
+
+```js
+try { It = u === null ? Nwn(this, { selection: s }) : void 0 }
+catch (et) { ... Poe(et, U, "Model creation failed") ... }
+
+function Nwn(e, t = {}) {
+  let n = t.selection ?? e.getSessionModelSelection();   // ← 返回了空
+  let o = WC(e, { selection: n, ... });
+  ...
+}
+function WC(e, t) {
+  if (!t.selection) throw Gr(fr.ConfigurationError, "Select a model before continuing");
+  ...
+}
+```
+
+**⇒ CLI 的 `Model creation failed` = 「session 里没有模型选择」。**
+
+**② 配置里的 provider id 被显式跳过**（偏移 16048360，函数 `y7a`）：
+
+```js
+for (let [a, l] of Object.entries(t.provider ?? {})) {
+  let u = a.trim();
+  let f = u === "builtin:bigmodel" ? zQ.bigmodel
+        : u === "builtin:zai"      ? zQ.zai
+        : void 0;
+  if (f) { ...apiKey... continue }
+  if (u.startsWith("builtin:") || u.startsWith("account:") || ...) continue;   // ← 跳过
+  ...
+}
+
+// zQ 的定义（偏移 2538852）
+zQ = { zai: "zai-api", bigmodel: "bigmodel-api" }
+```
+
+**⇒ 配置里只能写 `builtin:bigmodel` / `builtin:zai`，它们指向标准 API provider
+（需要付费 API key）—— `account:*` 是内部 id，会被跳过。**
+
+### 24.4 为什么这条路架构上不成立
+
+```
+CLI 是纯 Node 进程
+  → 无法产出 captcha（需要 Electron renderer 的 DOM + 阿里云 CDN 脚本）
+    → 无法使用 start-plan 免费额度通道
+      → 只能走 builtin:bigmodel（标准 API，需付费 key）
+```
+
+**这不是配置问题，是架构问题。**
+
+### 24.5 但这次探索产出了两个真实的东西
+
+**① 桥现在支持切换 provider（带白名单）—— 这是新能力**
+
+```json
+POST /v1/chat/completions
+{ "providerId": "account:bigmodel-individual-coding-plan", ... }
+```
+
+**若将来购买 Coding Plan，改一个字段即可切换，不需要改代码。**
+（三个 provider 的实测对照已记录在 §二十三。）
+
+**② 排除了第 7 条路径。**
+
+### 24.6 至此已排除的路径（7 条）
+
+| # | 路径 | 死因 |
+|---|---|---|
+| 1 | 裸发上游 | 无服务端会话登记 → 3012 |
+| 2 | `workspace/generateText` | 同上 |
+| 3 | 补客户端签名 | `cRs()` 对 start-plan 代码级禁用 |
+| 4 | 移植 captcha | 产出必须在 renderer；设备指纹 SDK 在 CDN |
+| 5 | 换闭源版 agent | 同构链路，超时 180s vs 20s |
+| 6 | 切换 provider（桥内） | 账户无资源包（429 [1113]） |
+| 7 | **agent 开终端跑 CLI** | **架构性：CLI 是纯 Node，产不出 captcha** |
+
+**唯一可用路径仍然是**：`createTask` + `sendPrompt`（agent turn），8-28 秒/轮。
+
