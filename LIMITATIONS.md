@@ -215,6 +215,22 @@ var yqt = `https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js`
 
 **它加载阿里云 CDN 的 `AliyunCaptcha.js`** —— 浏览器 SDK，**需要 DOM**。
 
+**交叉验证（排除「minify 导致假阴性」这个漏洞）**：
+
+我担心 CLI 是 minify 的、captcha 会不会是**动态拼出来的**。做了反向验证：
+
+| 搜索词 | CLI（zcode.cjs，16 MB） | renderer（styles-*.js，5.64 MB） |
+|---|---|---|
+| `o.alicdn.com` | **0** | 1 |
+| `AliyunCaptcha` | **0** | 4 |
+| `aliyun` | **0** | 有 |
+| `X-Aliyun` | **0** | 有 |
+| `Verify-Param` | **0** | 有 |
+| `Verify-Region` | **0** | 有 |
+
+**CLI 里连 `aliyun` 这个词都不存在。** 动态拼接也需要字面量碎片，
+而**一个碎片都没有**。同一套搜索方法在 renderer 里能命中 —— **证明不是假阴性。**
+
 **`--prompt` 失败的精确抛点我也定位到了**（读打包代码）：
 
 ```js
