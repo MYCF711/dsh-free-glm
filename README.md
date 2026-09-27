@@ -29,15 +29,27 @@ GLM 的免费额度走 `zcode-plan` 通道，而这个通道有**两道门**：
 
 ## 安装（三步）
 
+> **⚠ 国内网络必读**：`github.com` 直连经常超时（实测 `curl 28` 连接失败）。
+> 本仓库的所有下载命令都给了**镜像回退**，直接用镜像那条即可。
+> 镜像前缀：`https://gh-proxy.com/` + 完整 GitHub URL。
+
 ### 步骤 1：部署 ZCode 开源版实例（含桥）
 
 ```powershell
+# 直连（能连通时）
 git clone https://github.com/MYCF711/dsh-free-glm.git
+
+# 国内推荐：走镜像
+git clone https://gh-proxy.com/https://github.com/MYCF711/dsh-free-glm.git
+
 cd dsh-free-glm
 pwsh -File deploy-zcode-instance.ps1
 ```
 
-这个脚本做四件事：clone 上游 ZCode 开源版 → 应用桥补丁 → 装依赖（约 2.8GB）
+`deploy-zcode-instance.ps1` 内部**已自带镜像回退** —— 它会先试直连，
+失败自动换 `gh-proxy.com`，所以你不需要手动处理。
+
+脚本做四件事：clone 上游 ZCode 开源版 → 应用桥补丁 → 装依赖（约 2.8GB）
 → 构建。**耗时较长**（视网络 10-40 分钟），但只需做一次。
 
 <details>
@@ -63,18 +75,21 @@ $t = 'E:\ZCode-official'
 ### 步骤 2：安装插件
 
 ```powershell
-# 从本仓库的 Release 下载 tgz，然后：
-dsh plugin --profile <你的profile> add .\dsh-zcode-bridge-0.2.0.tgz
-```
+# 直连
+dsh plugin --profile <你的profile> add https://github.com/MYCF711/dsh-free-glm/releases/download/v0.2.0/dsh-zcode-bridge-0.2.0.tgz
 
-或者直接指向本地文件：
+# 国内推荐：走镜像
+dsh plugin --profile <你的profile> add https://gh-proxy.com/https://github.com/MYCF711/dsh-free-glm/releases/download/v0.2.0/dsh-zcode-bridge-0.2.0.tgz
 
-```powershell
+# 或者先下载再装本地文件
 dsh plugin --profile web add file:D:/dsh-free-glm/dsh-zcode-bridge-0.2.0.tgz
 ```
 
-> **注意**：`dsh plugin add` 装**同一版本号**的 tgz 时 pnpm 会命中缓存装回旧产物。
-> 换了新版本先 bump 版本号。
+> **注意**：
+> - `dsh plugin add` 装**同一版本号**的 tgz 时 pnpm 会命中缓存装回旧产物。
+>   换了新版本先 bump 版本号。
+> - **不要手动拷贝到 `node_modules`** —— 那样绕过 lockfile，下次 `pnpm install`
+>   会被覆盖（实测踩过：版本莫名倒退）。
 
 ### 步骤 3：重启 DSH
 
@@ -235,6 +250,15 @@ DSH 是由 `dsh-launcher.exe` 这个**长驻进程**拉起的，它持有**创�
 |---|---|
 | 0.2.0 | 工具调用（提示词桥接）+ 空回复明确报错 + provider 显示修复 |
 | 0.1.x | 基础对话链路 |
+
+**完整开发历史**（含每次修复的 diff 与根因说明）在 [`dev-history` 分支](https://github.com/MYCF711/dsh-free-glm/tree/dev-history)：
+
+```
+e34bd55 chore: 移除误提交的提交信息临时文件
+c1cf51e feat: 打通工具调用（提示词桥接）—— GLM 可在 DSH 中真正调用工具
+b95ce9d fix: 空回复不再当成功、工具块降级为历史记录、清理死代码
+fb0551c fix: 修复模型设置页不显示 provider，清理死代码
+```
 
 ---
 
