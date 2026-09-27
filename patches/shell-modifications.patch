@@ -759,6 +759,153 @@ index 9de80f6..58e2427 100644
          hasDisposedHostResources = false;
          disposeHostResourcesInFlight = null;
          const agentWarmupTargets =
+diff --git a/packages/desktop/src/main/index.ts b/packages/desktop/src/main/index.ts
+index c856324..4042e6b 100644
+--- a/packages/desktop/src/main/index.ts
++++ b/packages/desktop/src/main/index.ts
+@@ -3,6 +3,7 @@ import { createLocalTtftExporter } from "./localTtftExporter.js";
+ import "./desktopEarlyDataBaseDirBootstrap.js";
+ import "./desktopEarlyChromiumHardwareAccelerationBootstrap.js";
+ import { powerMonitor, powerSaveBlocker } from "electron";
++import { installHeadlessDialogSuppressor } from "./headlessDialogSuppressor.js";
+ import { crashCapturePaths } from "./appCrashCaptureBootstrap.js";
+ import { armsInitPromise } from "./appARMSBootstrap.js";
+ import {
+@@ -142,6 +143,7 @@ import {
+   showCurrentWindowFromDock,
+   syncApplicationUnreadBadge,
+   handleDesktopWindowCloseRequest,
++  isHeadlessMode,
+ } from "./desktopWindowLifecycle.js";
+ import { resolveZCodeBuiltinProviderConfigFilePath } from "./desktopProviderConfig.js";
+ import {
+@@ -258,6 +260,56 @@ if (!app.isPackaged && process.env.ZCODE_DISABLE_FIXED_REMOTE_DEBUGGING_PORT !==
+   app.commandLine.appendSwitch("remote-debugging-port", "9229");
+ }
+ 
++// ── 无头模式的资源裁剪（2026-09-27 实测：省约 154 MB）─────────────────
++//
++// 桥跑在无头后台，**没有窗口、没有用户交互**。但 Chromium 仍会按默认
++// 策略把一整套媒体服务拉起来：
++//
++//   video_capture.mojom.VideoCaptureService   95 MB
++//   audio.mojom.AudioService                  59 MB
++//
++// 这两个服务在无头桥场景下**完全用不到** —— 桥只做「HTTP 收请求 →
++// 驱动壳内会话 → 回文本」，不采集视频、不播放音频。
++//
++// 用 `disable-features` 关掉对应的 Blink 特性，Chromium 就不会为它们
++// 派生 utility 进程。
++//
++// ⚠ 只在无头模式生效（`ZCODE_HEADLESS=1`）—— 有窗口的正式使用下
++//   用户可能真要看视频/听音频，不能一刀切。
++//
++// ⚠ 用 `appendSwitch` 追加而不是覆盖：这些开关必须在 app ready **之前**
++//   设好，否则 Chromium 已经按默认特性集起了进程，改了也没用。
++//   （本文件顶部本来就是模块顶层执行，满足这个前提。）
++if (process.env["ZCODE_HEADLESS"] === "1") {
++  // ⚠ 这些特性名**不是凭记忆写的** —— 2026-09-27 从
++  //   `node_modules/electron/dist/electron.exe`（Electron 41.0.3 /
++  //   Chrome 146.0.7680.80，212 MB）里逐字节检索确认过存在。
++  //   写错名字不会报错，只是**静默无效** —— 那比不写更糟。
++  const headlessDisabledFeatures = [
++    // 媒体采集与播放：无头桥只做「HTTP → 壳内会话 → 回文本」，用不到。
++    "MediaCapture",
++    "MediaRecorder",
++    "AudioServiceOutOfProcess",
++    "WebAudio",
++    // 无窗口时用不到
++    "PictureInPicture",
++    "HardwareMediaKeyHandling",
++  ];
++  app.commandLine.appendSwitch("disable-features", headlessDisabledFeatures.join(","));
++
++  // ⚠ **不要** `appendSwitch("disable-renderer-backgrounding")`。
++  //
++  //   这是**布尔开关**：Chromium 只看它在不在，不看值。写上它反而会让
++  //   renderer **保持前台优先级** —— 与我们想要的（无头时让它降级、
++  //   省出 CPU 和内存）完全相反。
++  //
++  //   实测踩过：一开始写了 `appendSwitch("disable-renderer-backgrounding", "0")`，
++  //   以为值传 0 就是"不启用"，实际是"启用"。已删除。
++  //
++  // ⚠ 也**不要** `--disable-gpu`：Electron 的 renderer 在没有 GPU 进程时
++  //   会退回软件光栅化，反而更吃内存与 CPU；而且阿里云 captcha 依赖 WebGL。
++}
++
+ app.setName(runtimeApplicationName);
+ if (runtimeHomePath) {
+   app.setPath("home", runtimeHomePath);
+@@ -868,6 +920,10 @@ function resolveExternalWorkspaceConfirmationCopy() {
+ }
+ 
+ function focusForceUpdateGateWindow() {
++  // 无头后台模式：不因强制更新而把窗口翻出来打扰用户。
++  if (isHeadlessMode()) {
++    return;
++  }
+   const gateWindow = getApplicationWindowsExcludingCuaIndicator()[0];
+   if (!gateWindow) {
+     return;
+@@ -1912,7 +1968,7 @@ app.on("second-instance", (_event, argv, _workingDirectory, additionalData) => {
+   }
+ 
+   const win = getApplicationWindowsExcludingCuaIndicator()[0];
+-  if (win) {
++  if (win && !isHeadlessMode()) {
+     if (win.isMinimized()) {
+       win.restore();
+     }
+@@ -1925,6 +1981,11 @@ app.on("second-instance", (_event, argv, _workingDirectory, additionalData) => {
+ 
+ app.whenReady().then(async () => {
+   markMainLaunchAppReady();
++  // 无头模式：立即接管原生弹窗出口。
++  //
++  // 必须放在最前面 —— 后续任一弹窗（架构告警、强制更新、深链确认…）
++  // 在无人可点按钮的情况下会让主进程 `await` 永久挂起，连桥都起不来。
++  installHeadlessDialogSuppressor(logger);
+   installLocalMediaPreviewProtocol(session.defaultSession.protocol, {
+     isPathAuthorized: localMediaPreviewPathRegistry.isAuthorized,
+   });
+@@ -2044,17 +2105,26 @@ app.whenReady().then(async () => {
+       ),
+     () => showCurrentWindowFromDock(primaryWindowCoordinator),
+   );
+-  createWindowsDesktopTray({
+-    getLocale: () => currentApplicationLocale,
+-    showCurrentWindow: () =>
+-      primaryWindowCoordinator.ensurePrimaryWindow("tray-show-current-window"),
+-    executeDesktopCommand: executeDesktopCommandForApp,
+-    quitApp: () => {
+-      markExplicitQuit("tray-quit");
+-      app.quit();
+-    },
+-    logger,
+-  });
++  // 无头后台模式：不创建托盘图标（右下角通知区）。
++  //
++  // ★ 妥协点：托盘是退出/唤出窗口的唯一入口，无头模式下没有它 ——
++  //   退出只能靠任务管理器，或 `Stop-Process`。这是后台化的必然代价。
++  //   若要保留退出入口，可以改成 `ZCODE_HEADLESS=1` 但手动允许托盘。
++  if (!isHeadlessMode()) {
++    createWindowsDesktopTray({
++      getLocale: () => currentApplicationLocale,
++      showCurrentWindow: () =>
++        primaryWindowCoordinator.ensurePrimaryWindow("tray-show-current-window"),
++      executeDesktopCommand: executeDesktopCommandForApp,
++      quitApp: () => {
++        markExplicitQuit("tray-quit");
++        app.quit();
++      },
++      logger,
++    });
++  } else {
++    logger.info("[headless] tray disabled (ZCODE_HEADLESS=1)");
++  }
+ 
+   registerPlatformIpcHandlers({
+     fetchHelpConfig: readHelpConfig,
 diff --git a/packages/services/src/zcode-agent/zcodeAgent.ts b/packages/services/src/zcode-agent/zcodeAgent.ts
 index 719985a..94e7743 100644
 --- a/packages/services/src/zcode-agent/zcodeAgent.ts
@@ -870,6 +1017,58 @@ index 719985a..94e7743 100644
    onDynamicSessionRuntimePreferencesRequest(): Event<ZCodeAgentSessionRuntimePreferencesRequest>;
    /**
     * CLI 进程级资源样本，带 services 打的 lane 标签（CLI 自己不知道 lane）。
+diff --git a/packages/services/src/zcode-agent/zcodeAgentProcessManager.ts b/packages/services/src/zcode-agent/zcodeAgentProcessManager.ts
+index 7a8837f..beaa31a 100644
+--- a/packages/services/src/zcode-agent/zcodeAgentProcessManager.ts
++++ b/packages/services/src/zcode-agent/zcodeAgentProcessManager.ts
+@@ -1290,12 +1290,47 @@ export class ZCodeAgentProcessManager {
+         );
+         return;
+       }
++      // ── 并发连坐护栏（2026-09-27 新增，实测发现的真实风险）────────────
++      //
++      // 原实现**无条件**回收进程树。理由（下面的原注释）在**串行**时代是
++      // 正当的：超时说明协议链路不可信，不回收的话后续请求会继续复用坏
++      // client 反复超时。
++      //
++      // 但桥改成并发后，同一条连接上会**同时挂着多个在飞请求** ——
++      // 其中任意一个打满 3 分钟协议超时，就会把全部在飞请求一起带走
++      // （进程树被杀 → 它们的 promise 全 reject → 桥侧返回空文本）。
++      //
++      // 时序上这不是理论风险：协议默认超时 3 分钟
++      // （`DEFAULT_ZCODE_PROTOCOL_REQUEST_TIMEOUT_MS`），桥的 turn 超时
++      // 180 秒 —— 两者几乎同一量级，一条慢请求就能把别人一起拖下水。
++      //
++      // ⇒ 分两种情况：
++      //   - 还有别的在飞请求 → **只让当前请求失败**，不动进程树，
++      //     让其它请求有机会正常跑完，避免连坐。
++      //   - 就它一个 → 按原逻辑回收进程树，防止坏 client 被复用。
++      //
++      // 判据用 `client.pendingOperationRequestCount`（client 自带的在飞计数，
++      // 空闲回收逻辑第 666 行也在用它）—— **不自己造计数**，避免两处状态
++      // 不一致。超时的那个请求此刻已被结算，所以 `> 0` 表示还有别人在飞。
++      const stillInFlight = managed.client.pendingOperationRequestCount > 0;
++      if (stillInFlight) {
++        warnLog("ZCode agent request timed out; keeping client (other requests in flight)", {
++          workspaceKey,
++          method: event.method,
++          requestId: event.requestId,
++          timeoutMs: event.timeoutMs,
++          pid: child.pid,
++          pendingOperationRequestCount: managed.client.pendingOperationRequestCount,
++        });
++        return;
++      }
+       warnLog("ZCode agent request timed out; disposing stale protocol client", {
+         workspaceKey,
+         method: event.method,
+         requestId: event.requestId,
+         timeoutMs: event.timeoutMs,
+         pid: child.pid,
++        pendingOperationRequestCount: managed.client.pendingOperationRequestCount,
+       });
+       this.processesByWorkspaceKey.delete(workspaceKey);
+       this.reportRuntimeUnavailable(managed);
 diff --git a/packages/services/src/zcode-agent/zcodeAgentService.ts b/packages/services/src/zcode-agent/zcodeAgentService.ts
 index 9b33c71..de03ab9 100644
 --- a/packages/services/src/zcode-agent/zcodeAgentService.ts
