@@ -1,0 +1,1425 @@
+diff --git a/packages/desktop/src/host/index.ts b/packages/desktop/src/host/index.ts
+index 9de80f6..25692ff 100644
+--- a/packages/desktop/src/host/index.ts
++++ b/packages/desktop/src/host/index.ts
+@@ -15,6 +15,9 @@
+  */
+ import { createHostDatabaseStartup } from "./hostDatabaseStartup.js";
+ import { randomUUID } from "node:crypto";
++import { appendFileSync } from "node:fs";
++import { homedir } from "node:os";
++import { join } from "node:path";
+ import {
+   MessagePortProtocol,
+   ChannelServer,
+@@ -48,6 +51,10 @@ import {
+   type ZCodeAgentV4ClientMode,
+   collectServiceMemoryDiagnostics,
+ } from "@zcode/services";
++// `getAccountRequestAuthService` 是「Local Host 进程内能力」，按设计
++// 不走通用 RPC Channel（见 services/src/node.ts 的注释），所以从 ./node
++// 次入口取，而不是包主入口。
++import { getAccountRequestAuthService } from "@zcode/services/node";
+ import {
+   createLocalServices,
+   getOffPeakRequestAuthBuilder,
+@@ -122,6 +129,7 @@ import {
+ import { watchCronRunBotDelivery } from "./cronBotDelivery.js";
+ import { createHostRemoteWorkspaceProxyState } from "./hostRemoteWorkspaceProxyState.js";
+ import { createRemoteWorkspaceServiceCollection } from "./remoteWorkspaceServiceCollection.js";
++import { createZCodeBridge, parseMcpServersFromEnv, type ZCodeBridge } from "./zcodeBridgeServer.js";
+ import { getRemoteProviderProvisioningExecutor } from "./remoteProviderProvisioningService.js";
+ import { createRemotePromptAttachmentTransferService } from "./promptAttachmentTransferService.js";
+ import { shouldReportHostConsoleError, stringifyHostLogArg } from "./hostLog.js";
+@@ -1589,6 +1597,8 @@ let activeServices: ServiceCollection | null = null;
+ let activeHostApiNetworkTransport: HostApiNetworkTransport | null = null;
+ /** 本地 host services 的资源遥测订阅；远端连接的订阅由各自的 connection handle 持有。 */
+ let activeLocalResourceTelemetry: IDisposable | null = null;
++/** 免费额度 HTTP 桥实例（ZCODE_BRIDGE=1 时启动）。 */
++let activeZCodeBridge: ZCodeBridge | null = null;
+ // 资源管理器采样只在 main 请求时执行一次，Host 不维护任何周期定时器。
+ const hostResourceUsageResponder = createHostResourceUsageResponder({
+   getAgentService: () => activeServices?.getOptional(IZCodeAgentService),
+@@ -1853,8 +1863,27 @@ const windowHostControllerRuntime = createWindowHostControllerRuntime({
+   },
+ });
+ 
++/**
++ * 静默后台模式开关（`ZCODE_QUIET=1`）。
++ *
++ * 开启后跳过**纯诊断性质**的后台常驻订阅 —— 这些订阅只服务于本地遥测面板，
++ * 对模型调用链路零贡献，却会让日志每 60 秒刷一批 `perf_* flushed` /
++ * `memory role=...`（实测：3 分钟产生 ~60 行噪音）。
++ *
++ * 保留的是功能性订阅（task index 同步、session 广播、模型选择），
++ * **不要**在这里加它们的开关 —— 那些一关就会破坏会话。
++ */
++function isQuietMode(): boolean {
++  return process.env["ZCODE_QUIET"] === "1";
++}
++
+ function wireLocalResourceTelemetry(services: ServiceCollection): void {
+   activeLocalResourceTelemetry?.dispose();
++  if (isQuietMode()) {
++    activeLocalResourceTelemetry = null;
++    logger.info("[quiet] local resource telemetry disabled (ZCODE_QUIET=1)");
++    return;
++  }
+   activeLocalResourceTelemetry = registerHostServiceResourceTelemetry({
+     services,
+     postMessage: (message) => parentPort?.postMessage(message),
+@@ -1863,6 +1892,604 @@ function wireLocalResourceTelemetry(services: ServiceCollection): void {
+   });
+ }
+ 
++/**
++ * 免费额度 HTTP 桥（可选，默认关闭）。
++ *
++ * 用途：把**只有本进程能走通**的免费额度通道（`account:bigmodel-start-plan` + captcha）
++ * 暴露成本地 HTTP 接口，供外部程序（如 DSH 插件）调用。
++ *
++ * 为什么必须在这里做：
++ *   - 该通道强制要求阿里云 captcha，而 captcha 只能在渲染进程里跑（需要 DOM + CDN 脚本）；
++ *   - 请求由本 host 发出，渲染进程经 `interaction/requestProviderRuntimeHeaders` 回传验证头；
++ *   - 外部进程无法复用这条链：`app-server` 只支持 `--stdio`（父子私有管道），
++ *     而独立 spawn 的 app-server 走 `standalone` 路径——该路径硬编码只支持
++ *     `individual-coding-plan` 且永不产 captcha 头。
++ *
++ * 开关：环境变量 `ZCODE_BRIDGE=1`（默认关闭，避免影响正常使用）。
++ * 端口：随机分配并写入 `<dataBaseDir>/.zcode/v2/bridge-port.json`（含 token）。
++ */
++async function startZCodeBridgeIfEnabled(services: ServiceCollection): Promise<void> {
++  if (process.env["ZCODE_BRIDGE"] !== "1") return;
++
++  const taskService = services.getOptional(IZCodeTaskService);
++  if (!taskService) {
++    logger.warn("ZCode bridge skipped: IZCodeTaskService unavailable");
++    return;
++  }
++
++  const reasoningLevel = process.env["ZCODE_BRIDGE_REASONING_LEVEL"]?.trim() || "max";
++  const turnTimeoutMs = Number(process.env["ZCODE_BRIDGE_TIMEOUT_MS"] ?? "") || 180_000;
++  // 外部工具（MCP HTTP/SSE）—— DSH 工具面进入 ZCode 会话的唯一通道。
++  const mcpServers = parseMcpServersFromEnv(process.env["ZCODE_BRIDGE_MCP"]);
++  if (mcpServers) {
++    logger.info(
++      `[zcode-bridge] MCP servers injected: ${mcpServers.map((s) => `${s.name}(${s.type})`).join(", ")}`,
++    );
++  }
++
++  /**
++   * 【本地扩展】捕获壳每次产出的 provider auth 材料（含 captcha 头）。
++   *
++   * ## 为什么
++   *
++   * start-plan（免费额度）通道每次模型请求都必须带阿里云 captcha 头，而它只能
++   * 在渲染进程里产出。这些材料原本只回给壳内 agent，桥拿不到 —— 于是桥只能
++   * 退化成"让壳替它跑一轮对话"（工具面全丢、壳内工具会真执行、180 秒超时）。
++   *
++   * 通过 `registerProviderAuthMaterialObserver`（只观察、不应答，不影响壳内
++   * agent）把材料抄一份存下来，桥就有机会**自己发请求**。
++   *
++   * ## 缓存策略：只留最新一份
++   *
++   * captcha param 是一次性的（每次验证都新 mint，重复提交会撞 F008），所以
++   * **缓存旧值没有意义、还可能有害**。这里只保留最近一份，供"先看到材料存在"
++   * 这一步验证；真正转发时应改为**每次请求现取**。
++   */
++  const latestAuthMaterial = {
++    value: undefined as
++      | {
++          providerId: string;
++          modelId: string;
++          apiKey?: string;
++          headers?: Record<string, string>;
++          rawRequestAuth?: { apiKey?: string; headers?: Record<string, string> };
++          requestShape?: unknown;
++        }
++      | undefined,
++    at: 0,
++  };
++  const agentService = services.getOptional(IZCodeAgentService);
++  if (agentService) {
++    agentService.registerProviderAuthMaterialObserver((material) => {
++      latestAuthMaterial.value = material;
++      latestAuthMaterial.at = Date.now();
++      logger.info("[zcode-bridge] 捕获到 provider auth 材料（旁路）", {
++        providerId: material.providerId,
++        modelId: material.modelId,
++        hasApiKey: Boolean(material.apiKey),
++        headerNames: Object.keys(material.headers ?? {}),
++      });
++    });
++  } else {
++    logger.warn("[zcode-bridge] IZCodeAgentService 不可用，auth 材料旁路未注册");
++  }
++
++  try {
++    activeZCodeBridge = await createZCodeBridge({
++      dataBaseDir: resolveZCodeDataBaseDir(),
++      reasoningLevel,
++      ...(mcpServers === undefined ? {} : { mcpServers }),
++      log: (message, detail) => logger.info(`[zcode-bridge] ${message}`, detail),
++      /**
++       * 读最近一次捕获的 auth 材料（旁路）。
++       *
++       * 与 `resolveAuthMaterial` 的区别：那个只能拿到 apiKey（不带 captcha 头），
++       * 这个拿的是壳**实际用于发请求**的完整材料 —— 含 captcha。诊断端点优先用它。
++       */
++      getLatestAuthMaterial: () => latestAuthMaterial.value,
++      /**
++       * 主动 mint 新鲜材料（含 captcha 头）。
++       *
++       * captcha param 一次性，观察到的旧材料复用会撞 3007；要自己发请求就必须
++       * 每次现 mint。具体机制见 `mintProviderAuthMaterial` 的说明。
++       */
++      mintAuthMaterial: async ({ providerId, modelId, workspacePath }) => {
++        const agent = services.getOptional(IZCodeAgentService);
++        if (!agent) return undefined;
++        return await agent.mintProviderAuthMaterial({
++          // ⚠ workspacePath 必须与 renderer 订阅的那个桶一致。
++          //
++          // captcha 事件面按 resolveWorkspaceKey(workspace) 分桶，不同 key 是
++          // **不同的 Emitter 实例**；renderer 回调里还有一层
++          // requestBelongsToWorkspace 路径过滤。用错的路径 → 事件投递到没人
++          // 监听的桶 → 稳定 20 秒超时，且 renderer 侧连 request.received 都
++          // 不打日志（极易被误判为"captcha 组件没渲染"）。
++          //
++          // 调用方（桥）传的是它自己跑会话链路用的同一个路径，两者天然一致。
++          // 缺省才退回数据根目录（仅为兼容，不保证能收到应答）。
++          workspace: {
++            workspacePath: workspacePath?.trim() || resolveZCodeDataBaseDir(),
++          },
++          providerId,
++          modelId,
++        });
++      },
++      /**
++       * 解析请求鉴权材料（`{ apiKey, headers }`），供诊断端点用。
++       *
++       * ## 为什么需要它
++       *
++       * 桥现在走会话链路（`runConversation`），把壳当"对话代理"用 ——
++       * 工具面进不去、壳内工具会真的执行（180 秒超时的根源）、且会话状态
++       * 导致必须串行。
++       *
++       * 若这条路能拿到完整的 `{ apiKey, headers }`，桥就能**裸发标准 HTTP
++       * 请求**到上游：工具面原生可用、无壳内工具干扰、可并发。
++       *
++       * ## 材料的两个来源（缺一不可）
++       *
++       *   1. `apiKey` —— `IAccountRequestAuthService.resolveCurrent()`
++       *   2. captcha 头（`X-Aliyun-Captcha-Verify-Param` / `-Region`）
++       *      —— 只能在 Renderer 里产出，经 `providerRuntimeHeaders.request`
++       *      会话事件面广播、由 Renderer 回调应答。
++       *
++       * 本实现只覆盖第 1 部分。第 2 部分需要在诊断端点里另行驱动 Renderer，
++       * 尚未接通 —— 所以当前端点用于**验证路线可行性**（apiKey 是否可独立取得），
++       * 而不是直接拿去发请求。
++       */
++      resolveAuthMaterial: async ({ providerId, modelId }) => {
++        const authService = getAccountRequestAuthService(services);
++        if (!authService) {
++          logger.warn("ZCode bridge diagnostics: IAccountRequestAuthService unavailable");
++          return undefined;
++        }
++        // start-plan 的 accountAccess 是静态可构造的（见 zcodeProviderAccountAccessSchema）。
++        const accountAccess = {
++          type: "zhipu-account" as const,
++          accountType: "bigmodel" as const,
++          mode: "start-plan" as const,
++          entitled: true,
++        };
++        const material = await authService.resolveCurrent({
++          providerId,
++          modelId,
++          accountAccess,
++          reason: "model-request",
++        });
++        return material;
++      },
++      /**
++       * 走**会话链路**（与界面同款），而非 workspace/generateText。
++       *
++       * 实测：同一实例同一时刻，界面路径 200，generateWorkspaceText 走 3012。
++       * 所以这里 createTask → sendPrompt，与 `botsService.ts:4868` 同构。
++       */
++      runConversation: async (params) => {
++        const workspacePath = params.workspacePath;
++        const modelSelection = {
++          providerId: params.providerId,
++          modelId: params.modelId,
++          options: { reasoningLevel: params.reasoningLevel ?? reasoningLevel },
++        };
++
++        // 1. 创建 task（会同步建 ZCode session）
++        //
++        //    mcpServers：外部工具注入通道。`sendPrompt` 只有 toolDenylist
++        //    没有 allowlist，所以 DSH 的工具面只能经 MCP 进入会话。
++        //
++        //    ⚠ `headers` 在本模块是可选的（`ZCodeBridgeMcpServer.headers?`），
++        //      而壳内 `createTask` 要求它必填。桥这一侧没有头就显式给空数组，
++        //      而不是把 undefined 递进去（曾因此报 TS2345）。
++        const task = await taskService.createTask({
++          workspacePath,
++          modelSelection,
++          v4Create: true,
++          ...(params.mcpServers === undefined
++            ? {}
++            : {
++                mcpServers: params.mcpServers.map((server) => ({
++                  ...server,
++                  headers: server.headers ?? [],
++                })),
++              }),
++        });
++        const taskId = task.taskId;
++
++        // 2a.【工具面透传】订阅结构化流事件，收集模型发起的工具调用。
++        //
++        // ## 为什么能这么做（子代理实读代码确认）
++        //
++        // `IZCodeTaskService.onDynamicStreamEvent(taskId)` 推的 `ZCodeStreamEvent`
++        // 是一等公民事件：其中的 `tool_call` 带 `toolId` / `toolName` / `input`
++        // （完整参数），`tool_call_update` 带 `status` / `content` / `error`。
++        //
++        // 这条通道**纯进程内**（adapter 的 `getGlobalTaskEmitter` 直接 fire），
++        // 桥与 agent 同进程，所以能直接订阅 —— 不需要 MCP、不需要 RPC。
++        //
++        // ## 用途
++        //
++        // 让工具调用以**结构化**形式回到 DSH，而不是靠提示词模拟。
++        // 这是「工具面原生可用」的正道：模型调什么、参数是什么，都是上游自己
++        // 产出的，不用猜、不用解析文本。
++        const capturedToolCalls: Array<{
++          toolId: string;
++          toolName?: string;
++          input: unknown;
++          status?: string;
++          output?: unknown;
++          error?: string;
++        }> = [];
++        const toolIndexById = new Map<string, number>();
++
++        const streamSub = taskService.onDynamicStreamEvent(taskId)((event) => {
++          const record = event as {
++            type?: unknown;
++            toolId?: unknown;
++            toolName?: unknown;
++            input?: unknown;
++            status?: unknown;
++            content?: unknown;
++            error?: unknown;
++          };
++          // 【诊断】把每个流事件落到文件 —— 用文件而不是 logger，
++          // 因为 host logger 的签名可能吞掉多参数调用，且事件频率高。
++          if (params.allowTools === true) {
++            try {
++              appendFileSync(
++                join(resolveZCodeDataBaseDir(), "bridge-stream-events.ndjson"),
++                `${JSON.stringify({
++                  at: Date.now(),
++                  taskId,
++                  type: String(record.type),
++                  toolId: record.toolId,
++                  toolName: record.toolName,
++                  keys: Object.keys(record),
++                })}\n`,
++              );
++            } catch {
++              // 诊断失败不影响主流程。
++            }
++          }
++          if (record.type === "tool_call") {
++            const toolId = typeof record.toolId === "string" ? record.toolId : "";
++            if (toolId.length === 0) return;
++            if (!toolIndexById.has(toolId)) {
++              toolIndexById.set(toolId, capturedToolCalls.length);
++              capturedToolCalls.push({
++                toolId,
++                ...(typeof record.toolName === "string" ? { toolName: record.toolName } : {}),
++                input: record.input,
++              });
++            }
++            return;
++          }
++          if (record.type === "tool_call_update") {
++            const toolId = typeof record.toolId === "string" ? record.toolId : "";
++            const index = toolIndexById.get(toolId);
++            if (index === undefined) return;
++            const entry = capturedToolCalls[index];
++            if (entry === undefined) return;
++            // 就地补全：update 会先后带来 name / status / output。
++            if (entry.toolName === undefined && typeof record.toolName === "string") {
++              entry.toolName = record.toolName;
++            }
++            if (entry.input === undefined && record.input !== undefined) {
++              entry.input = record.input;
++            }
++            if (typeof record.status === "string") {
++              entry.status = record.status;
++            }
++            if (record.content !== undefined) {
++              entry.output = record.content;
++            }
++            if (typeof record.error === "string") {
++              entry.error = record.error;
++            }
++          }
++        });
++
++        // 2. 订阅终态（拿回复结束信号）
++        let settled = false;
++        let resolveTerminal: () => void = () => {};
++        const terminal = new Promise<void>((resolve) => {
++          resolveTerminal = resolve;
++        });
++        const terminalSub = taskService.onDynamicTaskTerminalOutcome(taskId)(() => {
++          if (!settled) {
++            settled = true;
++            resolveTerminal();
++          }
++        });
++
++        try {
++          // 3. 发送 prompt —— 多条消息拼成首条输入
++          //    （sendPrompt 一次发一条用户输入；system 用前置说明承载）
++          //
++          // ★ 必须显式声明「这是一次代答，不要动工具」（实测踩过）。
++          //
++          //   桥把上游消息拍平成 `User: ...` / `Assistant: ...` 的纯文本，
++          //   作为**一条用户输入**发进会话。若不说明，模型会把这段文本当成
++          //   真实对话现场，进而**自作主张调用壳内工具**（Bash/Read/Glob…），
++          //   而壳内工具会真的执行 —— 结果是回复迟迟不产生，一直挂到
++          //   180 秒超时并返回空文本。
++          //
++          //   实测证据：带工具往返历史的多轮请求耗时 69s（简单请求仅 13s），
++          //   且模型回复里出现"重新列过了""需要的话我可以进去看看"这类
++          //   明显在执行真实验证的语气；日志里 `bridge.chat.completed`
++          //   反复出现 durationMs≈180000 且 textLength=0。
++          const bridgePreamble = params.allowTools === true
++            // 【实验模式】放开工具：不注入"不要调用工具"，让模型自由调用。
++            // 用途是验证工具面透传（捕获结构化 tool_call）。
++            ? "[桥接模式] 下面是一段待续写的对话记录。请输出下一条 assistant 回复。\n\n"
++            : "[桥接模式] 下面是一段待续写的对话记录。"
++              + "请**只输出**下一条 assistant 回复的正文，不要调用任何工具，"
++              + "不要执行命令，不要读取文件 —— 工具由发起方负责，"
++              + "你只需基于记录中已有的信息作答。\n\n";
++          const systemParts = params.messages
++            .filter((m) => m.role === "system")
++            .map((m) => m.content);
++          const conversation = params.messages
++            .filter((m) => m.role !== "system")
++            .map((m) => `${m.role === "assistant" ? "Assistant" : "User"}: ${m.content}`)
++            .join("\n");
++          const content =
++            bridgePreamble
++            + (systemParts.length > 0 ? `${systemParts.join("\n")}\n\n` : "")
++            + conversation;
++
++          const traceId = `dsh-bridge-${randomUUID()}`;
++          await taskService.sendPrompt({
++            taskId,
++            traceId,
++            content,
++            modelSelection,
++            // ★ 禁用壳内工具体（双保险，与 bridgePreamble 配合）。
++            //
++            //   名称取自 `@zcode/shared` 的 `ZCODE_KNOWN_TOOL_NAMES`。
++            //   禁用范围 = 一切**有真实副作用**的家族：
++            //     shell / 文件写 / agent 派生 / 工作流 / node-repl / 后台任务控制。
++            //
++            //   为什么不禁全部：纯读工具留着无害，且万一模型确实需要核对
++            //   记录里提到的文件，读一次比 180 秒卡死更好。
++            //   但**写与执行必须禁** —— 桥是"代答"通道，不应该经由模型产生
++            //   任何磁盘/进程副作用，那既违背调用方预期，也是超时的主要来源。
++            //
++            //   【实验模式】`allowTools: true` 时不传 denylist —— 放开全部工具，
++            //   用于验证工具面透传（模型真的调用 → 桥捕获结构化事件）。
++            //   只在明确要求时启用：壳内工具会真的执行。
++            ...(params.allowTools === true
++              ? {}
++              : {
++                  toolDenylist: [
++                    // shell
++                    "Bash",
++                    // 文件写
++                    "Write",
++                    "Edit",
++                    "ApplyPatch",
++                    // agent / 工作流（会产生长任务）
++                    "Agent",
++                    "Task",
++                    "CreateWorkflow",
++                    "AmendWorkflow",
++                    "submit_result",
++                    // node repl
++                    "js",
++                    "js_reset",
++                    "js_add_node_module_dir",
++                    "mcp__node_repl__js",
++                    "mcp__node_repl__js_reset",
++                    "mcp__node_repl__js_add_node_module_dir",
++                    // 会阻塞等人的交互工具
++                    "AskUserQuestion",
++                  ],
++                }),
++          });
++
++          // 4. 等终态（或超时）
++          await Promise.race([
++            terminal,
++            new Promise<void>((resolve) => setTimeout(resolve, turnTimeoutMs)),
++          ]);
++
++          // 5. 读回复（快照里含持久化的消息列表）
++          const snapshot = await taskService.getTaskSnapshot({
++            taskId,
++            workspacePath,
++            messageLimit: 50,
++          });
++          const text = extractAssistantText(snapshot);
++          // 【工具面透传】快照里持久化了结构化工具调用，事后再拉也拿得到
++          // （不依赖事件订阅的时机与实例一致性 —— 见 extractToolCalls 的说明）。
++          const snapshotToolCalls = extractToolCalls(snapshot);
++          // 【诊断】把快照的 assistant 消息结构落盘 —— 用于确认真实字段名，
++          // 而不是靠类型声明的猜测（第一版按 `tools` 猜，实测没拿到）。
++          if (params.allowTools === true) {
++            try {
++              const s = snapshot as {
++                messages?: Array<Record<string, unknown>>;
++              };
++              const shape = (s?.messages ?? [])
++                .filter((m) => (m as { role?: unknown }).role === "assistant")
++                .map((m) => ({
++                  keys: Object.keys(m),
++                  content: typeof m.content,
++                  tools: Array.isArray(m.tools) ? (m.tools as unknown[]).length : typeof m.tools,
++                  parts: Array.isArray(m.parts) ? (m.parts as unknown[]).length : typeof m.parts,
++                  toolsSample:
++                    Array.isArray(m.tools) && (m.tools as unknown[]).length > 0
++                      ? JSON.stringify((m.tools as unknown[])[0]).slice(0, 600)
++                      : null,
++                }));
++              appendFileSync(
++                join(resolveZCodeDataBaseDir(), "bridge-snapshot-shape.ndjson"),
++                `${JSON.stringify({ at: Date.now(), taskId, shape })}\n`,
++              );
++            } catch {
++              // 诊断失败不影响主流程。
++            }
++          }
++          return {
++            text,
++            finishReason: settled ? "stop" : "timeout",
++            // 优先快照（可靠）；事件流捕获到的作为补充（若将来订阅生效）。
++            toolCalls: snapshotToolCalls.length > 0 ? snapshotToolCalls : capturedToolCalls,
++          };
++        } finally {
++          terminalSub.dispose();
++          streamSub.dispose();
++          // 清理临时 task（避免堆积）
++          await taskService
++            .deleteTask({ taskId, workspacePath })
++            .catch(() => undefined);
++        }
++      },
++    });
++    logger.info("ZCode bridge started", {
++      port: activeZCodeBridge.port,
++      portFilePath: activeZCodeBridge.portFilePath,
++      transport: "session-path",
++    });
++  } catch (error) {
++    logger.warn("ZCode bridge failed to start", {
++      error: error instanceof Error ? error.message : String(error),
++    });
++  }
++}
++
++/** 从 task snapshot 里抽出最后一条 assistant 文本。 */
++function extractAssistantText(snapshot: unknown): string {
++  try {
++    const s = snapshot as { messages?: Array<{ role?: string; content?: unknown }> };
++    const msgs = s?.messages;
++    if (!Array.isArray(msgs)) return "";
++    for (let i = msgs.length - 1; i >= 0; i--) {
++      const m = msgs[i];
++      if (m?.role !== "assistant") continue;
++      if (typeof m.content === "string") return m.content;
++      if (Array.isArray(m.content)) {
++        return m.content
++          .map((p: unknown) =>
++            typeof p === "object" && p !== null && typeof (p as { text?: unknown }).text === "string"
++              ? (p as { text: string }).text
++              : "",
++          )
++          .join("");
++      }
++    }
++    return "";
++  } catch {
++    return "";
++  }
++}
++
++/**
++ * 【工具面透传】从 task snapshot 里抽出**结构化**工具调用。
++ *
++ * ## 为什么走快照而不是事件流（实测踩过）
++ *
++ * 首选方案是订阅 `onDynamicStreamEvent(taskId)` 拿实时的 `tool_call` /
++ * `tool_call_update` 事件。**实测该订阅在本路径上收不到任何事件**：
++ * 在两处都加了落盘诊断，模型确实执行了工具（拿到真实的目录条目），
++ * 但事件回调一次都没触发 —— 诊断文件根本没生成。
++ *
++ * 推测原因是 emitter 实例不共享（host 侧 `IZCodeTaskService` 与真正
++ * fire 事件的 adapter 不是同一个内存实例），但**没有实测确认**。
++ *
++ * 所以改用**快照**：`ZCodeTaskSnapshot.messages[].tools[]` 里本来就持久化了
++ * 每个工具调用的 `toolName` / `input` / `status` / `output` / `error`，
++ * 数据一直都在，只是早先的 `extractAssistantText` 只读 `content` 把它丢了。
++ *
++ * 快照方案的额外好处：**不依赖订阅时机**（事件可能在订阅建立前就 fire 完，
++ * 而快照是事后拉取，必然拿得到），也不需要跨实例共享 emitter。
++ *
++ * ## `parts` 的顺序
++ *
++ * `messages[].parts` 用 `{type:"tool-call", toolIndex}` 保留工具调用与文本的
++ * **交错顺序**。这里按 `parts` 的顺序输出（缺失时退回 `tools` 数组顺序），
++ * 这样调用方看到的次序与模型实际的产出次序一致。
++ */
++function extractToolCalls(snapshot: unknown): Array<{
++  toolId: string;
++  toolName?: string;
++  input: unknown;
++  status?: string;
++  output?: unknown;
++  error?: string;
++}> {
++  const out: Array<{
++    toolId: string;
++    toolName?: string;
++    input: unknown;
++    status?: string;
++    output?: unknown;
++    error?: string;
++  }> = [];
++  try {
++    const s = snapshot as {
++      messages?: Array<{
++        role?: string;
++        tools?: Array<{
++          toolName?: unknown;
++          input?: unknown;
++          output?: unknown;
++          error?: unknown;
++          status?: unknown;
++        }>;
++        parts?: Array<{ type?: unknown; toolIndex?: unknown }>;
++      }>;
++    };
++    const msgs = s?.messages;
++    if (!Array.isArray(msgs)) return out;
++
++    for (const message of msgs) {
++      if (message?.role !== "assistant") continue;
++      const tools = Array.isArray(message.tools) ? message.tools : [];
++      if (tools.length === 0) continue;
++
++      // 按 parts 的交错顺序展开；没有 parts 就按数组顺序。
++      const order: number[] = [];
++      if (Array.isArray(message.parts)) {
++        for (const part of message.parts) {
++          if (part?.type !== "tool-call") continue;
++          const index = typeof part.toolIndex === "number" ? part.toolIndex : -1;
++          if (index >= 0 && index < tools.length && !order.includes(index)) {
++            order.push(index);
++          }
++        }
++      }
++      for (let i = 0; i < tools.length; i++) {
++        if (!order.includes(i)) order.push(i);
++      }
++
++      for (const index of order) {
++        const tool = tools[index];
++        if (tool === undefined) continue;
++        const toolName = typeof tool.toolName === "string" ? tool.toolName : undefined;
++        out.push({
++          // 快照里没有上游的 `toolId`，用「消息序号 + 工具序号」合成一个稳定 id。
++          // 调用方只需要一个稳定的关联键，不需要它是上游原值。
++          toolId: `snapshot-${out.length}`,
++          ...(toolName === undefined ? {} : { toolName }),
++          input: tool.input,
++          ...(typeof tool.status === "string" ? { status: tool.status } : {}),
++          ...(tool.output === undefined ? {} : { output: tool.output }),
++          ...(typeof tool.error === "string" ? { error: tool.error } : {}),
++        });
++      }
++    }
++    return out;
++  } catch {
++    return out;
++  }
++}
++
++function resolveZCodeDataBaseDir(): string {
++  const fromEnv = process.env["ZCODE_DATA_BASE_DIR"]?.trim();
++  if (fromEnv) return fromEnv;
++  return homedir();
++}
++
+ function disposeLocalResourceTelemetry(): void {
+   try {
+     activeLocalResourceTelemetry?.dispose();
+@@ -2895,6 +3522,7 @@ parentPort.on("message", async (e: Electron.MessageEvent) => {
+           services.register(IZCodeTaskService, reportingZCodeTaskService);
+         }
+         wireLocalResourceTelemetry(services);
++        await startZCodeBridgeIfEnabled(services);
+         hasDisposedHostResources = false;
+         disposeHostResourcesInFlight = null;
+         const agentWarmupTargets =
+diff --git a/packages/services/src/zcode-agent/zcodeAgent.ts b/packages/services/src/zcode-agent/zcodeAgent.ts
+index 719985a..94e7743 100644
+--- a/packages/services/src/zcode-agent/zcodeAgent.ts
++++ b/packages/services/src/zcode-agent/zcodeAgent.ts
+@@ -17,6 +17,8 @@ import type {
+   ModelSelection,
+   ZCodeSessionImportHistory,
+   ZCodePermissionRequestParams,
++  ZCodeProviderRuntimeHeadersCancelled,
++  ZCodeProviderRuntimeHeadersRequestParams,
+   AgentLaneResourceSample,
+   ZCodeMcpTelemetryEvent,
+   ZCodeMcpResourceSample,
+@@ -336,6 +338,20 @@ export interface ZCodeAgentRespondSessionRuntimePreferencesParams {
+     | { status: "failed"; message: string };
+ }
+ 
++/**
++ * start-plan 路径上 Renderer 的应答参数。
++ *
++ * `runtimeProviderHeaders` 是 Renderer 产出的 captcha 头容器。Host 侧只按固定白名单
++ * （X-Aliyun-Captcha-Verify-Param / -Region）取用，其余键丢弃；`headersApplied:false`
++ * 表示 Renderer 明确放弃（captcha 不可用 / 用户取消），Host 直接把失败透传给 CLI。
++ */
++export interface ZCodeAgentRespondProviderRuntimeHeadersParams extends ZCodeAgentSessionTarget {
++  requestId: string;
++  response:
++    | { headersApplied: true; runtimeProviderHeaders: Record<string, string> }
++    | { headersApplied: false; errorMessage?: string };
++}
++
+ export interface ZCodeAgentSessionSubscribeParams extends ZCodeAgentSessionTarget {
+   deliveryKind: ZCodeDeliveryKind;
+   afterSeq?: number;
+@@ -546,6 +562,10 @@ export type ZCodeAgentServiceEvent =
+       requestId: string;
+       response: ZCodeUserInputResponse;
+     }
++  // start-plan（免费额度）下 CLI 需要 aliyun captcha 头，而 captcha 只能在 Renderer 里产出。
++  // Host 收到 interaction/requestProviderRuntimeHeaders 后不自动应答，而是把原请求经会话事件面
++  // 广播给 Renderer，等它回调 respondProviderRuntimeHeaders 完成应答（闭源同构）。
++  | { type: "providerRuntimeHeaders.request"; request: ZCodeProviderRuntimeHeadersRequestParams }
+   | { type: "snapshot"; snapshot: ZCodeSessionStateSnapshot };
+ 
+ export interface ZCodeAgentAppRuntimePreferences {
+@@ -707,6 +727,65 @@ export interface IZCodeAgentService {
+   respondSessionRuntimePreferences(
+     params: ZCodeAgentRespondSessionRuntimePreferencesParams,
+   ): Promise<void>;
++  /**
++   * start-plan captcha 应答入口。
++   *
++   * Renderer 收到 onDynamicWorkspaceProviderRuntimeHeadersRequest 后异步跑 captcha，
++   * 完成后调用本方法把 captcha 头交回 host；host 按白名单合并进 base auth 后应答 CLI。
++   * 请求已取消/已应答时抛错。
++   */
++  respondProviderRuntimeHeaders(
++    params: ZCodeAgentRespondProviderRuntimeHeadersParams,
++  ): Promise<void>;
++  /**
++   * 【本地扩展】注册 auth 材料观察者（只观察，不应答）。
++   *
++   * 壳每次产出 provider auth 材料（含 captcha 头）时回调，供 host 桥缓存
++   * 后自行发模型请求。与 `respondProviderRuntimeHeaders` 的抢占式应答不同，
++   * 本观察者**不参与应答**，因此不影响壳内 agent 的正常流程。
++   *
++   * @param observer - 收到 `{ providerId, modelId, apiKey?, headers? }`。
++   * @returns 注销函数。
++   */
++  registerProviderAuthMaterialObserver(
++    observer: (material: {
++      providerId: string;
++      modelId: string;
++      apiKey?: string;
++      headers?: Record<string, string>;
++      /** 【诊断】壳内真实使用的完整材料（未经白名单过滤）。 */
++      rawRequestAuth?: { apiKey?: string; headers?: Record<string, string> };
++      /** 【诊断】触发本次材料的请求形状。 */
++      requestShape?: unknown;
++    }) => void,
++  ): () => void;
++  /**
++   * 【本地扩展】主动 mint 一份新鲜的 provider auth 材料（含 captcha 头）。
++   *
++   * 与 {@link registerProviderAuthMaterialObserver} 的被动观察不同：本方法按需
++   * 触发一次 captcha 产出。captcha param 是一次性的（重复提交撞 F008），所以
++   * 外部调用方要自己发请求时必须用这个，而不是复用观察到的旧材料。
++   *
++   * @param params.workspace - 目标 workspace（captcha 请求是 workspace 级）。
++   * @param params.providerId - provider 路由 id。
++   * @param params.modelId - 构造请求用的模型 id。
++   * @param params.timeoutMs - 等待 renderer 应答的上限，缺省 20 秒。
++   * @returns 完整材料，失败或超时返回 undefined。
++   */
++  mintProviderAuthMaterial(params: {
++    workspace: ZCodeAgentWorkspaceTarget;
++    providerId: string;
++    modelId: string;
++    timeoutMs?: number;
++  }): Promise<{ apiKey?: string; headers?: Record<string, string> } | undefined>;
++  /** workspace 级 captcha 请求流；renderer 在 useEffect 里订阅，按 workspacePath/Identity 过滤。 */
++  onDynamicWorkspaceProviderRuntimeHeadersRequest(
++    params: ZCodeAgentWorkspaceTarget,
++  ): Event<ZCodeProviderRuntimeHeadersRequestParams>;
++  /** 请求被 CLI 撤回；renderer 据此中止仍在跑的 captcha，避免为作废请求继续持有 DOM。 */
++  onDynamicWorkspaceProviderRuntimeHeadersCancelled(
++    params: ZCodeAgentWorkspaceTarget,
++  ): Event<ZCodeProviderRuntimeHeadersCancelled>;
+   onDynamicSessionRuntimePreferencesRequest(): Event<ZCodeAgentSessionRuntimePreferencesRequest>;
+   /**
+    * CLI 进程级资源样本，带 services 打的 lane 标签（CLI 自己不知道 lane）。
+diff --git a/packages/services/src/zcode-agent/zcodeAgentService.ts b/packages/services/src/zcode-agent/zcodeAgentService.ts
+index 9b33c71..de03ab9 100644
+--- a/packages/services/src/zcode-agent/zcodeAgentService.ts
++++ b/packages/services/src/zcode-agent/zcodeAgentService.ts
+@@ -127,6 +127,7 @@ import { ZCODE_AGENT_RUNTIME_UNAVAILABLE_CODE } from "./zcodeAgent.js";
+ import type {
+   ZCodeProtocolRequestId,
+   ModelSelection,
++  ZCodeProviderRuntimeHeadersCancelled,
+   ZCodeProviderRuntimeHeadersRequestParams,
+   ZCodeSessionEvent,
+   ZCodeSessionRuntimePreferencesScope,
+@@ -161,6 +162,7 @@ import type {
+   ZCodeAgentReadSessionMessagesParams,
+   ZCodeAgentReadSessionParams,
+   ZCodeAgentRemovePluginMarketplaceParams,
++  ZCodeAgentRespondProviderRuntimeHeadersParams,
+   ZCodeAgentRespondSessionRuntimePreferencesParams,
+   ZCodeAgentResumeSessionParams,
+   ZCodeAgentSendPromptParams,
+@@ -1119,6 +1121,13 @@ export function createZCodeAgentService(
+       sessionId,
+       workspaceKey: resolveWorkspaceKey(workspace),
+     });
++    // 通知 renderer 停掉还在跑的 captcha。取消是 CLI 主动撤回（用户新输入 / turn 结束 /
++    // runtime 换代），此时请求已作废，renderer 继续跑只会白白等到应答时才发现 request not found。
++    getProviderRuntimeHeadersCancelledEmitter(workspace).fire({
++      requestId,
++      sessionId,
++      workspace,
++    });
+   }
+   const sessionRuntimePreferencesRequestEmitter =
+     new Emitter<ZCodeAgentSessionRuntimePreferencesRequest>();
+@@ -1170,6 +1179,218 @@ export function createZCodeAgentService(
+     pendingUserInputs: pendingUserInputs.size,
+   }));
+   const pendingProviderRuntimeHeaders = new Map<string, PendingProviderRuntimeHeadersRequest>();
++
++  /**
++   * 【本地扩展】Provider auth 材料的旁路观察者。
++   *
++   * ## 为什么需要
++   *
++   * start-plan（免费额度）通道每次模型请求都要求携带阿里云 captcha 头，
++   * 而它只能在渲染进程里产出。这些材料原本**只**回给壳内 agent
++   * （`pending.client.respond`），外部进程（如 DSH 桥）拿不到。
++   *
++   * 有了这个旁路，桥就能拿到**同一份材料**去自行发请求 —— 从而把壳从
++   * 「对话代理」降级为「鉴权材料提供者」，让工具面留在 DSH 侧。
++   *
++   * ## 与「抢答」的区别（重要）
++   *
++   * 本旁路**只观察、不应答** —— `respondProviderRuntimeHeaders` 仍是唯一
++   * 的应答方，壳内 agent 正常拿到材料，不受影响。
++   * 早先考虑过让桥去抢答，但 `respondProviderRuntimeHeaders` 是抢占式的
++   * （`if (pending.responding) throw`），抢答会让正常会话全挂，故放弃。
++   *
++   * ## 安全
++   *
++   * 回调里含 `apiKey` 与 captcha 头，**属于机密**。注册方必须确保只在本机
++   * 内存中使用，不落盘、不出网。这里不做脱敏，因为调用方（本机桥）本来
++   * 就要用它发请求。
++   */
++  const providerAuthMaterialObservers = new Set<
++    (material: {
++      providerId: string;
++      modelId: string;
++      apiKey?: string;
++      headers?: Record<string, string>;
++      /** 【诊断】壳内真实使用的完整材料（未过滤）。 */
++      rawRequestAuth?: { apiKey?: string; headers?: Record<string, string> };
++      /** 【诊断】触发本次材料的请求形状。 */
++      requestShape?: unknown;
++    }) => void
++  >();
++
++  /**
++   * 注册一个 auth 材料观察者。返回注销函数。
++   *
++   * 每次 `respondProviderRuntimeHeaders` 成功产出材料时被调用。
++   */
++  function registerProviderAuthMaterialObserver(
++    observer: (material: {
++      providerId: string;
++      modelId: string;
++      apiKey?: string;
++      headers?: Record<string, string>;
++      /** 【诊断】壳内真实使用的完整材料（未过滤）。 */
++      rawRequestAuth?: { apiKey?: string; headers?: Record<string, string> };
++      /** 【诊断】触发本次材料的请求形状。 */
++      requestShape?: unknown;
++    }) => void,
++  ): () => void {
++    providerAuthMaterialObservers.add(observer);
++    return () => {
++      providerAuthMaterialObservers.delete(observer);
++    };
++  }
++
++  /**
++   * 【本地扩展】主动 mint 一份新鲜的 provider auth 材料（含 captcha 头）。
++   *
++   * ## 为什么需要「主动」
++   *
++   * 旁路观察者（{@link registerProviderAuthMaterialObserver}）是被动的：只有壳内
++   * agent 真的发了一轮模型请求，才有材料流过。而 captcha param 是**一次性**的
++   * （每次验证重新 mint，重复提交撞 F008）—— 实测：复用观察者拿到的材料去发
++   * 请求，稳定返回 `3007 captcha verify failed`。
++   *
++   * 所以外部调用方（如 DSH 桥）要自己发请求，就必须能**按需触发一次 captcha
++   * 产出**，而不是等壳内流量路过。
++   *
++   * ## 实现方式
++   *
++   * 复用宿主既有的 `providerRuntimeHeaders.request` 握手：伪造一个 pending 项，
++   * 其 `client.respond` 指向本函数自己的 resolver，然后 fire 到 workspace 事件面。
++   * renderer 的订阅者（`useProviderRuntimeHeadersCaptcha`）收到后照常跑 captcha，
++   * 完成后回调 `respondProviderRuntimeHeaders` —— 那里会走既有逻辑解析 apiKey、
++   * 白名单合并 captcha 头，最后**调用本函数的 resolver** 而不是壳内 agent。
++   *
++   * 因此这条路径与壳内 agent 的路径完全同构，只是"应答目的地"不同 ——
++   * 不抢占、不干扰正常会话。
++   *
++   * ## 前提
++   *
++   * renderer 必须挂了 captcha 订阅者（正常启动的 GUI 都会挂；headless 模式下
++   * 若 `ZCodeCaptchaRuntime` 未渲染，则永远等不到应答，本函数会超时返回 undefined）。
++   *
++   * @param params.workspace - 目标 workspace；captcha 请求是 workspace 级的。
++   * @param params.providerId - provider 路由 id。
++   * @param params.modelId - 用于构造请求的模型 id。
++   * @param params.timeoutMs - 等待 renderer 应答的上限，缺省 20 秒。
++   * @returns 完整材料 `{ apiKey, headers }`，失败或超时返回 undefined。
++   */
++  async function mintProviderAuthMaterial(params: {
++    workspace: ZCodeAgentWorkspaceTarget;
++    providerId: string;
++    modelId: string;
++    timeoutMs?: number;
++  }): Promise<{ apiKey?: string; headers?: Record<string, string> } | undefined> {
++    const timeoutMs = params.timeoutMs ?? 20_000;
++    const requestId = `bridge-mint-${randomUUID()}`;
++    const sessionId = `bridge-mint-session-${randomUUID()}`;
++
++    const workspace = {
++      workspacePath: params.workspace.workspacePath,
++      ...(params.workspace.workspaceIdentity
++        ? { workspaceIdentity: params.workspace.workspaceIdentity }
++        : {}),
++    };
++
++    const key = providerRuntimeHeadersRequestKey({ ...workspace, sessionId, requestId });
++
++    // 构造与壳内 agent 同形的请求参数。accountAccess 用 start-plan 的静态形状
++    // （见 zcodeProviderAccountAccessSchema）：只有这个 mode 会走 renderer 跑 captcha。
++    const request = {
++      workspace,
++      sessionId,
++      requestId,
++      providerId: params.providerId,
++      modelSelection: {
++        providerId: params.providerId,
++        modelId: params.modelId,
++        options: { reasoningLevel: "max" },
++      },
++      accountAccess: {
++        type: "zhipu-account" as const,
++        accountType: "bigmodel" as const,
++        mode: "start-plan" as const,
++        entitled: true,
++      },
++      reason: "model-request",
++    } as unknown as ZCodeProviderRuntimeHeadersRequestParams;
++
++    return await new Promise<{ apiKey?: string; headers?: Record<string, string> } | undefined>(
++      (resolve) => {
++        let settled = false;
++        const finish = (value: { apiKey?: string; headers?: Record<string, string> } | undefined) => {
++          if (settled) return;
++          settled = true;
++          clearTimeout(timer);
++          pendingProviderRuntimeHeaders.delete(key);
++          resolve(value);
++        };
++        const timer = setTimeout(() => {
++          logger.warn(undefined, "provider auth material mint timed out", {
++            requestId,
++            providerId: params.providerId,
++            timeoutMs,
++          });
++          finish(undefined);
++        }, timeoutMs);
++        timer.unref?.();
++
++        // 伪造 client：renderer 应答时，respondProviderRuntimeHeaders 会把材料
++        // 送到这里（而不是壳内 agent 的连接）。
++        const client = {
++          respond: async (
++            _id: unknown,
++            payload: { headersApplied?: boolean; requestAuth?: { apiKey?: string; headers?: Record<string, string> } },
++          ) => {
++            if (payload?.headersApplied !== true || payload.requestAuth === undefined) {
++              finish(undefined);
++              return;
++            }
++            finish(payload.requestAuth);
++          },
++        } as unknown as ZCodeProtocolClient;
++
++        pendingProviderRuntimeHeaders.set(key, {
++          client,
++          protocolRequestId: 0 as unknown as ZCodeProtocolRequestId,
++          request,
++        });
++
++        // 只 fire workspace 面 —— 与 renderer 的订阅面一致（见
++        // useProviderRuntimeHeadersCaptcha 的「只订阅 workspace 面」约束）。
++        getProviderRuntimeHeadersEmitter(workspace).fire(request);
++
++        logger.info(undefined, "provider auth material mint requested", {
++          requestId,
++          providerId: params.providerId,
++          modelId: params.modelId,
++        });
++      },
++    );
++  }
++
++  /**
++   * Provider runtime headers 的 workspace 级请求流。
++   *
++   * 与 conversation/workspace-config 帧同为 workspace 级 emitter，但语义不同：这不是周期帧，
++   * 而是「请求-应答」握手 —— renderer 收到后在 useEffect 里异步跑 captcha，再回调
++   * respondProviderRuntimeHeaders。之所以要 workspace 级，是因为 captcha 请求可能发生在
++   * 没有 session 订阅者的会话上（后台任务 / 无 pane），只靠 emitSessionEvent 会静默丢弃。
++   */
++  const providerRuntimeHeadersEmitters = new Map<
++    string,
++    Emitter<ZCodeProviderRuntimeHeadersRequestParams>
++  >();
++  /**
++   * 取消流：CLI 撤回某一轮凭据刷新时，renderer 上还在跑的 captcha 必须立刻停。
++   * 没有这条，renderer 会为一个已作废的请求继续持有 DOM/脚本，并在完成时命中
++   * respondProviderRuntimeHeaders 的「request not found」。
++   */
++  const providerRuntimeHeadersCancelledEmitters = new Map<
++    string,
++    Emitter<ZCodeProviderRuntimeHeadersCancelled>
++  >();
+   const pendingSessionRuntimePreferences = new Map<
+     string,
+     PendingSessionRuntimePreferencesRequest
+@@ -1255,6 +1476,40 @@ export function createZCodeAgentService(
+     invalidateWorkspaceClient(event.workspaceKey, active.client);
+   });
+ 
++  /**
++   * Provider runtime headers 白名单。
++   *
++   * Renderer 是 captcha 的唯一生产者（阿里云脚本只跑在 DOM 里），但 Renderer 绝不能成为
++   * 「任意出站请求头」的注入源：它只能回传这两个确定语义的 captcha 头。其余键一律丢弃。
++   */
++  const PROVIDER_RUNTIME_HEADER_ALLOWLIST = [
++    "X-Aliyun-Captcha-Verify-Param",
++    "X-Aliyun-Captcha-Verify-Region",
++  ] as const;
++
++  /**
++   * 把 Renderer 回传的 runtimeProviderHeaders 按白名单合并进基础 auth 的 headers。
++   * 大小写不敏感匹配（HTTP 头本身不区分大小写），并按 canonical 名写回，避免同一头出现两个大小写变体。
++   */
++  function mergeAllowedRuntimeProviderHeaders(
++    baseHeaders: Record<string, string> | undefined,
++    runtimeProviderHeaders: Record<string, string> | undefined,
++  ): Record<string, string> {
++    const merged: Record<string, string> = { ...(baseHeaders ?? {}) };
++    for (const [rawKey, rawValue] of Object.entries(runtimeProviderHeaders ?? {})) {
++      if (typeof rawValue !== "string") continue;
++      const name = rawKey.trim().toLowerCase();
++      const canonical = PROVIDER_RUNTIME_HEADER_ALLOWLIST.find(
++        (allowed) => allowed.toLowerCase() === name,
++      );
++      const value = rawValue.trim();
++      if (canonical && value) {
++        merged[canonical] = value;
++      }
++    }
++    return merged;
++  }
++
+   async function resolveAccountRequestAuth(
+     request: ZCodeProviderRuntimeHeadersRequestParams,
+   ): Promise<AccountRequestAuthMaterial | undefined> {
+@@ -1269,6 +1524,29 @@ export function createZCodeAgentService(
+     });
+   }
+ 
++  /**
++   * 组合出最终回给 CLI 的 auth 材料。
++   * 与闭源同构：`apiKey || headers 非空` 才算「拿到了鉴权材料」，否则必须回 headersApplied:false，
++   * 不能让 CLI 带着一个空 auth 去发请求。
++   */
++  function buildMergedRequestAuth(
++    requestAuth: AccountRequestAuthMaterial | undefined,
++    runtimeProviderHeaders: Record<string, string> | undefined,
++  ): { apiKey?: string; headers?: Record<string, string> } | undefined {
++    const headers = mergeAllowedRuntimeProviderHeaders(
++      requestAuth?.headers,
++      runtimeProviderHeaders,
++    );
++    const apiKey = requestAuth?.apiKey;
++    if (!apiKey && Object.keys(headers).length === 0) {
++      return undefined;
++    }
++    return {
++      ...(apiKey ? { apiKey } : {}),
++      ...(Object.keys(headers).length > 0 ? { headers } : {}),
++    };
++  }
++
+   async function respondAccountRequestAuthWithoutInteraction(params: {
+     key: string;
+     pending: PendingProviderRuntimeHeadersRequest;
+@@ -1278,12 +1556,13 @@ export function createZCodeAgentService(
+       const requestAuth = await resolveAccountRequestAuth(params.pending.request);
+       // 账号解析是异步 IO；取消/进程退出后不能把迟到材料发给已撤销的请求。
+       if (pendingProviderRuntimeHeaders.get(params.key) !== params.pending) return;
+-      if (!requestAuth) {
++      const merged = buildMergedRequestAuth(requestAuth, undefined);
++      if (!merged) {
+         throw new Error("Account request auth resolver returned no material");
+       }
+       await params.pending.client.respond(params.pending.protocolRequestId, {
+         headersApplied: true,
+-        requestAuth,
++        requestAuth: merged,
+       });
+       logger.info(undefined, "ZCode provider runtime headers 已应用", {
+         modelId: params.pending.request.modelSelection.modelId,
+@@ -1313,6 +1592,144 @@ export function createZCodeAgentService(
+     }
+   }
+ 
++  /**
++   * Renderer 应答入口（start-plan captcha 路径）。
++   *
++   * 与 respondAccountRequestAuthWithoutInteraction 的差别只有两点：
++   * 1. 它由 Renderer 主动调用，所以必须先按 requestId 从 pending map 认领请求，
++   *    认领不到（已取消 / 已过期 / workspace 不匹配）或重复应答都要显式抛错；
++   * 2. 它把 Renderer 回传的 runtimeProviderHeaders 按白名单合并进 base auth。
++   *
++   * auth 解析仍走 host 侧的 accountRequestAuthService —— captcha 头是「附加」，不是「替代」，
++   * CLI 依然需要 apiKey。
++   */
++  async function respondProviderRuntimeHeaders(params: {
++    workspace: ZCodeAgentWorkspaceTarget;
++    sessionId: string;
++    requestId: string;
++    response:
++      | { headersApplied: true; runtimeProviderHeaders: Record<string, string> }
++      | { headersApplied: false; errorMessage?: string };
++  }): Promise<void> {
++    const key = providerRuntimeHeadersRequestKey({
++      ...params.workspace,
++      sessionId: params.sessionId,
++      requestId: params.requestId,
++    });
++    const pending = pendingProviderRuntimeHeaders.get(key);
++    if (!pending) {
++      throw new Error(`ZCode provider runtime headers request not found: ${params.requestId}`);
++    }
++    if (pending.responding) {
++      throw new Error(
++        `ZCode provider runtime headers response already pending: ${params.requestId}`,
++      );
++    }
++    pending.responding = true;
++
++    if (!params.response.headersApplied) {
++      pendingProviderRuntimeHeaders.delete(key);
++      await pending.client.respond(pending.protocolRequestId, {
++        headersApplied: false,
++        ...(params.response.errorMessage
++          ? { errorMessage: params.response.errorMessage }
++          : {}),
++      });
++      logger.warn(undefined, "ZCode provider runtime headers 应用失败", {
++        modelId: pending.request.modelSelection.modelId,
++        providerId: pending.request.providerId,
++        requestId: pending.request.requestId,
++        sessionId: pending.request.sessionId,
++        ...(params.response.errorMessage ? { error: params.response.errorMessage } : {}),
++        workspaceKey: resolveWorkspaceKey(pending.request.workspace),
++      });
++      return;
++    }
++
++    let requestAuth: AccountRequestAuthMaterial | undefined;
++    try {
++      requestAuth = await resolveAccountRequestAuth(pending.request);
++    } catch (error) {
++      // 与闭源同构：解析异常也要先把 pending 摘掉，避免同一个请求被二次应答。
++      if (pendingProviderRuntimeHeaders.get(key) !== pending) return;
++      pendingProviderRuntimeHeaders.delete(key);
++      logger.warn(undefined, "ZCode provider runtime headers 应用失败", {
++        modelId: pending.request.modelSelection.modelId,
++        providerId: pending.request.providerId,
++        requestId: pending.request.requestId,
++        sessionId: pending.request.sessionId,
++        error: error instanceof Error ? error.message : String(error),
++        workspaceKey: resolveWorkspaceKey(pending.request.workspace),
++      });
++      await pending.client.respond(pending.protocolRequestId, {
++        headersApplied: false,
++        errorMessage: error instanceof Error ? error.message : String(error),
++      });
++      return;
++    }
++    // 账号解析是异步 IO；等待期间请求可能已被取消或 runtime 换代并重发，不能把迟到材料发给旧请求。
++    if (pendingProviderRuntimeHeaders.get(key) !== pending) return;
++    pendingProviderRuntimeHeaders.delete(key);
++
++    const merged = buildMergedRequestAuth(requestAuth, params.response.runtimeProviderHeaders);
++
++    // 【本地扩展】先把材料喂给旁路观察者（只观察，不影响下面给 agent 的应答）。
++    // 观察者抛错不能影响正常应答流程 —— 旁路是附加能力，不是必经路径。
++    if (merged) {
++      for (const observer of providerAuthMaterialObservers) {
++        try {
++          observer({
++            providerId: pending.request.providerId,
++            modelId: pending.request.modelSelection.modelId,
++            ...(merged.apiKey ? { apiKey: merged.apiKey } : {}),
++            ...(merged.headers ? { headers: merged.headers } : {}),
++            // 【诊断】壳内**真实使用的完整材料**（未经白名单过滤）。
++            //
++            // 用途：3012「unusual activity」的排查。上游能识别出裸发请求与壳内
++            // 请求的差异，必须逐字段对比才知道差什么。merged.headers 只保留了
++            // captcha 两个头，看不出全貌。
++            rawRequestAuth: {
++              ...(requestAuth?.apiKey ? { apiKey: requestAuth.apiKey } : {}),
++              ...(requestAuth?.headers ? { headers: requestAuth.headers } : {}),
++            },
++            // 【诊断】pending 请求的完整形状 —— 3012 可能与请求参数有关
++            // （accountAccess / modelSelection / reason 等）。
++            requestShape: {
++              providerId: pending.request.providerId,
++              modelId: pending.request.modelSelection.modelId,
++              reason: pending.request.reason,
++              accountAccess: pending.request.accountAccess,
++              modelSelection: pending.request.modelSelection,
++            },
++          });
++        } catch (error) {
++          logger.warn(undefined, "Provider auth material observer failed", {
++            error: error instanceof Error ? error.message : String(error),
++          });
++        }
++      }
++    }
++
++    await pending.client.respond(
++      pending.protocolRequestId,
++      merged
++        ? { headersApplied: true, requestAuth: merged }
++        : { headersApplied: false, errorMessage: "Provider request auth is missing" },
++    );
++    const logContext = {
++      modelId: pending.request.modelSelection.modelId,
++      providerId: pending.request.providerId,
++      requestId: pending.request.requestId,
++      sessionId: pending.request.sessionId,
++      workspaceKey: resolveWorkspaceKey(pending.request.workspace),
++    };
++    if (merged) {
++      logger.info(undefined, "ZCode provider runtime headers 已应用", logContext);
++    } else {
++      logger.warn(undefined, "ZCode provider runtime headers 应用失败", logContext);
++    }
++  }
++
+   function takePendingSessionRuntimePreferences(
+     requestId: string,
+   ): PendingSessionRuntimePreferencesRequest | undefined {
+@@ -1607,6 +2024,28 @@ export function createZCodeAgentService(
+     return created;
+   }
+ 
++  function getProviderRuntimeHeadersEmitter(workspace: ZCodeAgentWorkspaceTarget) {
++    const key = resolveWorkspaceKey(workspace);
++    const existing = providerRuntimeHeadersEmitters.get(key);
++    if (existing) {
++      return existing;
++    }
++    const created = new Emitter<ZCodeProviderRuntimeHeadersRequestParams>();
++    providerRuntimeHeadersEmitters.set(key, created);
++    return created;
++  }
++
++  function getProviderRuntimeHeadersCancelledEmitter(workspace: ZCodeAgentWorkspaceTarget) {
++    const key = resolveWorkspaceKey(workspace);
++    const existing = providerRuntimeHeadersCancelledEmitters.get(key);
++    if (existing) {
++      return existing;
++    }
++    const created = new Emitter<ZCodeProviderRuntimeHeadersCancelled>();
++    providerRuntimeHeadersCancelledEmitters.set(key, created);
++    return created;
++  }
++
+   /** v4 订阅 connectionId：同 host 进程内多个独立消费者（renderer/syncer）用 scope 后缀区分。 */
+   function v4ConnectionIdFor(subscriberScope?: string): string {
+     return subscriberScope ? `${v4ConnectionId}#${subscriberScope}` : v4ConnectionId;
+@@ -2273,16 +2712,37 @@ export function createZCodeAgentService(
+             workspacePath: workspace.workspacePath,
+           });
+           const accountAccess = parsed.data.accountAccess;
+-          if (accountRequestAuthService && accountAccess) {
+-            // Account API Key / Team Runtime Key / Start Plan JWT 都不需要 Renderer 交互。
+-            // Host 按 Model 固定的 Account Access 自动应答，避免后台任务和无 pane 会话依赖 UI 订阅者。
++          // start-plan 是唯一需要 Renderer 参与的模式：走免费额度时服务端要求携带阿里云 captcha
++          // 校验头，而 captcha 只能在 Renderer（有 DOM + 阿里云脚本）里产出。Host 若替它自动应答，
++          // 就会拿一个没有 captcha 头的 auth 去发请求，上游固定拒绝为 3007。
++          // 其余 Account API Key / Team Runtime Key / Start Plan JWT 都不需要 Renderer 交互：
++          // Host 按 Model 固定的 Account Access 自动应答，避免后台任务和无 pane 会话依赖 UI 订阅者。
++          const requiresRendererInteraction = accountAccess?.mode === "start-plan";
++          if (accountRequestAuthService && accountAccess && !requiresRendererInteraction) {
+             void respondAccountRequestAuthWithoutInteraction({
+               key: pendingKey,
+               pending,
+             });
+             return;
+           }
+-          // 没有账号凭据解析器的请求无人应答只会滞留到 CLI 侧 180s 超时，直接快速失败。
++          if (requiresRendererInteraction) {
++            // 与闭源同构：请求此时已登记进 pendingProviderRuntimeHeaders（key 含 requestId），
++            // 这里只把请求广播给 Renderer 订阅者，由它跑完 captcha 后回调本服务应答；
++            // 本分支**不能**删 pending，否则 renderer 应答时找不到请求。
++            //
++            // 双发（与闭源 Wt + u.get(...)?.fire 同构）：
++            //  - session 事件面：让已有会话订阅者（task adapter / 具体 pane）看到；
++            //  - workspace 事件面：captcha 请求可能发生在没有 session 订阅者的会话上
++            //    （后台任务 / 无 pane），只发 session 面会静默丢弃，CLI 侧等到 180s 超时。
++            emitSessionEvent(workspace, parsed.data.sessionId, {
++              type: "providerRuntimeHeaders.request",
++              request: parsed.data,
++            });
++            getProviderRuntimeHeadersEmitter(workspace).fire(parsed.data);
++            return;
++          }
++          // 没有账号凭据解析器、也没有 Renderer 可应答的请求无人应答只会滞留到 CLI 侧
++          // 180s 超时，直接快速失败。
+           pendingProviderRuntimeHeaders.delete(pendingKey);
+           void pending.client.respond(pending.protocolRequestId, {
+             headersApplied: false,
+@@ -3220,6 +3680,10 @@ export function createZCodeAgentService(
+       emitter.dispose();
+     }
+     workspaceConfigFrameEmitters.clear();
++    for (const emitter of providerRuntimeHeadersEmitters.values()) {
++      emitter.dispose();
++    }
++    providerRuntimeHeadersEmitters.clear();
+     for (const emitter of sessionsIndexFrameEmitters.values()) {
+       emitter.dispose();
+     }
+@@ -4736,6 +5200,33 @@ export function createZCodeAgentService(
+       logger.info(undefined, "运行时偏好响应已回传 Agent", responseContext);
+     },
+ 
++    async respondProviderRuntimeHeaders(
++      params: ZCodeAgentRespondProviderRuntimeHeadersParams,
++    ): Promise<void> {
++      return respondProviderRuntimeHeaders({
++        workspace: {
++          workspacePath: params.workspacePath,
++          ...(params.workspaceIdentity ? { workspaceIdentity: params.workspaceIdentity } : {}),
++        },
++        sessionId: params.sessionId,
++        requestId: params.requestId,
++        response: params.response,
++      });
++    },
++
++    /**
++     * 【本地扩展】注册 auth 材料观察者。
++     *
++     * 见 `providerAuthMaterialObservers` 的说明。供 host 桥把壳每次产出的
++     * `{ apiKey, headers }`（含 captcha 头）缓存下来，用于自行发模型请求。
++     */
++    registerProviderAuthMaterialObserver,
++
++    /**
++     * 【本地扩展】主动 mint 新鲜 auth 材料。见 `mintProviderAuthMaterial` 的说明。
++     */
++    mintProviderAuthMaterial,
++
+     onDynamicSessionRuntimePreferencesRequest() {
+       return (listener) => {
+         const disposable = sessionRuntimePreferencesRequestEmitter.event(listener);
+@@ -5595,6 +6086,29 @@ export function createZCodeAgentService(
+       return getWorkspaceConfigFrameEmitter(params).event;
+     },
+ 
++    // ── start-plan captcha 握手（workspace 级）──
++    // 与 v4 帧通道不同，这不是订阅-路由帧：没有 topic，也不参与 connection scope 的
++    // ownership 路由。它只是 workspace 级的「请求 → renderer 跑 captcha → 回调应答」两段式，
++    // 因此照 base service 的 workspace emitter 模式实现，不套 routedEvent。
++    onDynamicWorkspaceProviderRuntimeHeadersRequest(params: ZCodeAgentWorkspaceTarget) {
++      const workspaceKey = resolveWorkspaceKey(params);
++      return (listener) => {
++        const disposable = getProviderRuntimeHeadersEmitter(params).event(listener);
++        // 重放已有 pending：请求可能先于 renderer 订阅到达（pane 尚未挂载 / 订阅在
++        // useEffect 里晚一拍建立）。不重放的话这条请求会一直挂到 CLI 侧 180s 超时。
++        for (const [key, pending] of pendingProviderRuntimeHeaders) {
++          if (key.startsWith(`${workspaceKey}\u0000`) && !pending.responding) {
++            listener(pending.request);
++          }
++        }
++        return disposable;
++      };
++    },
++
++    onDynamicWorkspaceProviderRuntimeHeadersCancelled(params: ZCodeAgentWorkspaceTarget) {
++      return getProviderRuntimeHeadersCancelledEmitter(params).event;
++    },
++
+     onDynamicProcessResourceSample() {
+       return processResourceSampleEmitter.event;
+     },
