@@ -332,6 +332,34 @@ function bnn(e) { return e?.access?.type === "zhipu-account" && e.access.mode ==
 | **密钥库** | `D:\github-key\github-token.txt` / `D:\gitee-key\gitee-token.txt` |
 | Release | v0.2.3（最新），v0.2.0~v0.2.2 历史 |
 
+### ⚠ 推送坑（实测踩过，2026-09-27）
+
+**GitHub 的 HTTPS 在本机会被墙**，`git push origin main` 报：
+
+```
+fatal: unable to access 'https://github.com/MYCF711/dsh-free-glm.git/':
+  Failed to connect to github.com:443 after 28685 ms
+  Recv failure: Connection was reset
+```
+
+连通性诊断：
+
+```
+api.github.com  → HTTP 000
+github.com      → HTTP 000
+ssh -T git@github.com → Hi MYCF711! You've successfully authenticated   ← SSH 通！
+```
+
+**⇒ 用 SSH 推送**：
+
+```powershell
+cd D:\dsh-free-glm
+git remote add github-ssh git@github.com:MYCF711/dsh-free-glm.git   # 只加一次
+git push github-ssh main
+```
+
+**Gitee 的 HTTPS 正常**（`git push gitee main` 可用）。
+
 **仓库结构**：
 
 ```
