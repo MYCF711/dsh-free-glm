@@ -223,6 +223,23 @@ export interface ZCodeBridgeDeps {
      *   180 秒超时的主要来源。仅用于受控验证。
      */
     allowTools?: boolean;
+    /**
+     * 【流式增量】每拿到一份**累积的**部分文本就回调一次。
+     *
+     * ## 为什么需要
+     *
+     * 桥原先等整包才返回 —— 一次 20-120 秒的请求期间，调用方（DSH）
+     * 拿不到任何东西，界面上表现为「卡在思考、不吐文本」。
+     *
+     * 实现方式：等终态的同时按 1.2 秒轮询 `getTaskSnapshot`，把当前
+     * 已持久化的 assistant 文本回调出来。
+     *
+     * ⚠ 语义是**累积全文**，不是增量片段 —— 调用方自己算差量
+     *   （累计文本会随生成推进而变长，直接当 delta 会重复）。
+     *
+     * 省略此回调 = 不做轮询，零额外开销（一次性调用的默认行为）。
+     */
+    onPartialText?: (accumulated: string) => void;
   }) => Promise<{
     text: string;
     usage?: { inputTokens?: number; outputTokens?: number; totalTokens?: number };
@@ -497,37 +514,103 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
   }
 
   /**
-   * 对话请求的串行队列。
+   * 对话请求的并发控制。
    *
-   * ## 为什么必须串行（实测踩过）
+   * ## 历史：曾经是**完全串行**
    *
-   * `runConversation` 每次都 `createTask()` 建一个新 task，再 `sendPrompt`
-   * 让它跑。**同一时刻只允许一个**：多个 task 并发时会在会话链路上互相干扰，
-   * 谁都拿不到 assistant 消息，一直挂到 180 秒超时并返回空文本。
+   * 旧实现是一条 promise 链（`conversationQueue`），所有请求排队。
+   * 理由是实测过「多个 task 并发时在会话链路上互相干扰，双双挂到 180 秒
+   * 超时并返回空文本」。
    *
-   * 实测证据（壳日志）：
-   *   - 正常：`bridge.chat.completed {"durationMs":10342,"textLength":6}`
-   *   - 卡死：`bridge.chat.completed {"durationMs":180214,"textLength":0}`
-   *   而 `sendPrompt ACK` 的 trace id 成对出现（两个不同 trace 相差 30ms），
-   *   说明确有并发。
+   * ## 2026-09-27 重新实测：那个理由**不成立**
    *
-   * DSH 侧是会并发的 —— agent 主回复、会话标题生成、压缩摘要等都会各自
-   * 发起模型调用。所以**必须在这一层排队**，不能指望调用方串行。
+   * 用 3 个并发 HTTP 请求直连桥（绕过调用方 DSH 的串行）实测：
    *
-   * 用 promise 链实现：每个请求接到队尾，前一个 settle 后才开始下一个。
-   * 队列不设上限：调用方数量天然有限，且排队优于互相破坏。
+   *   请求 1: 13588 ms
+   *   请求 2: 19047 ms
+   *   请求 3: 27538 ms
+   *   三者耗时之和 = 60173 ms
+   *   **墙钟总时间 = 28084 ms**   ← 只用了最长者的时间
+   *
+   * ⇒ **墙钟 ≈ 最长单个，不是三者之和。壳完全能并行跑多个 task。**
+   *
+   * 也就是说：旧注释里「128 条请求从无重叠、最大并发恒为 1」这个观测
+   * **是这条队列造成的结果，不是壳的限制** —— 因果方向被搞反了。
+   *
+   * 壳侧 `runConversation` 每次 `createTask()` 建**独立 task**，
+   * `sseOpen` / `pushedChars` / `chatId` 全是请求内局部变量，
+   * 没有跨请求的共享可变状态。
+   *
+   * ## 那 180 秒超时是怎么来的
+   *
+   * 更可能是**别的**原因（当时还叠加着 captcha 投错桶、发现文件读写不一致
+   * 等问题），而不是"并发本身有害"。当前实测 3 并发全部正常返回。
+   *
+   * ## 但仍保留上限
+   *
+   * 完全不限并发会：① 打满上游免费额度的速率限制；② DSH 一轮可能发
+   * 3-5 个请求（主回复 + 标题 + 压缩），无限并发会把上游打爆。
+   * 取 **4** 作为上限（覆盖 DSH 单轮的最坏情况），可用
+   * `ZCODE_BRIDGE_MAX_CONCURRENCY` 覆盖，设为 `1` 即回到旧的串行行为。
+   *
+   * ## 入场顺序
+   *
+   * 仍然保持 FIFO —— 但只在"有槽位"时生效。**不再让短请求排在长请求
+   * 后面干等**：旧实现里一条标题生成（本该几百毫秒）会被一条 60 秒的
+   * 主回复堵成 20 秒以上（实测 41 条短请求中位 21885ms）。
    */
-  let conversationQueue: Promise<unknown> = Promise.resolve();
+  const MAX_CONCURRENCY = ((): number => {
+    const raw = process.env["ZCODE_BRIDGE_MAX_CONCURRENCY"]?.trim();
+    const parsed = raw === undefined || raw.length === 0 ? Number.NaN : Number(raw);
+    if (!Number.isFinite(parsed) || parsed < 1) {
+      return 4;
+    }
+    return Math.floor(parsed);
+  })();
 
-  /** 把一次对话执行排进队列，返回它自己的 Promise。 */
-  function enqueueConversation<T>(task: () => Promise<T>): Promise<T> {
-    const run = conversationQueue.then(task, task);
-    // 队列本身永远不 reject —— 否则一次失败会毒化后续所有请求。
-    conversationQueue = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    return run;
+  /** 当前在跑的对话数。 */
+  let runningConversations = 0;
+  /** 等槽位的请求（FIFO）。 */
+  const conversationWaiters: Array<() => void> = [];
+
+  /**
+   * 带并发上限的调度。
+   *
+   * ## 返回的两个时长分别是什么
+   *
+   * - `queueWaitMs` —— 从**进入调度**到**真正开跑**之间的等待。
+   *   并发未满时它接近 0；并发满时要等前面的人让出槽位。
+   * - `runMs` —— 真正跑 `task()` 花的时间（即壳内 turn 的时长）。
+   *
+   * ## 为什么要分开（旧实现的坑）
+   *
+   * 旧代码把 `queuedAt` 与 `startedAt` **在同一瞬间赋值**，然后
+   * `queueWaitMs: Date.now() - queuedAt` —— 于是它恒等于 `durationMs`
+   * （实测日志里 40102 vs 40103，差的只是浮点误差）。
+   * **那个字段零信息量**，还误导人以为"全部时间都花在排队上"。
+   */
+  async function runWithSlot<T>(
+    task: () => Promise<T>,
+  ): Promise<{ value: T; queueWaitMs: number; runMs: number }> {
+    const enteredAt = Date.now();
+    if (runningConversations >= MAX_CONCURRENCY) {
+      await new Promise<void>((resolve) => {
+        conversationWaiters.push(resolve);
+      });
+    }
+    const queueWaitMs = Date.now() - enteredAt;
+    runningConversations += 1;
+    const runStartedAt = Date.now();
+    try {
+      const value = await task();
+      return { value, queueWaitMs, runMs: Date.now() - runStartedAt };
+    } finally {
+      runningConversations -= 1;
+      const next = conversationWaiters.shift();
+      if (next !== undefined) {
+        next();
+      }
+    }
   }
 
   const handler = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
@@ -919,12 +1002,77 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
         // 桥从 `onDynamicStreamEvent` 捕获结构化 `tool_call` 透给 DSH。
         const allowTools = body.allowTools === true;
 
+        /**
+         * 【流式】`stream: true` 时用 SSE 边生成边推。
+         *
+         * ## 为什么加这个
+         *
+         * 桥原先等整包才返回。一次请求 20-120 秒期间调用方拿不到任何东西，
+         * 界面上表现为「卡在思考、不吐文本」 —— 这是用户报的最主要症状。
+         *
+         * 实测延迟构成（日志时间线）：
+         *   - captcha：0.4 秒
+         *   - 桥自身：~0.1 秒
+         *   - **agent turn 循环：剩下全部**（20 秒里约 19.9 秒，其间 509 个内部事件）
+         *
+         * 所以能优化的不是"让上游变快"（那是免费额度通道的固有速度），
+         * 而是**把已经产生的部分文本尽早吐出去**。
+         *
+         * ## 实现
+         *
+         * `runConversation` 在等终态的同时按 1.2 秒轮询快照，把累积文本回调
+         * 出来；这里算差量、按 OpenAI SSE 形状推送。
+         */
+        const wantsStream =
+          body.stream === true ||
+          (typeof request.headers["accept"] === "string" &&
+            request.headers["accept"].includes("text/event-stream"));
+
         const startedAt = Date.now();
-        const queuedAt = startedAt;
         try {
-          // ★ 走串行队列：见 enqueueConversation 的说明。
-          //   并发会让多个 task 在会话链路上互相干扰，双双挂到 180 秒超时。
-          const result = await enqueueConversation(() =>
+          // ★ 走**带并发上限**的调度：见 runWithSlot 的说明。
+          //   旧实现是完全串行；2026-09-27 实测证明壳能并行（3 并发墙钟
+          //   28s vs 之和 60s），串行只会让短请求排在长请求后面干等。
+          // 【流式】SSE 头要在**第一个字节产出前**发出，所以先写头。
+          // 未要求流式时不写，保持原来的整包 JSON 行为。
+          let sseOpen = false;
+          const sseWrite = (chunk: unknown): void => {
+            if (!wantsStream) return;
+            if (!sseOpen) {
+              response.writeHead(200, {
+                "Content-Type": "text/event-stream; charset=utf-8",
+                "Cache-Control": "no-cache, no-transform",
+                Connection: "keep-alive",
+                // 禁掉中间层的缓冲，否则"流式"会被攒成一坨。
+                "X-Accel-Buffering": "no",
+              });
+              sseOpen = true;
+            }
+            response.write(`data: ${JSON.stringify(chunk)}\n\n`);
+          };
+
+          const chatId = `chatcmpl-${randomBytes(8).toString("hex")}`;
+          const created = Math.floor(Date.now() / 1000);
+
+          // 已推出的文本长度 —— 快照给的是**累积全文**，这里算差量。
+          let pushedChars = 0;
+          const onPartialText =
+            wantsStream === true
+              ? (accumulated: string): void => {
+                  if (accumulated.length <= pushedChars) return;
+                  const delta = accumulated.slice(pushedChars);
+                  pushedChars = accumulated.length;
+                  sseWrite({
+                    id: chatId,
+                    object: "chat.completion.chunk",
+                    created,
+                    model: modelId,
+                    choices: [{ index: 0, delta: { content: delta }, finish_reason: null }],
+                  });
+                }
+              : undefined;
+
+          const { value: result, queueWaitMs, runMs } = await runWithSlot(() =>
             deps.runConversation({
               workspacePath,
               providerId: DEFAULT_PROVIDER_ID,
@@ -932,6 +1080,7 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
               reasoningLevel: deps.reasoningLevel ?? "max",
               messages,
               allowTools,
+              ...(onPartialText === undefined ? {} : { onPartialText }),
               ...(maxOutputTokens === undefined ? {} : { maxOutputTokens }),
               ...(deps.mcpServers === undefined ? {} : { mcpServers: deps.mcpServers }),
             }),
@@ -940,9 +1089,15 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
           log("bridge.chat.completed", {
             modelId,
             durationMs: Date.now() - startedAt,
-            // 排队等待时长：与 durationMs 分开记，便于区分
-            // "模型慢" 与 "排队久"（后者说明并发压力大）。
-            queueWaitMs: Date.now() - queuedAt,
+            // 排队等待 —— 并发满时才有值，正常情况下接近 0。
+            //
+            // ⚠ 旧实现把计时点与 `startedAt` 放在同一瞬间，导致这个字段
+            //   恒等于 `durationMs`（**零信息量**，还会误导人以为全是排队）。
+            queueWaitMs,
+            // 真正执行时长（壳内 turn 跑了多久）。这才是"模型慢"的指标。
+            runMs,
+            // 本次的并发上限 —— 便于从日志确认配置。
+            concurrency: MAX_CONCURRENCY,
             textLength: result.text.length,
             toolCallCount: result.toolCalls?.length ?? 0,
             usage: result.usage,
@@ -974,10 +1129,59 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
               ...(call.error === undefined ? {} : { error: call.error }),
             }));
 
+          const finishReason =
+            toolCallsOut.length > 0 ? "tool_calls" : (result.finishReason ?? "stop");
+
+          if (wantsStream) {
+            // ── 流式收尾 ──────────────────────────────────────────────
+            //
+            // 把**最终文本与工具调用**作为最后一帧发出去（快照轮询可能
+            // 漏掉末尾几个字符，或整轮没有增量 —— 比如模型直接给工具调用）。
+            // 调用方以这一帧为准，前面的 delta 只用于"边生成边显示"。
+            if (result.text.length > pushedChars) {
+              sseWrite({
+                id: chatId,
+                object: "chat.completion.chunk",
+                created,
+                model: modelId,
+                choices: [
+                  {
+                    index: 0,
+                    delta: { content: result.text.slice(pushedChars) },
+                    finish_reason: null,
+                  },
+                ],
+              });
+            }
+            sseWrite({
+              id: chatId,
+              object: "chat.completion.chunk",
+              created,
+              model: modelId,
+              choices: [
+                {
+                  index: 0,
+                  delta: {
+                    ...(toolCallsOut.length > 0 ? { tool_calls: toolCallsOut } : {}),
+                  },
+                  finish_reason: finishReason,
+                },
+              ],
+              usage: {
+                prompt_tokens: result.usage?.inputTokens ?? 0,
+                completion_tokens: result.usage?.outputTokens ?? 0,
+                total_tokens: result.usage?.totalTokens ?? 0,
+              },
+            });
+            response.write("data: [DONE]\n\n");
+            response.end();
+            return;
+          }
+
           json(response, 200, {
-            id: `chatcmpl-${randomBytes(8).toString("hex")}`,
+            id: chatId,
             object: "chat.completion",
-            created: Math.floor(Date.now() / 1000),
+            created,
             model: modelId,
             choices: [
               {
@@ -988,8 +1192,7 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
                   ...(toolCallsOut.length > 0 ? { tool_calls: toolCallsOut } : {}),
                 },
                 // 有工具调用时用 `tool_calls`，与 OpenAI 语义一致。
-                finish_reason:
-                  toolCallsOut.length > 0 ? "tool_calls" : (result.finishReason ?? "stop"),
+                finish_reason: finishReason,
               },
             ],
             usage: {
@@ -1005,6 +1208,20 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
             durationMs: Date.now() - startedAt,
             error: message,
           });
+          if (response.headersSent) {
+            // SSE 已经开流：不能再发 JSON 状态码，只能用一帧错误 + 收尾，
+            // 否则客户端会一直等一个永远不来的 `[DONE]`。
+            try {
+              response.write(
+                `data: ${JSON.stringify({ error: { message, type: "upstream_error" } })}\n\n`,
+              );
+              response.write("data: [DONE]\n\n");
+            } catch {
+              // 连接已断，忽略。
+            }
+            response.end();
+            return;
+          }
           errorJson(response, 502, `Model request failed: ${message}`, "upstream_error");
         }
         return;
