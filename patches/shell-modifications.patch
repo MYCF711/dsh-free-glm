@@ -1,5 +1,5 @@
 diff --git a/packages/desktop/src/host/index.ts b/packages/desktop/src/host/index.ts
-index 9de80f6..527f8a7 100644
+index 9de80f6..58e2427 100644
 --- a/packages/desktop/src/host/index.ts
 +++ b/packages/desktop/src/host/index.ts
 @@ -15,6 +15,9 @@
@@ -68,7 +68,7 @@ index 9de80f6..527f8a7 100644
    activeLocalResourceTelemetry = registerHostServiceResourceTelemetry({
      services,
      postMessage: (message) => parentPort?.postMessage(message),
-@@ -1863,6 +1892,617 @@ function wireLocalResourceTelemetry(services: ServiceCollection): void {
+@@ -1863,6 +1892,682 @@ function wireLocalResourceTelemetry(services: ServiceCollection): void {
    });
  }
  
@@ -97,6 +97,16 @@ index 9de80f6..527f8a7 100644
 +    return;
 +  }
 +
++  // 推理档位。默认仍是 `"max"` —— **不擅自降级**，因为档位直接影响回答质量，
++  // 而且很难预判用户的偏好。
++  //
++  // ⚠ 但要知道代价（2026-09-27 实测）：**每一轮对话都跑最高推理档**，
++  //   包括「生成会话标题」「压缩摘要」这类一句话任务。历史日志里
++  //   `textLength<=5` 的 41 条短请求中位耗时 **21885ms** —— 其中很大一部分
++  //   就是这个档位造成的。
++  //
++  // ⇒ 想显著提速就把它调低（`high` / `medium`），代价是复杂任务的推理深度下降。
++  //   这是**用户取舍**，不该由代码替他决定。
 +  const reasoningLevel = process.env["ZCODE_BRIDGE_REASONING_LEVEL"]?.trim() || "max";
 +  const turnTimeoutMs = Number(process.env["ZCODE_BRIDGE_TIMEOUT_MS"] ?? "") || 180_000;
 +  // 外部工具（MCP HTTP/SSE）—— DSH 工具面进入 ZCode 会话的唯一通道。
@@ -480,10 +490,65 @@ index 9de80f6..527f8a7 100644
 +          });
 +
 +          // 4. 等终态（或超时）
-+          await Promise.race([
-+            terminal,
-+            new Promise<void>((resolve) => setTimeout(resolve, turnTimeoutMs)),
-+          ]);
++          //
++          // 【流式增量】等终态的同时轮询快照，把新增文本通过回调吐给调用方，
++          // 让上游（桥 → DSH）能边生成边转发，而不是干等 20-120 秒。
++          //
++          // ## 为什么轮询而不是订阅事件
++          //
++          // `onDynamicStreamEvent` 在这条路径上**收不到任何事件** —— 实测
++          // 落盘诊断完全无输出。根因（查证）：那棵树的生产者是
++          // `mapServiceEvent`，而它只由 `onDynamicTaskEvent` 建立会话订阅
++          // 后才被调用；桥从来没有调用过 `onDynamicTaskEvent`。
++          // ⇒ emitter 是同一个实例，但**没有任何代码路径往里 fire**。
++          //
++          // `getTaskSnapshot` 则实测可用：中位 129ms（其中 99% 是
++          // `resumeSession` 的 RPC，SQLite 索引只占 1ms）。
++          //
++          // ## 代价控制
++          //
++          // 轮询间隔取 1200ms：
++          //   - 太短（<500ms）会给 host 添无谓负担，且快照本身要 ~130ms
++          //   - 太长（>2000ms）用户会明显感到"一顿一顿"
++          // 1200ms 下 20 秒的请求约 16 次快照，累计开销约 2 秒（10%），可接受。
++          //
++          // 只在**有 onPartialText 回调**时才轮询 —— 不需要增量的调用方
++          // （如 DSH 的一次性请求）不受影响，保持零额外开销。
++          const pollForPartialText =
++            params.onPartialText === undefined
++              ? undefined
++              : setInterval(() => {
++                  void (async () => {
++                    try {
++                      const partial = await taskService.getTaskSnapshot({
++                        taskId,
++                        workspacePath,
++                        messageLimit: 50,
++                      });
++                      const partialText = extractAssistantText(partial);
++                      if (partialText.length > 0) {
++                        params.onPartialText?.(partialText);
++                      }
++                    } catch {
++                      // 快照轮询失败不影响主流程 —— 终态那次仍会拿到完整结果。
++                    }
++                  })();
++                }, 1200);
++          if (pollForPartialText !== undefined) {
++            // 别让它拖住进程退出。
++            pollForPartialText.unref?.();
++          }
++
++          try {
++            await Promise.race([
++              terminal,
++              new Promise<void>((resolve) => setTimeout(resolve, turnTimeoutMs)),
++            ]);
++          } finally {
++            if (pollForPartialText !== undefined) {
++              clearInterval(pollForPartialText);
++            }
++          }
 +
 +          // 5. 读回复（快照里含持久化的消息列表）
 +          const snapshot = await taskService.getTaskSnapshot({
@@ -686,7 +751,7 @@ index 9de80f6..527f8a7 100644
  function disposeLocalResourceTelemetry(): void {
    try {
      activeLocalResourceTelemetry?.dispose();
-@@ -2895,6 +3535,7 @@ parentPort.on("message", async (e: Electron.MessageEvent) => {
+@@ -2895,6 +3600,7 @@ parentPort.on("message", async (e: Electron.MessageEvent) => {
            services.register(IZCodeTaskService, reportingZCodeTaskService);
          }
          wireLocalResourceTelemetry(services);
