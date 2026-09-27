@@ -1,6 +1,6 @@
 {
   "name": "dsh-zcode-bridge",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "DSH plugin: ZCode free-quota GLM provider via the local ZCode bridge (requires the ZCode opensource instance running with ZCODE_BRIDGE=1)",
   "type": "module",
   "main": "lib/index.js",
@@ -11,7 +11,6 @@
       "default": "./lib/index.js"
     },
     "./client": {
-      "types": "./lib/client/index.d.ts",
       "default": "./lib/client.js"
     },
     "./package.json": "./package.json"
@@ -33,14 +32,14 @@
     }
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
-    "@deepseek-ai/schemastery": "^3.18.0"
+    "@deepseek-ai/cordis": ">=4.0.0 <5",
+    "@deepseek-ai/dsh-llm": ">=0.1.2-rc.1 <0.2.0",
+    "@deepseek-ai/schemastery": ">=3.18.0 <4"
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
     "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
-    "@deepseek-ai/schemastery": "^3.18.4",
+    "@deepseek-ai/schemastery": "3.18.4",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.3"
   },

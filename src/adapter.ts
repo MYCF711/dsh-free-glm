@@ -13,8 +13,12 @@
  *   - `usage` 恒为 `{prompt_tokens:0, completion_tokens:0, total_tokens:0}`
  *     （桥内部拿不到真实用量），所以**不上报 usage**，而不是报一堆 0
  *
- * 因此本适配器**不能复用 `consumeOpenAiSse`** —— 那个按 SSE 帧解析，
- * 喂给它一个 JSON 整包会一行都读不出来（表现为模型不说话）。
+ * 因此本适配器**不消费 SSE** —— 按 SSE 帧解析的读法喂给它一个 JSON 整包
+ * 会一行都读不出来（表现为模型不说话）。桥返回什么就整包 JSON 解析。
+ *
+ * ⚠ 本插件**没有** SSE 消费代码。早先版本从其它 provider 适配器抄来了一份
+ *   `sse.ts` + `openai-compat.ts`（约 700 行），对本桥完全无用，已删除 ——
+ *   留着会误导后来者以为"某个路径会走 SSE"。
  *
  * ## 做法
  *
@@ -43,7 +47,7 @@ import type {
   StreamChunk,
 } from "@deepseek-ai/dsh-llm";
 
-import { errorDetail, httpErrorCode, isTransportError } from "./openai-compat.js";
+import { isTransportError } from "./transport-error.js";
 import {
   CHAT_COMPLETIONS_PATH,
   MODELS,
@@ -502,6 +506,27 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
 
     // 4. 合成流式输出。
     const text = extractText(payload);
+
+    // ── 空文本必须报错，不能当"正常回复"发出去 ──────────────────────────
+    //
+    // 实测：桥在会话链路卡住时会**满 180 秒超时**，然后返回一个空 content
+    // （日志里 `bridge.chat.completed {"durationMs":180214,"textLength":0}`）。
+    // 早先这里把空文本当成正常回复，照发 block-start/block-end/finish ——
+    // 结果是 DSH 收到一个**没有任何内容的成功回复**，界面上什么都不显示，
+    // 用户看到的就是"点了发送没反应"，而且没有任何可排查的线索。
+    //
+    // 报错而不是静默：宁可让用户看到一条明确的失败，也不要一个静默的空回合。
+    if (text.length === 0) {
+      const finish = payload.choices?.[0]?.finish_reason;
+      throw new LlmError(
+        "zcode-bridge: 桥返回了空回复"
+          + (typeof finish === "string" && finish.length > 0 ? `（finish_reason=${finish}）` : "")
+          + "。常见原因：ZCode 实例的会话链路卡住并触发了 180 秒超时"
+          + "（看壳日志里的 bridge.chat.completed：durationMs 接近 180000 且 textLength 为 0）。"
+          + "可尝试重启 ZCode 实例。",
+        "SERVER",
+      );
+    }
 
     yield { type: "block-start", index: 0, blockType: "text" };
 
