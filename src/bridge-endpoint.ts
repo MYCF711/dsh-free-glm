@@ -68,15 +68,28 @@ function dataDirCandidates(): string[] {
     }
   };
 
+  // ── 顺序很重要：**检出目录优先于家目录**（2026-09-27 实测修正）──────
+  //
+  // 旧顺序是 `homedir()` 在最前，之后才轮到检出目录。后果实测过：
+  // 插件把壳启动到家目录，壳把发现文件写到 `C:\Users\Administrator\.zcode`，
+  // 而 `D:\...\_oss_data` 里还留着上一个实例的旧文件 → 两份并存，
+  // 端点解析挑错就触发保活误杀（进程树每 10-30 秒整体消失）。
+  //
+  // 为什么要让检出目录优先：`<盘符>\zcode-glm5.3f\_oss_data` 这个路径
+  // **不会凭空出现** —— 它存在就证明这台机器上装过源码版实例。
+  // 而 `homedir()` 人人都有，只是个"碰巧存在的目录"，不构成任何证据。
+  //
+  // 实测两者内容差异（2026-09-27）：
+  //   homedir 的 tasks-index.sqlite 483 KB（故障后新建的空壳）
+  //   检出目录的 tasks-index.sqlite 2.4 MB（真实会话史）
+  for (const drive of ["C:", "D:", "E:", "F:"]) {
+    push(`${drive}\\zcode-glm5.3f\\_oss_data`);
+  }
+
   // 官方安装版的默认位置：数据根就是家目录（其下有 `.zcode`）。
   push(homedir());
   push(process.env["APPDATA"]);
   push(process.env["LOCALAPPDATA"]);
-
-  // 源码检出的常见位置（磁盘根下的数据目录）。
-  for (const drive of ["C:", "D:", "E:", "F:"]) {
-    push(`${drive}\\zcode-glm5.3f\\_oss_data`);
-  }
 
   return out;
 }
@@ -94,7 +107,25 @@ function dataDirCandidates(): string[] {
 export function resolveDataBaseDir(): string {
   const fromEnv = process.env[DATA_BASE_DIR_ENV]?.trim();
   if (fromEnv !== undefined && fromEnv.length > 0) {
-    return fromEnv;
+    // ⚠ 环境变量**不再是最终裁定**（2026-09-27 实测踩过）。
+    //
+    // 原实现直接 `return fromEnv`，从不验证那个目录里的发现文件是否新鲜。
+    // 实测后果：环境变量指向 `D:\...\_oss_data`，里面躺着**上一个已死实例**
+    // 写下的发现文件（端口已拒绝连接），而**当前活着的实例**把文件写在了
+    // `C:\Users\Administrator\.zcode`。`candidateDataDirs()` 把环境变量目录
+    // 排在最前 → `readBridgePortFile()` 读到一个格式完全合法的过期对象 →
+    // 立即返回 → 插件拿着死端口 → `probeBridge()` false → 保活判「壳死了」
+    // → `killResidualInstances()` 杀掉**正在正常服务**的那个实例 → 死循环。
+    //
+    // ⇒ 环境变量只在**它的目录里确实有发现文件**时才优先；否则交给候选表，
+    //   由「哪个目录的文件是活的」这个事实来裁定（见 `resolveBridgeEndpoint`）。
+    try {
+      if (existsSync(join(fromEnv, BRIDGE_PORT_FILE_RELATIVE))) {
+        return fromEnv;
+      }
+    } catch {
+      // 路径非法/无权限 —— 落到候选表。
+    }
   }
 
   // 候选表里挑第一个真的有发现文件的 —— 比"猜一个路径"可靠得多。
@@ -108,7 +139,7 @@ export function resolveDataBaseDir(): string {
     }
   }
 
-  return homedir();
+  return fromEnv ?? homedir();
 }
 
 /**
@@ -217,6 +248,11 @@ export function resolveBridgeEndpoint(): ZCodeBridgeEndpoint | undefined {
   }
 
   // 逐个候选目录试；已经按优先级排好序（首选目录在最前，不重复）。
+  // 返回**第一个格式合法**的发现文件。
+  //
+  // ⚠ 格式合法 ≠ 桥还活着。过期文件与新鲜文件在 JSON 上完全同形，
+  //   所以这个函数只能当"候选"，探活由调用方做（见
+  //   `resolveLiveBridgeEndpoint`）。
   for (const dir of candidateDataDirs()) {
     const file = readBridgePortFile(join(dir, BRIDGE_PORT_FILE_RELATIVE));
     if (file === undefined) {
@@ -230,6 +266,89 @@ export function resolveBridgeEndpoint(): ZCodeBridgeEndpoint | undefined {
     };
   }
 
+  return undefined;
+}
+
+/**
+ * 解析出**确实活着**的桥端点 —— 候选目录逐个 `/health` 探活，择优返回。
+ *
+ * ## 为什么必须有这个函数（2026-09-27 实测踩过，这是"壳反复消失"的真根因）
+ *
+ * 机器上可能同时存在**多份**发现文件：环境变量指向的目录里躺着**上一个
+ * 已死实例**写下的文件，而**当前活着的实例**把文件写在了别处
+ * （实测：`D:\...\_oss_data` 里是死端口 57653，`C:\Users\Administrator\.zcode`
+ * 里是活端口 56483）。
+ *
+ * `resolveBridgeEndpoint()` 会返回**排在最前**的那个，不管它死没死。
+ * 一旦它返回死端口：
+ *
+ *   `probeBridge()` false → 保活判「壳死了」
+ *     → `killResidualInstances()` 杀掉**正在正常服务**的那个实例
+ *     → spawn 新实例 → 新实例又把文件写到别处 → 再判死 → 死循环
+ *
+ * 观测现象：进程树每 10-30 秒整体消失一次，桥却从来没坏过。
+ *
+ * ⇒ **候选之间用探活来裁定，不用"谁是第一个"来裁定。**
+ *   先试首选候选（省一次 HTTP），失败再并发探其余候选。
+ */
+export async function resolveLiveBridgeEndpoint(
+  timeoutMs = 2_000,
+): Promise<ZCodeBridgeEndpoint | undefined> {
+  const envBase = process.env[BASE_URL_ENV]?.trim();
+  const envToken = process.env[TOKEN_ENV]?.trim();
+  if (envBase !== undefined && envBase.length > 0) {
+    if (envToken === undefined || envToken.length === 0) {
+      return undefined;
+    }
+    const explicit: ZCodeBridgeEndpoint = {
+      baseUrl: stripTrailingSlash(envBase),
+      token: envToken,
+      source: "env",
+      models: [],
+    };
+    return (await probeBridge(explicit, timeoutMs)) ? explicit : undefined;
+  }
+
+  // 收集所有候选目录里**格式合法**的发现文件（按优先级排序）。
+  const candidates: ZCodeBridgeEndpoint[] = [];
+  for (const dir of candidateDataDirs()) {
+    const file = readBridgePortFile(join(dir, BRIDGE_PORT_FILE_RELATIVE));
+    if (file === undefined) {
+      continue;
+    }
+    const endpoint: ZCodeBridgeEndpoint = {
+      baseUrl: `http://${file.host}:${file.port}`,
+      token: file.token,
+      source: "discovery-file",
+      models: file.models,
+    };
+    if (!candidates.some((c) => c.baseUrl === endpoint.baseUrl)) {
+      candidates.push(endpoint);
+    }
+  }
+
+  if (candidates.length === 0) {
+    return undefined;
+  }
+
+  // 首选单独探（最常见情况：第一个就是活的，省掉并发开销）。
+  const [first, ...rest] = candidates as [ZCodeBridgeEndpoint, ...ZCodeBridgeEndpoint[]];
+  if (await probeBridge(first, timeoutMs)) {
+    return first;
+  }
+
+  // 首选是死的 —— 并发探其余候选，取第一个活的。
+  // 用 `allSettled` 而非 `race`：需要"至少一个成功"，不是"最快返回"。
+  if (rest.length === 0) {
+    return undefined;
+  }
+  const settled = await Promise.allSettled(rest.map((e) => probeBridge(e, timeoutMs)));
+  for (let i = 0; i < rest.length; i += 1) {
+    const outcome = settled[i];
+    if (outcome !== undefined && outcome.status === "fulfilled" && outcome.value) {
+      return rest[i];
+    }
+  }
   return undefined;
 }
 

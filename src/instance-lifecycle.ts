@@ -34,7 +34,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -42,7 +42,13 @@ import {
   DATA_BASE_DIR_ENV,
   TOKEN_ENV,
 } from "./product.js";
-import { resolveDataBaseDir, resolveBridgePortFilePath, resolveBridgeEndpoint, probeBridge } from "./bridge-endpoint.js";
+import {
+  resolveDataBaseDir,
+  resolveBridgePortFilePath,
+  resolveBridgeEndpoint,
+  resolveLiveBridgeEndpoint,
+  probeBridge,
+} from "./bridge-endpoint.js";
 
 /** 启动 ZCode 实例所需的配置。 */
 export interface ZCodeInstanceSpawnConfig {
@@ -377,11 +383,13 @@ export function startKeepAlive(
  * 从而制造出"桥明明活着却被判定为死"的假阴性。
  */
 async function bridgeAlive(): Promise<boolean> {
-  const endpoint = resolveBridgeEndpoint();
-  if (endpoint === undefined) {
-    return false;
-  }
-  return probeBridge(endpoint);
+  // ⚠ 必须用 `resolveLiveBridgeEndpoint()` —— 它会**逐候选探活**。
+  //
+  // 用 `resolveBridgeEndpoint()` 会在「环境变量指向一个已死实例写下的
+  // 过期发现文件」时返回死端口，于是这个函数返回 false，保活判「壳死了」，
+  // 去杀掉那个**正在正常服务**的实例。实测就是这个死循环让进程树
+  // 每 10-30 秒整体消失一次。
+  return (await resolveLiveBridgeEndpoint()) !== undefined;
 }
 
 /**
@@ -416,20 +424,61 @@ function killResidualInstances(
     // ⚠ 路径用单引号包裹并转义内部单引号，避免反斜杠被当成转义序列
     //   （实测踩过：路径里出现 `\\` 会导致匹配全部落空，清理静默失效）。
     const escaped = electronPath.replace(/'/g, "''");
+    // ── 启动宽限期（2026-09-27 实测踩过，这是自杀式重启循环的根源）──────
+    //
+    // 旧实现无差别杀掉所有匹配的实例。实测后果是一个**闭环**：
+    //
+    //   桥启动需要约 3 秒（写发现文件 → 监听端口）
+    //     ↓ 保活的 tick（每 10 秒）在这 3 秒窗口内跑到
+    //   判「桥不可用」（端口还没监听）
+    //     ↓ killResidualInstances() 杀掉**刚启动的**那个实例
+    //   spawn 新实例 → 新桥又要 3 秒 → 又被杀 → 无限循环
+    //
+    // 观测到的现象：`bridge.started` 日志写了、发现文件也写了，但
+    // 端口始终不通，且 `instancePid` 反复变化。
+    //
+    // ⇒ **只杀"存在超过宽限期"的实例**。刚启动的（进程年龄 < 45 秒）
+    //   一律放过 —— 它可能正在监听端口的路上。
+    //
+    // 45 秒的依据：实测冷启动到 `bridge.started` 约 3 秒，但机器繁忙时
+    // 可能到 20-30 秒；留一倍余量。
+    const GRACE_MS = 45_000;
     const script =
       `Get-CimInstance Win32_Process -Filter "Name='electron.exe'" | ` +
       `Where-Object { $_.ExecutablePath -eq '${escaped}' -and $_.CommandLine -notmatch '--type=' } | ` +
-      `Select-Object -ExpandProperty ProcessId`;
+      `ForEach-Object { ` +
+      `  $age = ((Get-Date) - $_.CreationDate).TotalMilliseconds; ` +
+      `  if ($age -gt ${GRACE_MS}) { $_.ProcessId } ` +
+      `  else { Write-Output "GRACE:$($_.ProcessId):$([int]($age/1000))" } ` +
+      `}`;
     const out = execFileSync("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
       encoding: "utf8",
       timeout: 15_000,
       stdio: ["ignore", "pipe", "ignore"],
     });
 
-    const pids = out
-      .split(/\r?\n/)
-      .map((line) => Number(line.trim()))
-      .filter((n) => Number.isInteger(n) && n > 0);
+    const pids: number[] = [];
+    const inGrace: string[] = [];
+    for (const line of out.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) continue;
+      if (trimmed.startsWith("GRACE:")) {
+        // 格式 GRACE:<pid>:<ageSeconds> —— 只记录，不杀。
+        inGrace.push(trimmed.slice(6));
+        continue;
+      }
+      const n = Number(trimmed);
+      if (Number.isInteger(n) && n > 0) {
+        pids.push(n);
+      }
+    }
+
+    if (inGrace.length > 0) {
+      logger.info(
+        `[zcode-bridge] 跳过 ${inGrace.length} 个处于启动宽限期的实例`
+          + `（pid:年龄秒 = ${inGrace.join(", ")}）`,
+      );
+    }
 
     if (pids.length === 0) {
       return;
@@ -486,8 +535,8 @@ export async function spawnZCodeInstance(
   //   纯粹的破坏动作，把唯一能让插件找到桥的凭据抹掉。
   //
   //   判据用 `/health`（端口通不通），不用文件在不在。
-  const existing = resolveBridgeEndpoint();
-  if (existing !== undefined && (await probeBridge(existing))) {
+  const existing = await resolveLiveBridgeEndpoint();
+  if (existing !== undefined) {
     logger.info(
       `[zcode-bridge] 已有桥在 ${existing.baseUrl} 上运行，复用而不重启（不删发现文件）`,
     );
@@ -539,6 +588,37 @@ export async function spawnZCodeInstance(
   });
   child.unref();
 
+  // 【诊断】把实际传给子进程的关键环境变量落盘。
+  //
+  // 为什么需要：`ZCODE_BRIDGE=1` 明明在 env 里，壳却不下桥（日志里连
+  // `bridge.started` 都没有，`ZCode bridge skipped` 也没有 → 说明
+  // host 进程读到的 `ZCODE_BRIDGE` 不是 "1"）。
+  //
+  // 而 host 是 **electron 的 utility 子进程**，不是我们直接 spawn 的那层 ——
+  // 它的环境块由 electron 传递，中间可能被改写。这个文件用来确认
+  // "我们传出去的" 与 "host 实际读到的" 是否一致。
+  try {
+    const seen = {
+      at: Date.now(),
+      spawnedPid: child.pid,
+      ZCODE_BRIDGE: "1",
+      ZCODE_HEADLESS: "1",
+      ZCODE_QUIET: "1",
+      ZCODE_ENV: "production",
+      dataBaseDir: config.dataBaseDir,
+      // 记下进程自身环境里这几个键的**原始值**，便于对比。
+      inheritedZcodeBridge: process.env["ZCODE_BRIDGE"],
+      inheritedHeadless: process.env["ZCODE_HEADLESS"],
+      inheritedAutostart: process.env["ZCODE_BRIDGE_AUTOSTART"],
+    };
+    appendFileSync(
+      join(config.dataBaseDir, "bridge-spawn-env.ndjson"),
+      `${JSON.stringify(seen)}\n`,
+    );
+  } catch {
+    // 诊断失败不影响启动。
+  }
+
   const pid = child.pid;
   if (pid === undefined) {
     logger.warn("[zcode-bridge] 实例启动失败：未拿到 pid");
@@ -561,7 +641,8 @@ export async function spawnZCodeInstance(
       currentInstanceId !== previousInstanceId &&
       (await bridgeAlive())
     ) {
-      logger.info(`[zcode-bridge] 桥就绪（新 instanceId），baseUrl=${resolveBridgeEndpoint()?.baseUrl}`);
+      const live = await resolveLiveBridgeEndpoint();
+      logger.info(`[zcode-bridge] 桥就绪（新 instanceId），baseUrl=${live?.baseUrl}`);
       return pid;
     }
 
@@ -579,7 +660,8 @@ export async function spawnZCodeInstance(
     // ── 就绪判据 3：没有旧记录（首次启动）且 /health 通 ──────────────
     //   这一条覆盖"此前从来没有发现文件"的场景 —— 此时没有可比对的旧值。
     if (previousInstanceId === undefined && previousPort === undefined && (await bridgeAlive())) {
-      logger.info(`[zcode-bridge] 桥就绪（首次启动），baseUrl=${resolveBridgeEndpoint()?.baseUrl}`);
+      const live = await resolveLiveBridgeEndpoint();
+      logger.info(`[zcode-bridge] 桥就绪（首次启动），baseUrl=${live?.baseUrl}`);
       return pid;
     }
   }

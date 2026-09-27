@@ -68,6 +68,7 @@ import {
 import {
   probeBridge,
   resolveBridgeEndpoint,
+  resolveLiveBridgeEndpoint,
 } from "./bridge-endpoint.js";
 import type { ZCodeBridgeEndpoint } from "./product.js";
 import type { ModelVisibility } from "./model-visibility.js";
@@ -92,6 +93,21 @@ export interface ZCodeBridgeAdapterOptions {
    * 拿全量目录来渲染开关。省略则不过滤（headless/CLI profile 无需开关）。
    */
   readonly visibility?: ModelVisibility;
+  /**
+   * 【按需拉起】确保壳可用；不可用就自己拉起来并等就绪。
+   *
+   * 由 `index.ts` 注入（那里才有 `spawnConfig` 与保活上下文）。
+   * 返回 `true` = 桥可用。
+   *
+   * ## 为什么放在适配器里而不是只在插件启动时做
+   *
+   * 早先只有「DSH 启动时拉起」+「后台保活」。壳挂掉后用户一发消息就直接吃
+   * `MISSING_CREDENTIAL`，得自己想办法重启 —— 那是把「壳没跑」当成用户的错误。
+   *
+   * `prepareCall()` 是**每轮请求开始**的挂载点，在这兜底最合适：
+   * 用户点发送 → 插件先确保依赖在 → 再真正发请求。
+   */
+  readonly ensureReady?: () => Promise<boolean>;
 }
 
 /**
@@ -305,6 +321,21 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
   private advertisedModelIds: Set<string> | undefined;
   /** 模型可见性（拨动开关）。未注入时不过滤。 */
   private visibility: ModelVisibility | undefined;
+  /**
+   * 【流式】收到**第一个**文本增量时的回调。
+   *
+   * 用途：让 `stream()` 不必干等整轮结束就能开始输出。
+   *
+   * 为什么是「首个」而不是「每个增量」：工具调用的解析需要完整文本
+   * （见 `consumeSse` 的说明），所以只借首字节做一件事 —— **尽快开一个
+   * 文本块**，消除「卡在思考、不吐文本」的空白期。
+   */
+  private onFirstText: (() => void) | undefined;
+  /** 【按需拉起】插件注入的「确保壳可用」回调。 */
+  private ensureReady: (() => Promise<boolean>) | undefined;
+  /** 上次「确保」的结果与时间 —— 避免每轮都白等一次探测。 */
+  private lastEnsureAt = 0;
+  private lastEnsureOk = false;
 
   constructor(options: ZCodeBridgeAdapterOptions = {}) {
     super();
@@ -313,6 +344,7 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.chunkChars = Math.max(1, options.chunkChars ?? DEFAULT_CHUNK_CHARS);
     this.visibility = options.visibility;
+    this.ensureReady = options.ensureReady;
   }
 
   /** 生命周期钩子：注册后调用，可空。 */
@@ -329,6 +361,135 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
   /** 当前端点的来源（`env` / `discovery-file` / `unavailable`），供诊断。 */
   endpointSource(): string {
     return this.lastResolvedSource;
+  }
+
+  /**
+   * 消费桥的 SSE 流，合成为一次完整响应。
+   *
+   * ## 为什么"合成完整响应"而不是边收边 yield
+   *
+   * 工具调用的解析必须拿到**完整文本**才能做（JSON 围栏可能跨多个 delta）。
+   * 边流边解析会引入"半个围栏"的中间态，极易误判 —— 而误判的代价是
+   * DSH 去执行一个模型根本没要求的工具。
+   *
+   * 所以这里只做两件事：
+   *   1. **尽快感知到"已经有内容了"** —— 通过 `onFirstText` 回调让上层
+   *      立刻发一个文本块开始（消除"卡在思考"的空白期）
+   *   2. 合成完整 payload，交给原有解析逻辑
+   *
+   * ## 与"真正流式"的差别
+   *
+   * 用户看到的是**先出现一个文本块、随后一次性补全**，而不是逐字冒出。
+   * 这是刻意取舍：正确性优先于观感。若将来要逐字流，需要让桥把
+   * "工具协议围栏"与"普通文本"分开推 —— 那是另一层改造。
+   */
+  private async consumeSse(
+    response: Response,
+    outerSignal: AbortSignal | undefined,
+  ): Promise<BridgeChatResponse> {
+    const body = response.body;
+    if (body === null) {
+      // 没有流（某些环境会这样）—— 退回整包解析。
+      return (await response.json()) as BridgeChatResponse;
+    }
+
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let content = "";
+    let finishReason: string | undefined;
+    let toolCalls: unknown[] | undefined;
+    let usage: BridgeChatResponse["usage"];
+
+    // 首字节回调 —— 让上层能立刻开始输出，不必等整轮结束。
+    let announced = false;
+
+    try {
+      for (;;) {
+        if (outerSignal?.aborted === true) {
+          break;
+        }
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE 以空行分帧。保留最后一段（可能不完整）。
+        let sep = buffer.indexOf("\n\n");
+        while (sep >= 0) {
+          const frame = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+          sep = buffer.indexOf("\n\n");
+
+          for (const line of frame.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (data.length === 0 || data === "[DONE]") continue;
+
+            let chunk: {
+              choices?: Array<{
+                delta?: { content?: unknown; tool_calls?: unknown };
+                finish_reason?: unknown;
+              }>;
+              usage?: BridgeChatResponse["usage"];
+              error?: { message?: unknown };
+            };
+            try {
+              chunk = JSON.parse(data) as typeof chunk;
+            } catch {
+              continue;
+            }
+
+            if (chunk.error !== undefined) {
+              throw new LlmError(
+                `zcode-bridge: 桥在流中报错: ${
+                  typeof chunk.error.message === "string" ? chunk.error.message : "unknown"
+                }`,
+                "SERVER",
+              );
+            }
+
+            const choice = chunk.choices?.[0];
+            const deltaContent = choice?.delta?.content;
+            if (typeof deltaContent === "string" && deltaContent.length > 0) {
+              content += deltaContent;
+              if (!announced) {
+                announced = true;
+                this.onFirstText?.();
+              }
+            }
+            if (Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0) {
+              toolCalls = choice.delta.tool_calls;
+            }
+            if (typeof choice?.finish_reason === "string" && choice.finish_reason.length > 0) {
+              finishReason = choice.finish_reason;
+            }
+            if (chunk.usage !== undefined) {
+              usage = chunk.usage;
+            }
+          }
+        }
+      }
+    } finally {
+      reader.releaseLock?.();
+      this.onFirstText = undefined;
+    }
+
+    // 合成与整包 JSON **同形**的 payload —— 后续解析逻辑一行都不用改。
+    const synthesized: BridgeChatResponse & { tool_calls?: unknown[] } = {
+      choices: [
+        {
+          index: 0,
+          message: {
+            role: "assistant",
+            content,
+            ...(toolCalls === undefined ? {} : { tool_calls: toolCalls }),
+          },
+          ...(finishReason === undefined ? {} : { finish_reason: finishReason }),
+        },
+      ],
+      ...(usage === undefined ? {} : { usage }),
+    };
+    return synthesized;
   }
 
   /**
@@ -402,15 +563,12 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
    * 让同步的 `listAllModels()` 也能拿到。
    */
   async refreshCatalog(): Promise<boolean> {
-    const endpoint = resolveBridgeEndpoint();
+    // ⚠ 必须用探活择优版 —— `resolveBridgeEndpoint()` 可能在环境变量目录里
+    //   读到**已死实例**写下的过期发现文件，把健康的桥判成不可用，
+    //   于是 provider 分组整个从设置页消失（实测踩过）。
+    const endpoint = await resolveLiveBridgeEndpoint();
     if (endpoint === undefined) {
       this.lastResolvedSource = "unavailable";
-      this.advertisedModelIds = undefined;
-      return false;
-    }
-    const alive = await probeBridge(endpoint);
-    if (!alive) {
-      this.lastResolvedSource = `${endpoint.source}:unreachable`;
       this.advertisedModelIds = undefined;
       return false;
     }
@@ -448,12 +606,35 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
    * 新版 `LlmRuntime.prepareCall()` 会调用 `registration.adapter.prepareCall(...)`；
    * 基类缺该方法时每轮请求开始会抛 `prepareCall is not a function`。
    * Jet Hub 的 zcode / qoder / buddy 三处都是同款写法。
+   *
+   * ## 【按需拉起】这里是确保壳可用的挂载点
+   *
+   * `prepareCall` 是**每轮请求开始**都会走的路径，所以在这兜底最自然：
+   * 用户点发送 → 先确保依赖在 → 再真正发请求。
+   *
+   * 注入了 `ensureReady` 时才做，且**失败不抛错** —— 让后续 `stream()`
+   * 自己去报那条更明确的 `MISSING_CREDENTIAL`（它知道怎么描述缺什么）。
    */
   async prepareCall(provider: string, model: string, signal?: AbortSignal) {
+    if (this.ensureReady !== undefined) {
+      try {
+        const ok = await this.ensureReady();
+        this.lastEnsureOk = ok;
+        this.lastEnsureAt = Date.now();
+      } catch {
+        // 拉起失败不在这里抛 —— 交给 stream() 报更明确的错。
+        this.lastEnsureOk = false;
+      }
+    }
     return {
       model: await this.resolveModel(provider, model, signal),
       stream: (options: GenerateOptions) => this.stream(options),
     };
+  }
+
+  /** 上次「按需拉起」的结果（供设置页/诊断显示）。 */
+  ensureStatus(): { ok: boolean; at: number } {
+    return { ok: this.lastEnsureOk, at: this.lastEnsureAt };
   }
 
   /**
@@ -465,7 +646,10 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
     // 1. 解析端点。缺失即明确报错 —— stream 是请求路径，
     //    静默产空流会让用户看到"模型不说话"而无从排查。
-    const endpoint = resolveBridgeEndpoint();
+    //
+    //    用探活择优版：本地可能同时存在多份发现文件（环境变量目录里那份
+    //    属于已死实例），只按"第一个读到的"选会稳定打到死端口。
+    const endpoint = await resolveLiveBridgeEndpoint();
     if (endpoint === undefined) {
       throw new LlmError(
         "zcode-bridge: 找不到 ZCode 桥。请确认 ZCode 实例正在运行，"
@@ -512,11 +696,30 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
 
     let payload: BridgeChatResponse;
     try {
+      // ── 流式请求 ──────────────────────────────────────────────────────
+      //
+      // ## 为什么必须流式（实测踩过）
+      //
+      // 桥原先等整包才返回。一次请求 20-120 秒期间 DSH 拿不到任何东西，
+      // 界面上表现为「**卡在思考、不吐文本**」—— 这是用户报的最主要症状。
+      //
+      // 实测延迟构成（壳日志时间线）：
+      //   captcha 0.4s ＋ 桥自身 0.1s ＋ **agent turn 循环 ~19.9s**
+      //
+      // 那 19.9 秒是免费额度通道的固有速度，改不动；但**已经产生的部分文本
+      // 可以尽早吐出来**，用户就能看到字在往外冒，而不是盯着"思考中"。
+      //
+      // ## 增量怎么用
+      //
+      // 本函数把增量**转成异步队列**，与后续的解析逻辑解耦：
+      // 流式阶段只负责"把文本块尽早 yield 出去"，工具调用等解析仍按
+      // 完整文本走原有逻辑（那边的契约更严格，不能边流边解析）。
+      const acceptHeader = "text/event-stream";
       const response = await fetch(`${endpoint.baseUrl}${CHAT_COMPLETIONS_PATH}`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Accept: "application/json",
+          Accept: acceptHeader,
           Authorization: `Bearer ${endpoint.token}`,
           // ★ DSH 的硬性契约：每个 provider HTTP 请求都必须带 attributionHeaders()。
           //   库类型注释原文："Every provider HTTP request must include
@@ -525,7 +728,7 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
           //   桥会忽略未知头，所以这些不会影响桥的行为。
           ...attributionHeaders(),
         },
-        body: JSON.stringify(body),
+        body: JSON.stringify({ ...body, stream: true }),
         signal: abortController.signal,
       });
 
@@ -537,7 +740,14 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
           { status: response.status },
         );
       }
-      payload = (await response.json()) as BridgeChatResponse;
+
+      // 桥未按 SSE 返回时（旧版本桥）退回整包 JSON —— 保证向后兼容。
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.includes("text/event-stream")) {
+        payload = (await response.json()) as BridgeChatResponse;
+      } else {
+        payload = await this.consumeSse(response, options.signal);
+      }
     } catch (error) {
       if (error instanceof LlmError) {
         throw error;

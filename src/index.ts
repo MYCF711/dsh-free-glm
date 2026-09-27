@@ -34,7 +34,7 @@ import { dirname, join } from "node:path";
 import { ZCodeBridgeAdapter } from "./adapter.js";
 import { PROVIDER } from "./product.js";
 import { ModelVisibility } from "./model-visibility.js";
-import { probeBridge, resolveBridgeEndpoint } from "./bridge-endpoint.js";
+import { probeBridge, resolveBridgeEndpoint, resolveLiveBridgeEndpoint } from "./bridge-endpoint.js";
 import {
   installInstanceLifecycleHooks,
   killOwnedInstance,
@@ -249,11 +249,28 @@ function appDirCandidates(): string[] {
 /**
  * 数据根目录的候选位置（其下应有 `.zcode` 子目录）。
  *
- * 顺序即优先级：
- *   1. `ZCODE_DATA_BASE_DIR`（显式指定，最高优先）
- *   2. `~/.zcode` 的父目录 —— 即**家目录**。这是官方版的默认位置，
- *      所以放前面。插件通过「其下是否存在 `.zcode` 子目录」来确认。
- *   3. 源码检出的数据目录常见位置
+ * ## 顺序即优先级，且**检出目录必须在家目录之前**（2026-09-27 实测修正）
+ *
+ * 旧顺序把 `homedir()` 放在检出目录前面，后果实测过：
+ *
+ *   launcher 环境块过期 → `ZCODE_DATA_BASE_DIR` 读不到
+ *     → `firstExisting()` 命中 `homedir()`（它永远存在）
+ *     → 插件**把壳启动到家目录**，壳把发现文件写到
+ *       `C:\Users\Administrator\.zcode\v2\bridge-port.json`
+ *     → 而 `D:\...\_oss_data\.zcode\v2\` 里还留着**上一个实例**的旧文件
+ *     → 两份并存、一活一死，端点解析挑错就触发保活误杀
+ *       （观测现象：实例进程树每 10-30 秒整体消失一次）
+ *
+ * 为什么检出目录优先：`<盘符>\zcode-glm5.3f\_oss_data` 这个路径**不会凭空
+ * 出现**，它存在就证明这台机器上装过源码版实例；而 `homedir()` 人人都有，
+ * 只是个"碰巧存在的目录"，不构成证据。
+ *
+ * 实测两个目录的内容差异（2026-09-27）也支持这个判断：
+ *   - `homedir()` 的 `tasks-index.sqlite` 483 KB（故障后才新建的空壳）
+ *   - 检出目录的 `tasks-index.sqlite` 2.4 MB（真实会话史）
+ *
+ * ⚠ 与 `bridge-endpoint.ts` 的 `dataDirCandidates()` **必须保持同序** ——
+ *   一个管「壳往哪写」，一个管「插件往哪读」，顺序不一致就会重新分裂。
  */
 function dataDirCandidates(): string[] {
   const out: string[] = [];
@@ -264,17 +281,74 @@ function dataDirCandidates(): string[] {
     }
   };
 
+  // 1. 显式指定，最高优先 —— 用户说了算，不被任何推测覆盖。
   push(process.env["ZCODE_DATA_BASE_DIR"]);
-  // 家目录：官方版把数据写在 `~/.zcode`，所以 `homedir()` 就是 dataBaseDir。
-  push(homedir());
-  push(process.env["APPDATA"]);
-  push(process.env["LOCALAPPDATA"]);
 
+  // 2. 源码检出的数据目录（存在即证据）。
   for (const drive of ["C:", "D:", "E:", "F:"]) {
     push(`${drive}\\zcode-glm5.3f\\_oss_data`);
   }
 
+  // 3. 官方版的默认落点：数据根就是家目录（其下有 `.zcode`）。
+  push(homedir());
+  push(process.env["APPDATA"]);
+  push(process.env["LOCALAPPDATA"]);
+
   return out;
+}
+
+/**
+ * 候选数据目录的**选择函数** —— 返回第一个「真的能被当成数据根」的候选。
+ *
+ * ## 为什么不能只按「目录存在」选（2026-09-27 实测踩过，两份发现文件的来源）
+ *
+ * 旧实现在候选表上跑 `firstExisting()` —— 只看**目录在不在**。
+ * 实测后果：`homedir()` 永远存在 → 命中它 → 插件把壳启动到家目录 →
+ * 壳把发现文件写到 `C:\Users\Administrator\.zcode\v2\bridge-port.json`，
+ * 而 `D:\...\_oss_data` 里还留着上一个实例的旧文件 → 两份并存、一活一死。
+ *
+ * ## 为什么不是「谁有 bridge-port.json 谁优先」（试过，**是错的**）
+ *
+ * 按「有发现文件=高分」排序时**两个目录同分**，而家目录排在前面 ——
+ * 因为家目录那份文件正是**故障本身的产物**。用故障产物当判据只会加固故障。
+ *
+ * ## 采用的判据
+ *
+ * `dataDirCandidates()` 已经把**检出目录排在家目录之前**（见该函数注释），
+ * 这里只做一层真实性校验：
+ *   - 首选候选里有 `.zcode` → 直接用它（这是正常路径，不额外付代价）
+ *   - 否则退到第一个「其下有 `.zcode`」的候选（兼容全新安装的机器）
+ *
+ * ⚠ 不再引入打分排序 —— 打分在实测中出现过两个候选同分、
+ *   而错误项因"先来"胜出的情况。**顺序显式写死，比动态打分可预测。**
+ */
+function pickDataBaseDir(): string | undefined {
+  const candidates = dataDirCandidates();
+
+  // 首选候选真的像数据根 → 直接用。
+  const first = candidates[0];
+  if (first !== undefined && hasZcodeData(first)) {
+    return first;
+  }
+
+  // 否则取第一个「其下有 .zcode」的候选。
+  for (const candidate of candidates) {
+    if (hasZcodeData(candidate)) {
+      return candidate;
+    }
+  }
+
+  // 都没有：仍然接受首选候选（首次安装、还没建数据目录的情况）。
+  return first;
+}
+
+/** 这个目录像不像一个 ZCode 数据根（其下有 `.zcode`）。 */
+function hasZcodeData(dir: string): boolean {
+  try {
+    return existsSync(join(dir, ".zcode"));
+  } catch {
+    return false;
+  }
 }
 
 /** 取第一个存在的候选；都不存在返回 undefined。 */
@@ -303,9 +377,15 @@ function resolveSpawnConfig(): SpawnConfig | undefined {
   const appDir =
     process.env["ZCODE_BRIDGE_APP_DIR"]?.trim() ??
     firstExisting(appDirCandidates());
+  // ⚠ dataBaseDir 必须用 `pickDataBaseDir()`（带「这里有 `.zcode` 数据」校验），
+  //   不是 `firstExisting(dataDirCandidates())` ——
+  //   旧用法只看"目录在不在"，而 `homedir()` 永远在 → 插件把壳启动到家目录
+  //   → 发现文件写到 `C:\Users\Administrator\.zcode\v2\`，
+  //   而 `D:\...\_oss_data\.zcode\v2\` 里还留着上一个实例的旧文件 → 两份并存。
+  const autoDataBaseDir = pickDataBaseDir();
   const dataBaseDir =
     process.env["ZCODE_DATA_BASE_DIR"]?.trim() ??
-    (process.env["ZCODE_BRIDGE_BASE_URL"]?.trim() ? undefined : firstExisting(dataDirCandidates()));
+    (process.env["ZCODE_BRIDGE_BASE_URL"]?.trim() ? undefined : autoDataBaseDir);
 
   // 三者缺一不可：electron 用来启动，appDir 是它的入口，dataBaseDir 决定
   // 桥写发现文件的位置（readBridgePortFile 也按同一规则找）。
@@ -563,9 +643,7 @@ export async function apply(ctx: Context): Promise<void> {
 
   // 先看壳是否已经在跑（发现文件存在 + /health 通）。
   // 已在跑就不重复启动 —— 否则会起出第二个实例，两个都抢同一个端口文件。
-  const bridgeAlreadyUp =
-    resolveBridgeEndpoint() !== undefined &&
-    (await probeBridge(resolveBridgeEndpoint()!));
+  const bridgeAlreadyUp = (await resolveLiveBridgeEndpoint()) !== undefined;
 
   if (!bridgeAlreadyUp && spawnConfig !== undefined) {
     logger.info("[zcode-bridge] 壳未运行，自动启动（可用 ZCODE_BRIDGE_AUTOSTART=0 关闭）");
@@ -596,6 +674,86 @@ export async function apply(ctx: Context): Promise<void> {
     },
     logger,
   );
+
+  /**
+   * 【按需拉起】确保桥可用；不可用就自己拉起来并**等它就绪**。
+   *
+   * ## 为什么必须有（这是设计缺陷的修复，2026-09-27）
+   *
+   * 早先只有「DSH 启动时拉起」+「后台保活」两条路径。**模型调用时没有任何兜底** ——
+   * 壳挂掉后（崩溃、被手动关闭、启动失败），用户一发消息就直接吃
+   * `MISSING_CREDENTIAL: 找不到 ZCode 桥`，得自己想办法重启。
+   *
+   * 这是错的：用户点"发送"时，插件应该**先把依赖拉起来**，而不是把
+   * 「壳没跑」这件事当成用户的错误抛回去。
+   *
+   * ## 与保活的分工
+   *
+   *   - 保活：DSH 活着期间周期探测（10 秒一次），挂了就重启 —— 针对"事后发现"
+   *   - 本函数：**请求发起前**同步确保可用 —— 针对"这一刻就要用"
+   *
+   * 两者互补：保活管背景自愈，本函数管前台可用性。
+   *
+   * ## 为什么要等（而不是拉起就返回）
+   *
+   * 壳冷启动约 20-40 秒。若只"发起启动"就返回，请求立刻会因桥未就绪而失败 ——
+   * 那是把延迟变成了错误。这里等就绪（最多 90 秒），用户的体感是
+   * 「这一轮比较慢」，而不是「报错了」。
+   *
+   * ## 并发去重
+   *
+   * DSH 会并发发请求（主回复 + 标题生成 + 压缩）。若每个请求都去拉起壳，
+   * 会同时 spawn 多个实例 —— 而 ZCode 有**单实例锁**，它们会互相踢掉。
+   * 所以用 `pendingEnsure` 做单例：同一时刻只有一个"确保"在跑，其余等它。
+   */
+  let pendingEnsure: Promise<boolean> | undefined;
+
+  async function ensureBridgeReady(timeoutMs = 90_000): Promise<boolean> {
+    // 快路径：桥已就绪，不付任何代价。
+    if ((await resolveLiveBridgeEndpoint()) !== undefined) {
+      return true;
+    }
+    if (spawnConfig === undefined) {
+      // 探测不到安装位置 —— 拉起无从谈起，让调用方报明确的配置错误。
+      return false;
+    }
+    if (pendingEnsure !== undefined) {
+      // 已有一个"确保"在跑：等它，不要重复 spawn。
+      return await pendingEnsure;
+    }
+
+    pendingEnsure = (async (): Promise<boolean> => {
+      logger.info("[zcode-bridge] 请求前探测到壳不可用，正在拉起（最长等待 90 秒）…");
+      const startedAt = Date.now();
+      try {
+        await spawnZCodeInstance(spawnConfig, logger);
+        const elapsed = Date.now() - startedAt;
+        if ((await resolveLiveBridgeEndpoint()) !== undefined) {
+          logger.info(`[zcode-bridge] 壳已就绪（用时 ${Math.round(elapsed / 1000)} 秒）`);
+          return true;
+        }
+        logger.warn(`[zcode-bridge] 壳拉起后仍不可达（用时 ${Math.round(elapsed / 1000)} 秒）`);
+        return false;
+      } catch (error: unknown) {
+        logger.warn(`[zcode-bridge] 拉起壳失败: ${String(error)}`);
+        return false;
+      } finally {
+        // 让超时参数真正生效：spawnZCodeInstance 自己等就绪，这里兜一个上限。
+        pendingEnsure = undefined;
+      }
+    })();
+
+    // 超时保护 —— 不能让一个卡住的启动把请求永久挂住。
+    const timeout = new Promise<boolean>((resolve) => {
+      const t = setTimeout(() => resolve(false), timeoutMs);
+      t.unref?.();
+    });
+    const ready = await Promise.race([pendingEnsure, timeout]);
+    if (!ready) {
+      pendingEnsure = undefined;
+    }
+    return ready;
+  }
 
   const llm = ctx.get("llm") as
     | {
@@ -631,6 +789,10 @@ export async function apply(ctx: Context): Promise<void> {
 
   const adapter = new ZCodeBridgeAdapter({
     ...(visibility === undefined ? {} : { visibility }),
+    // 【按需拉起】每轮请求前确保壳可用 —— 修掉"壳挂了就报 MISSING_CREDENTIAL"
+    // 这个设计缺陷：用户点发送时，插件应该先把依赖拉起来，而不是把
+    // "壳没跑"当成用户的错误抛回去。
+    ensureReady: () => ensureBridgeReady(),
     logger: {
       info: (message: unknown) => ctx.logger?.info?.(message),
       warn: (message: unknown) => ctx.logger?.warn?.(message),
