@@ -1,6 +1,6 @@
 {
   "name": "dsh-zcode-bridge",
-  "version": "0.2.3",
+  "version": "0.4.1",
   "description": "DSH plugin: ZCode free-quota GLM provider via the local ZCode bridge, with prompt-bridged tool calling (requires the ZCode opensource instance running with ZCODE_BRIDGE=1)",
   "type": "module",
   "main": "lib/index.js",

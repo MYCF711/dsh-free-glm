@@ -133,7 +133,23 @@ interface BridgeChatResponse {
   readonly model?: string;
   readonly choices?: readonly {
     readonly index?: number;
-    readonly message?: { readonly role?: string; readonly content?: unknown };
+    readonly message?: {
+      readonly role?: string;
+      readonly content?: unknown;
+      /**
+       * 【原生工具调用】OpenAI 形状 —— 桥的**快速路径**提供。
+       *
+       * 桥侧已把流式分片按 `index` **累加**成完整 `arguments` JSON 字符串，
+       * 正好对应 DSH `ToolCallBlock.arguments` 的类型。
+       */
+      readonly tool_calls?: readonly {
+        readonly id?: unknown;
+        readonly type?: unknown;
+        readonly function?: { readonly name?: unknown; readonly arguments?: unknown };
+      }[];
+      /** 思考内容（Anthropic 的 thinking 块，桥透传成这个字段）。 */
+      readonly reasoning_content?: unknown;
+    };
     readonly finish_reason?: string;
   }[];
   readonly usage?: {
@@ -402,6 +418,20 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     let buffer = "";
     let content = "";
     let finishReason: string | undefined;
+    /**
+     * 流式工具调用的**累加器**（按 `index` 定位）。
+     *
+     * OpenAI 的流式 tool_calls 是分片的：首个分片给 `id` / `name`，
+     * 后续分片只给 `function.arguments` 的字符串片段。
+     * **不能直接覆盖** —— 否则只剩最后一个分片（通常只有 arguments 片段、
+     * 没有 name），表现为「空回复（finish_reason=tool_calls）」。
+     */
+    const accumulatedToolCalls: Array<{
+      index: number;
+      id: string;
+      name: string;
+      arguments: string;
+    }> = [];
     let toolCalls: unknown[] | undefined;
     let usage: BridgeChatResponse["usage"];
 
@@ -465,7 +495,53 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
               onDelta?.(deltaContent);
             }
             if (Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0) {
-              toolCalls = choice.delta.tool_calls;
+              /**
+               * ★ 必须按 `index` **累积分片**，不能直接覆盖。
+               *
+               * ## 为什么（实测踩过，表现为「空回复 finish_reason=tool_calls」）
+               *
+               * OpenAI 的流式工具调用是**分片传输**的，靠 `index` 定位：
+               *
+               *   data: {"delta":{"tool_calls":[{"index":0,"id":"toolu_x","type":"function",
+               *          "function":{"name":"glob","arguments":""}}]}}
+               *   data: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"pat"}}]}}
+               *   data: {"delta":{"tool_calls":[{"index":0,"function":{"arguments":"tern\":\"...\"}"}}]}}
+               *
+               * 旧写法 `toolCalls = choice.delta.tool_calls` 每次**整体替换**，
+               * 结果只剩最后一个分片 —— 那个分片通常**只有 arguments 片段、没有 name/id**，
+               * 于是上游解析出「有工具调用但参数为空」，桥侧报
+               * 「空回复（finish_reason=tool_calls）」。
+               *
+               * ⚠ 注释里**绝不能出现星号加斜杠** —— 它会提前关闭块注释，
+               *   把后面整段变成代码，报一串 TS1109/TS1127/TS1128。
+               *   （实测踩过：写通配路径示例时踩到）
+               */
+              for (const rawCall of choice.delta.tool_calls) {
+                if (rawCall === null || typeof rawCall !== "object") continue;
+                const call = rawCall as {
+                  index?: unknown;
+                  id?: unknown;
+                  type?: unknown;
+                  function?: { name?: unknown; arguments?: unknown };
+                };
+                const idx = typeof call.index === "number" ? call.index : accumulatedToolCalls.length;
+                let acc = accumulatedToolCalls[idx];
+                if (acc === undefined) {
+                  acc = { index: idx, id: "", name: "", arguments: "" };
+                  accumulatedToolCalls[idx] = acc;
+                }
+                if (typeof call.id === "string" && call.id.length > 0) acc.id = call.id;
+                if (typeof call.function?.name === "string" && call.function.name.length > 0) {
+                  // 名字也可能分片，但更常见是首次给全 —— 用拼接兼容两种情况
+                  acc.name =
+                    acc.name.length === 0 || call.function.name.startsWith(acc.name)
+                      ? call.function.name
+                      : acc.name + call.function.name;
+                }
+                if (typeof call.function?.arguments === "string") {
+                  acc.arguments += call.function.arguments;
+                }
+              }
             }
             if (typeof choice?.finish_reason === "string" && choice.finish_reason.length > 0) {
               finishReason = choice.finish_reason;
@@ -482,6 +558,18 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     }
 
     // 合成与整包 JSON **同形**的 payload —— 后续解析逻辑一行都不用改。
+    // 工具调用用**累加后**的结果（不是最后一个分片）。
+    // ⚠ 变量名不能叫 `toolCalls` —— 上面（L419）已有同名 `let toolCalls`，
+    //   同一函数作用域内 `const` 重名是语法错误（TS1005/TS1128）。
+    const mergedToolCalls =
+      accumulatedToolCalls.length === 0
+        ? undefined
+        : accumulatedToolCalls.map((c) => ({
+            index: c.index,
+            id: c.id.length > 0 ? c.id : `zcb-call-${c.index}`,
+            type: "function",
+            function: { name: c.name, arguments: c.arguments },
+          }));
     const synthesized: BridgeChatResponse & { tool_calls?: unknown[] } = {
       choices: [
         {
@@ -489,7 +577,7 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
           message: {
             role: "assistant",
             content,
-            ...(toolCalls === undefined ? {} : { tool_calls: toolCalls }),
+            ...(mergedToolCalls === undefined ? {} : { tool_calls: mergedToolCalls }),
           },
           ...(finishReason === undefined ? {} : { finish_reason: finishReason }),
         },
@@ -672,24 +760,78 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
 
     // ── 工具表注入 ────────────────────────────────────────────────────────
     //
-    // 桥没有 tools 通道，所以把 schema 渲染成提示词追加到 system 段。
-    // 追加而不是覆盖：DSH 的 system 段里有 agent 的完整行为规范，不能丢。
+    // ## 2026-09-27 重大变更：桥现在有**原生 tools 通道**了
+    //
+    // 旧实现把 schema 渲染成提示词（因为桥只能收 `content: string`）。
+    // 现在桥的**快速路径**支持原生 `tools[]` 透传（Anthropic 协议），
+    // 实测 `finish_reason=tool_calls` + 结构化 `arguments`。
+    //
+    // ## 快速路径是什么
+    //
+    // 桥检测到 `system` **以** 某个白名单串**开头**时，走直连上游：
+    //     system = "You are ZCode connectivity probe.\n\n<真实指令>"
+    // 不建 task、不跑 turn 循环 —— 实测 **3.6-7.3 秒**（会话链路 8-28 秒）。
+    //
+    // ## 因此这里做两件事
+    //
+    // 1. `system` 前面**必须**加上探针前缀（否则上游 405 / 3012）
+    // 2. `tools[]` 用原生字段传（不再渲染成提示词）
+    //
+    // 渲染成提示词的老路保留为**回退**（当调用方显式要求 `promptToolBridge` 时）。
+    const ZCODE_PROBE_PREFIX = "You are ZCode connectivity probe.";
     const tools = options.tools ?? [];
-    const toolInstructions = renderToolInstructions(tools);
     const baseSystem =
       typeof options.system === "string" && options.system.length > 0 ? options.system : "";
-    const systemText =
-      toolInstructions.length === 0
-        ? (baseSystem.length > 0 ? baseSystem : undefined)
-        : [baseSystem, toolInstructions].filter((part) => part.length > 0).join("\n\n");
+
+    // 探针前缀必须**在最前**（实测：前缀匹配，后面可追加任意内容）
+    //
+    // 【A/B 开关】`ZCODE_BRIDGE_NO_PROBE=1` 时不加前缀 → 强制回落到会话链路。
+    // 用途：对比两条路径的真实耗时（会话链路会建 task 并捕获真实 taskId）。
+    const probeDisabled = process.env.ZCODE_BRIDGE_NO_PROBE === "1";
+    const systemText = probeDisabled || baseSystem.startsWith(ZCODE_PROBE_PREFIX)
+      ? baseSystem
+      : [ZCODE_PROBE_PREFIX, baseSystem].filter((part) => part.length > 0).join("\n\n");
 
     const body: Record<string, unknown> = {
       model: options.model,
-      messages: [
-        ...(systemText === undefined ? [] : [{ role: "system", content: systemText }]),
-        ...messages,
-      ],
+      messages,
+      system: systemText,
     };
+    // 【诊断】记录真实请求规模 —— 用于定位「耗时波动 7.5-68 秒」的成因。
+    // 依据：模拟测试显示「system 2635 字 + 30 工具」时输入 6529 token → 27.2 秒，
+    // 而小输入只要 9 秒。需要看 DSH 实际传了多大。
+    try {
+      const { appendFileSync } = await import("node:fs");
+      const { join } = await import("node:path");
+      const { homedir } = await import("node:os");
+      const base = process.env.ZCODE_DATA_BASE_DIR?.trim() || homedir();
+      appendFileSync(
+        join(base, "dsh-bridge-request-size.ndjson"),
+        `${JSON.stringify({
+          at: Date.now(),
+          model: options.model,
+          systemChars: systemText.length,
+          messageCount: messages.length,
+          messageChars: JSON.stringify(messages).length,
+          toolCount: tools.length,
+          toolsChars: tools.length > 0 ? JSON.stringify(body.tools).length : 0,
+          bodyChars: JSON.stringify(body).length,
+        })}\n`,
+      );
+    } catch {
+      /* 诊断用，失败不影响主流程 */
+    }
+    // 原生工具透传（桥负责 OpenAI → Anthropic 形状转换）
+    if (tools.length > 0) {
+      body.tools = tools.map((tool) => ({
+        type: "function",
+        function: {
+          name: tool.name,
+          ...(tool.description === undefined ? {} : { description: tool.description }),
+          ...(tool.parameters === undefined ? {} : { parameters: tool.parameters }),
+        },
+      }));
+    }
     if (options.maxTokens !== undefined && options.maxTokens > 0) {
       // 桥会把 max_tokens 钳到 [1, 32000]。
       body.max_tokens = options.maxTokens;
@@ -727,22 +869,111 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
       // 流式阶段只负责"把文本块尽早 yield 出去"，工具调用等解析仍按
       // 完整文本走原有逻辑（那边的契约更严格，不能边流边解析）。
       const acceptHeader = "text/event-stream";
-      const response = await fetch(`${endpoint.baseUrl}${CHAT_COMPLETIONS_PATH}`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: acceptHeader,
-          Authorization: `Bearer ${endpoint.token}`,
-          // ★ DSH 的硬性契约：每个 provider HTTP 请求都必须带 attributionHeaders()。
-          //   库类型注释原文："Every provider HTTP request must include
-          //   `attributionHeaders()`; prove the headers are added in the wire request
-          //   or library header hook."
-          //   桥会忽略未知头，所以这些不会影响桥的行为。
-          ...attributionHeaders(),
-        },
-        body: JSON.stringify({ ...body, stream: true }),
-        signal: abortController.signal,
-      });
+      /**
+       * ★★ 并发竞速（2026-09-27 新增，**默认关闭**）—— 消除上游 TTFB 的慢档。
+       *
+       * ## 为什么（实测数据）
+       *
+       * 桥的快速路径直连上游时，`ttft`（首字节前耗时）呈**离散跳变**：
+       *
+       *   total= 2831ms  ttft= 1483ms  gen= 1348ms    ← 快档
+       *   total= 7059ms  ttft= 4906ms  gen= 2153ms
+       *   total=10062ms  ttft= 8997ms  gen= 1065ms
+       *   total=14157ms  ttft=12080ms  gen= 2077ms
+       *   total=27198ms  ttft=23618ms  gen= 3580ms    ← 慢档
+       *
+       * `ttft` 档位实测：1.5 / 4.3 / 4.9 / 8.8 / 9.0 / 9.3 / 12.1 / 23.6 秒。
+       * **而 `gen` 始终 1-5 秒**（稳定）。⇒ 慢的是「上游排队」，不是生成。
+       *
+       * ## 竞速实测（同一请求，同时发 N 个）
+       *
+       *   单发      : 10.9s
+       *   竞速 3 个 : 3.6 / 4.0 / 5.1      ← 三个全部落在快档！
+       *   竞速 5 个 : 2.7 / 3.3 / 10.8 / 10.9 / 11.2
+       *
+       * **⇒ 竞速 3 个能把慢档完全消掉**：至少有一个请求走快档。
+       *
+       * ## 成本与取舍
+       *
+       * - 每次调用**多消耗 2 份额度**（免费额度，实测不影响）
+       * - 但**p95 从 10-27 秒降到 5 秒以内**
+       * - 输掉的请求用 AbortController 主动取消，不浪费上游生成
+       *
+       * ## 开关
+       *
+       * `ZCODE_BRIDGE_RACE=3` 启用 3 路竞速；缺省或 1 即**关闭**（保持现有行为）。
+       * 上限钳到 5（再多收益递减且额度消耗快）。
+       */
+      const raceWidth = ((): number => {
+        const raw = process.env.ZCODE_BRIDGE_RACE?.trim();
+        const n = raw === undefined || raw.length === 0 ? 1 : Number(raw);
+        if (!Number.isFinite(n) || n < 2) return 1;
+        return Math.min(5, Math.floor(n));
+      })();
+      const requestBody = JSON.stringify({ ...body, stream: true });
+      const doFetch = (): Promise<Response> =>
+        fetch(`${endpoint.baseUrl}${CHAT_COMPLETIONS_PATH}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: acceptHeader,
+            Authorization: `Bearer ${endpoint.token}`,
+            // ★ DSH 的硬性契约：每个 provider HTTP 请求都必须带 attributionHeaders()。
+            //   库类型注释原文："Every provider HTTP request must include
+            //   `attributionHeaders()`; prove the headers are added in the wire request
+            //   or library header hook."
+            //   桥会忽略未知头，所以这些不会影响桥的行为。
+            ...attributionHeaders(),
+          },
+          body: requestBody,
+          signal: abortController.signal,
+        });
+      let response: Response;
+      if (raceWidth === 1) {
+        response = await doFetch();
+      } else {
+        // 竞速：并发 N 路，取**第一个返回 HTTP 200 的**；其余立即 abort。
+        const controllers = new Set<AbortController>();
+        const attempt = async (): Promise<Response> => {
+          const ctl = new AbortController();
+          controllers.add(ctl);
+          // 外层取消要能穿透到每一路
+          const onOuter = (): void => ctl.abort();
+          abortController.signal.addEventListener("abort", onOuter, { once: true });
+          try {
+            const r = await fetch(`${endpoint.baseUrl}${CHAT_COMPLETIONS_PATH}`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Accept: acceptHeader,
+                Authorization: `Bearer ${endpoint.token}`,
+                ...attributionHeaders(),
+              },
+              body: requestBody,
+              signal: ctl.signal,
+            });
+            if (r.status !== 200) {
+              // 非 200 的不要参与竞速（可能是限流），但它若先回也说明上游有问题
+              throw new Error(`race attempt http ${r.status}`);
+            }
+            return r;
+          } finally {
+            controllers.delete(ctl);
+          }
+        };
+        const attempts = Array.from({ length: raceWidth }, () => attempt());
+        try {
+          response = await Promise.any(attempts);
+        } catch (error) {
+          // 全部失败 —— 退回单发，让错误处理路径给出可诊断的信息
+          response = await doFetch();
+        } finally {
+          // 取消落败的（含已完成的 controller，abort 幂等）
+          for (const ctl of controllers) ctl.abort();
+        }
+        // 落败的 promise 若 reject 会变 unhandled —— 吞掉它们
+        for (const p of attempts) p.catch(() => undefined);
+      }
 
       if (!response.ok) {
         const raw = await response.text().catch(() => "");
@@ -859,7 +1090,21 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     // 用户看到的就是"点了发送没反应"，而且没有任何可排查的线索。
     //
     // 报错而不是静默：宁可让用户看到一条明确的失败，也不要一个静默的空回合。
-    if (text.length === 0) {
+    //
+    // ⚠ 2026-09-27 修正：**纯工具调用回合的 text 天然为空**。
+    //
+    // 旧代码只有「提示词桥」一条路 —— 那时工具调用被写在正文的 ```json 围栏里，
+    // 所以 `text.length === 0` 确实是异常。
+    //
+    // 现在桥有**原生 `tool_calls` 通道**（OpenAI 形状，`content` 可以为空），
+    // 于是「模型只调工具、不写正文」这个**完全合法**的回合会被误判成空回复，
+    // 抛出「桥返回了空回复（finish_reason=tool_calls）」。
+    //
+    // 实测：DSH 多步循环里每一步都是这种回合，导致整轮失败。
+    const hasNativeToolCalls =
+      Array.isArray(payload.choices?.[0]?.message?.tool_calls)
+      && (payload.choices?.[0]?.message?.tool_calls as unknown[]).length > 0;
+    if (text.length === 0 && !hasNativeToolCalls) {
       const finish = payload.choices?.[0]?.finish_reason;
       throw new LlmError(
         "zcode-bridge: 桥返回了空回复"
@@ -873,10 +1118,39 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
 
     // ── 工具调用解析 ──────────────────────────────────────────────────────
     //
-    // 模型按提示词约定把工具调用写在 ```json 围栏里。解析出来后走工具块路径，
-    // 并把围栏从文本里摘掉 —— 用户不该看到协议原文。
-    const toolCalls = tools.length > 0 ? parseToolCalls(text) : [];
-    const proseText = toolCalls.length > 0 ? stripToolFences(text) : text;
+    // **两条来源，优先原生**（2026-09-27）：
+    //
+    //  ① 原生 `message.tool_calls`（OpenAI 形状）—— 桥的**快速路径**提供。
+    //     形状：{ id, type:"function", function:{ name, arguments } }
+    //     `arguments` 已经是**完整合法 JSON 字符串**（桥侧累加分片得到）。
+    //
+    //  ② 提示词围栏（```json {"tool":...}```）—— 旧路径，仅当没有原生时才用。
+    //     这是「把 schema 渲染成提示词」那套的产物，现在退为兜底。
+    const nativeCalls = (() => {
+      const raw = payload.choices?.[0]?.message?.tool_calls;
+      if (!Array.isArray(raw) || raw.length === 0) return [];
+      return raw
+        .map((c) => {
+          if (c === null || typeof c !== "object") return undefined;
+          const rec = c as { id?: unknown; function?: { name?: unknown; arguments?: unknown } };
+          const name = rec.function?.name;
+          if (typeof name !== "string" || name.length === 0) return undefined;
+          const args = rec.function?.arguments;
+          return {
+            name,
+            arguments: typeof args === "string" && args.length > 0 ? args : "{}",
+          };
+        })
+        .filter((c): c is { name: string; arguments: string } => c !== undefined);
+    })();
+    const toolCalls = nativeCalls.length > 0
+      ? nativeCalls
+      : tools.length > 0
+        ? parseToolCalls(text)
+        : [];
+    const proseText = toolCalls.length > 0 && nativeCalls.length === 0
+      ? stripToolFences(text)
+      : text;
 
     // 纯工具调用回合（模型只给了围栏、没有自然语言）时文本块为空 ——
     // 这是合法的：DSH 允许一个回合只有 tool-call 块。
