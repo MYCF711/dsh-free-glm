@@ -30,24 +30,35 @@
  * 分片只是**呈现层**的模拟 —— 上游确实是一次性返回的。切分粒度取
  * 一个视觉上自然的折中值。
  *
- * ## 为什么不支持工具调用
+ * ## 工具调用：提示词化桥接
  *
- * 桥的端点收 `content: string`，没有 `tools` 通道（`sendPrompt` 只接受
- * `toolDenylist`，无 allowlist）。已实测过的 MCP 注入路径能握手但工具
- * 不进工具面。所以本适配器**不声明、不透传** `tools` —— 模型改用
- * ZCode 实例内部自带的工具集（Bash/Read/Write/Edit/WebFetch…）。
+ * 桥**没有 `tools` 通道**（`sendPrompt` 只收 `content: string`，只有
+ * `toolDenylist` 无 allowlist），所以无法把 DSH 的 `tools[]` 透传给上游。
+ *
+ * 做法（见 `tool-bridge.ts`）：
+ *   1. 把 `tools[]` 渲染成提示词，追加到 system 段
+ *   2. 与模型约定输出 ```json 围栏包裹的 `{"tool":...,"arguments":{...}}`
+ *   3. 在 `stream()` 里解析回复，命中则**合成** `tool-call` 块序列
+ *   4. 有工具调用时 `finish` 用 `{ kind: 'tool-calls' }`
+ *
+ * 实测（GLM-5.3-Flash，19 秒）模型一次命中且格式完全正确。
+ * 契约只约束 chunk 序列，不关心工具调用是谁产生的，所以这条路径合法。
  */
 
-import { LlmAdapter, LlmError, attributionHeaders } from "@deepseek-ai/dsh-llm";
+import { randomUUID } from "node:crypto";
+
+import { LlmAdapter, LlmError, attributionHeaders, ToolCallId } from "@deepseek-ai/dsh-llm";
 import type {
   GenerateOptions,
   LlmModelInfo,
   LlmProviderInfo,
   LlmResolvedModelInfo,
   StreamChunk,
+  ToolCallBlock,
 } from "@deepseek-ai/dsh-llm";
 
 import { isTransportError } from "./transport-error.js";
+import { parseToolCalls, renderToolInstructions, stripToolFences } from "./tool-bridge.js";
 import {
   CHAT_COMPLETIONS_PATH,
   MODELS,
@@ -139,9 +150,18 @@ function extractText(payload: BridgeChatResponse): string {
  * 所以这里做一次显式降级，把 DSH 的结构化块**降级成文本**：
  *
  *   - 文本块        → 直接拼进 content
- *   - 工具调用块    → 转成 `[tool-call name(args)]` 一行
+ *   - 工具调用块    → 还原成模型自己的 ```json 围栏格式（**与提示词协议对齐**）
  *   - 工具结果块    → 转成 `[tool-result name] <内容>` 一行
  *   - 图片块        → 转成 `[image]` 占位（桥不支持；目录也没声明 image）
+ *
+ * ## 为什么工具调用历史要还原成围栏格式（实测踩过的坑）
+ *
+ * 模型看到的工具调用历史**必须与它被要求输出的格式一致**。早先把历史里的
+ * 工具调用降级成 `[tool-call name] {...}` 这种自造格式，结果是模型看到了
+ * 两种互相矛盾的"工具调用长什么样"，转而模仿历史格式 → 解析器认不出 →
+ * 表现为"模型说它调用了工具，但 DSH 这边什么都没发生"。
+ *
+ * 用同一个围栏格式，历史就是一个完整的few-shot 示范。
  *
  * ## 为什么工具块必须保留（实测踩过的坑）
  *
@@ -185,8 +205,13 @@ function toBridgeMessages(
             break;
           case "tool-call": {
             const name = typeof record.name === "string" ? record.name : "unknown";
-            const args = safeJson(record.input);
-            parts.push(`[tool-call ${name}] ${args}`);
+            // DSH 的工具调用历史里 `input` 可能是对象，也可能是**已序列化的 JSON 字符串**
+            // （取决于它从哪条路径投影过来）。两种都要还原成对象再放进围栏，
+            // 否则会出现 `"arguments":"{\"path\":\"x\"}"` 这种双层转义的畸形示范。
+            const args = coerceArguments(record.input);
+            // 还原成模型自己的输出格式 —— 见函数头注释：历史必须是 Few-shot 示范，
+            // 用另一种格式会让模型模仿错的形状，解析器认不出。
+            parts.push("```json\n" + safeJson({ tool: name, arguments: args }) + "\n```");
             break;
           }
           case "tool-result": {
@@ -217,6 +242,23 @@ function toBridgeMessages(
     out.push({ role, content: text });
   }
   return out;
+}
+
+/** 把工具参数规整成对象：字符串先尝试 parse，失败则原样包成 `{ raw }`。 */
+function coerceArguments(input: unknown): unknown {
+  if (typeof input !== "string") {
+    return input ?? {};
+  }
+  const trimmed = input.trim();
+  if (trimmed.length === 0) {
+    return {};
+  }
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    // 不是合法 JSON —— 保留原文而不是丢弃，让模型至少看得到它自己写过什么。
+    return { raw: input };
+  }
 }
 
 /** 把工具结果的嵌套 content 压成一行文本。 */
@@ -436,8 +478,19 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
 
     // 2. 组请求体（OpenAI chat-completions 形状）。
     const messages = toBridgeMessages(options.messages);
+
+    // ── 工具表注入 ────────────────────────────────────────────────────────
+    //
+    // 桥没有 tools 通道，所以把 schema 渲染成提示词追加到 system 段。
+    // 追加而不是覆盖：DSH 的 system 段里有 agent 的完整行为规范，不能丢。
+    const tools = options.tools ?? [];
+    const toolInstructions = renderToolInstructions(tools);
+    const baseSystem =
+      typeof options.system === "string" && options.system.length > 0 ? options.system : "";
     const systemText =
-      typeof options.system === "string" && options.system.length > 0 ? options.system : undefined;
+      toolInstructions.length === 0
+        ? (baseSystem.length > 0 ? baseSystem : undefined)
+        : [baseSystem, toolInstructions].filter((part) => part.length > 0).join("\n\n");
 
     const body: Record<string, unknown> = {
       model: options.model,
@@ -528,25 +581,89 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
       );
     }
 
-    yield { type: "block-start", index: 0, blockType: "text" };
+    // ── 工具调用解析 ──────────────────────────────────────────────────────
+    //
+    // 模型按提示词约定把工具调用写在 ```json 围栏里。解析出来后走工具块路径，
+    // 并把围栏从文本里摘掉 —— 用户不该看到协议原文。
+    const toolCalls = tools.length > 0 ? parseToolCalls(text) : [];
+    const proseText = toolCalls.length > 0 ? stripToolFences(text) : text;
 
-    for (let offset = 0; offset < text.length; offset += this.chunkChars) {
-      yield {
-        type: "text-delta",
-        index: 0,
-        text: text.slice(offset, offset + this.chunkChars),
-      };
+    // 纯工具调用回合（模型只给了围栏、没有自然语言）时文本块为空 ——
+    // 这是合法的：DSH 允许一个回合只有 tool-call 块。
+    const hasText = proseText.length > 0;
+
+    if (!hasText && toolCalls.length === 0) {
+      // 走到这里说明文本被剥空了但也没解析出工具调用 —— 只可能是模型
+      // 给了一个能被 JSON.parse 但不是工具调用形状的围栏（如 `{"a":1}`）。
+      // 此时保留原文当普通回复，总比发一个空回合好。
+      const fallback = text.trim().length > 0 ? text : "";
+      if (fallback.length === 0) {
+        throw new LlmError(
+          "zcode-bridge: 桥返回了空回复（解析后无可呈现内容）。可尝试重启 ZCode 实例。",
+          "SERVER",
+        );
+      }
     }
 
-    yield { type: "block-end", index: 0, block: { type: "text", text } };
+    // 文本块 —— 只在有自然语言时才发。index 从 0 开始。
+    let index = 0;
+    if (hasText) {
+      yield { type: "block-start", index, blockType: "text" };
+      for (let offset = 0; offset < proseText.length; offset += this.chunkChars) {
+        yield {
+          type: "text-delta",
+          index,
+          text: proseText.slice(offset, offset + this.chunkChars),
+        };
+      }
+      yield { type: "block-end", index, block: { type: "text", text: proseText } };
+      index += 1;
+    }
+
+    // 工具块 —— 每个调用一个 index，连续递增。
+    //
+    // ★ 契约要点（dsh-llm 的 BlockAssembler 强制）：
+    //   - `tool-call-delta` 的 `id` **必填**，留空会被兜底成 `call-${index}`，
+    //     导致工具结果关联断裂
+    //   - `name` 只在非空时带一次即可
+    //   - `block-end` 的 `block` 要**浅拷贝**
+    //   - `arguments` 必须是**完整合法 JSON 字符串**
+    for (const call of toolCalls) {
+      // ★ `ToolCallId` 是 branded 类型 —— 必须用库导出的构造器，不能 `as` 强转
+      //   （强转在类型层面"过"了，但绕过了 brand 的唯一合法构造入口）。
+      const id = ToolCallId(`zcb-${randomUUID()}`);
+      yield { type: "block-start", index, blockType: "tool-call" };
+      yield {
+        type: "tool-call-delta",
+        index,
+        id,
+        name: call.name,
+        argumentsDelta: "",
+      };
+      yield { type: "tool-call-delta", index, id, argumentsDelta: call.arguments };
+      const block: ToolCallBlock = {
+        type: "tool-call",
+        id,
+        name: call.name,
+        arguments: call.arguments,
+      };
+      yield { type: "block-end", index, block: { ...block } };
+      index += 1;
+    }
 
     // ⚠ 不上报 usage：桥的 usage 恒为 0（它拿不到真实用量）。
     //   上报 0 会让 DSH 的用量统计显示成"没消耗"，比不报更误导。
 
-    yield { type: "finish", reason: mapFinishReason(payload.choices?.[0]?.finish_reason) };
+    // 有工具调用时结束原因必须是 `tool-calls`，否则 DSH 不会去执行工具。
+    yield {
+      type: "finish",
+      reason:
+        toolCalls.length > 0
+          ? { kind: "tool-calls" }
+          : mapFinishReason(payload.choices?.[0]?.finish_reason),
+    };
   }
 }
-
 /** 从桥的错误响应里抽出可读信息（它用 OpenAI 的 error 包裹形状）。 */
 function describeBridgeError(raw: string): string {
   if (raw.length === 0) {

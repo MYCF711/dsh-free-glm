@@ -1,7 +1,7 @@
 {
   "name": "dsh-zcode-bridge",
-  "version": "0.1.3",
-  "description": "DSH plugin: ZCode free-quota GLM provider via the local ZCode bridge (requires the ZCode opensource instance running with ZCODE_BRIDGE=1)",
+  "version": "0.2.0",
+  "description": "DSH plugin: ZCode free-quota GLM provider via the local ZCode bridge, with prompt-bridged tool calling (requires the ZCode opensource instance running with ZCODE_BRIDGE=1)",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -21,7 +21,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/bundle-client.mjs",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node scripts/test-tool-bridge.mjs"
   },
   "dsh": {
     "bundle": {
