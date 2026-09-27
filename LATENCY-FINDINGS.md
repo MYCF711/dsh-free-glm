@@ -1718,3 +1718,132 @@ Jet Hub 的 happy-dom 方案能造出**结构正确**的赝品，但 `DeviceToke
 生产 CDN 全名、生产 appKey —— **均未获取**（动态 JS 404 不可得）。
 **这是 SDK 的设计使然，不是调查疏漏。**
 
+
+---
+
+## 二十三、第十五轮：第 6 条路径 —— 切换 provider 到 individual-coding-plan（失败）
+
+### 23.1 动机（子代理③的线索）
+
+子代理读到 `zcodeAgentService.ts:2720` 的分支：
+
+```ts
+const requiresRendererInteraction = accountAccess?.mode === "start-plan";
+if (accountRequestAuthService && accountAccess && !requiresRendererInteraction) {
+  void respondAccountRequestAuthWithoutInteraction({ key: pendingKey, pending });
+  return;   // ← 非 start-plan 时 host 直接自动应答，完全不碰 renderer
+}
+```
+
+**⇒ 若 provider 的 `mode` 不是 `start-plan`，captcha 链路根本不会被触发。**
+
+我从 `zcode-builtin.json` 里找到了内建 provider 定义（**这些是官方预置的**）：
+
+```json
+{
+  "providerId": "account:bigmodel-individual-coding-plan",
+  "providerName": "BigModel Individual Coding Plan",
+  "config": {
+    "group": "bigmodel-family",
+    "builtinModelIds": ["GLM-5.3", "GLM-5.3-Flash"],
+    "access": {
+      "type": "zhipu-account",
+      "mode": "individual-coding-plan",     // ← 不产 captcha
+      "accountType": "bigmodel"
+    },
+    "api": {
+      "type": "anthropic-messages",
+      "baseUrl": "https://open.bigmodel.cn/api/anthropic"
+    }
+  }
+}
+```
+
+`zcode-builtin.json` 里共 **9 个内建 provider**：
+
+```
+account:zai-individual-coding-plan
+account:zai-team-coding-plan
+account:zai-start-plan
+account:bigmodel-individual-coding-plan
+account:bigmodel-team-coding-plan
+account:bigmodel-start-plan
+account:zai-offpeak-idle-plan
+account:bigmodel-offpeak-idle-plan
+```
+
+### 23.2 桥侧改造：允许 body 覆盖 providerId
+
+`zcodeBridgeServer.ts` 新增 `resolveProviderId()`（带白名单，避免传任意字符串）：
+
+```ts
+const ALLOWED_PROVIDER_IDS = [
+  "account:bigmodel-start-plan",
+  "account:bigmodel-individual-coding-plan",
+  "account:bigmodel-team-coding-plan",
+  "account:zai-start-plan",
+  "account:zai-individual-coding-plan",
+  "account:zai-team-coding-plan",
+  "account:bigmodel-offpeak-idle-plan",
+  "account:zai-offpeak-idle-plan",
+];
+function resolveProviderId(raw: unknown): string {
+  if (typeof raw !== "string") return DEFAULT_PROVIDER_ID;
+  const trimmed = raw.trim();
+  return ALLOWED_PROVIDER_IDS.includes(trimmed) ? trimmed : DEFAULT_PROVIDER_ID;
+}
+```
+
+并把 `/v1/chat/completions` 的 `providerId` 改为 `resolveProviderId(body["providerId"])`。
+
+### 23.3 ★ 对照实验（决定性）
+
+```
+account:bigmodel-start-plan             ✓ 16.5s  「正常」      ← captcha 通道，正常
+account:bigmodel-individual-coding-plan ✓  0.2s  「」          ← 空
+account:bigmodel-team-coding-plan       ✓  0.1s  「」          ← 空
+```
+
+日志（`bridge.chat.completed`）：
+
+```json
+{"modelId":"GLM-5.3-Flash","durationMs":16461,"runMs":16461,"textLength":2}
+{"modelId":"GLM-5.3-Flash","durationMs":  158,"runMs":  158,"textLength":0}
+{"modelId":"GLM-5.3-Flash","durationMs":  142,"runMs":  141,"textLength":0}
+```
+
+**`provider auth 材料（旁路）` 记录的 `providerId` 始终是 `account:bigmodel-start-plan`**
+（只有 start-plan 那次触发 mint —— 印证了「非 start-plan 不碰 renderer」）。
+
+### 23.4 结论
+
+**158ms / 141ms + `textLength=0` ⇒ agent 在本地就返回了空，没有发出上游请求。**
+
+**原因**：`account:bigmodel-individual-coding-plan` 需要**该套餐的凭据**
+（`credentials.json` 里的 `account-provider:coding-plan:...:api-key`），
+而**那个账号没有可用资源包** —— 子代理③实测过：明文直接调用得到
+
+```
+HTTP 429 {"code":"1113","message":"余额不足或无可用资源包,请充值。"}
+```
+
+**⇒ 第 6 条路径失败。死因不是 captcha，而是账户余额。**
+
+### 23.5 但这次实验有两个副产物
+
+1. **`providerId` 覆盖机制已验证可用** —— 三个 provider 走了三条不同路径（16.5s / 0.2s / 0.1s）
+2. **反向印证了「非 start-plan 不产 captcha」** —— 只有 start-plan 那次触发了 mint
+
+### 23.6 至此已排除的路径（6 条）
+
+| # | 路径 | 死因 |
+|---|---|---|
+| 1 | 裸发上游 | 无服务端会话登记 → 3012 |
+| 2 | `workspace/generateText` | 同上（3/3 复现） |
+| 3 | 补客户端签名 | `cRs()` 对 start-plan 代码级禁用 |
+| 4 | 移植 captcha | 产出必须在 renderer；设备指纹 SDK 在 CDN，不可移植 |
+| 5 | 换闭源版 agent | 同构链路，超时 180s vs 20s，更差 |
+| 6 | **切换 provider 到 coding-plan** | **账户无资源包（429 [1113]）** |
+
+**唯一可用路径仍然是**：`createTask` + `sendPrompt`（agent turn），8-28 秒/轮。
+
