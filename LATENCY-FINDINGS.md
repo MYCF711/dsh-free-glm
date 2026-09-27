@@ -264,12 +264,11 @@ $env:DSH_HOME="$env:APPDATA\in.dsh-plug.dsh-launcher\homes\0.1.7-rc.2"
 
 ---
 
-## 六、内存优化（2026-09-27 实测，**结论与预期不符，如实记录**）
+## 六、内存优化（2026-09-27 实测，**两轮都未达标，如实记录**）
 
-### 做了什么
+### 第一轮做法（❌ 已证伪，无效）
 
-在 `packages/desktop/src/main/index.ts` 的模块顶层（`app ready` 之前）加了
-无头模式专用的特性裁剪：
+在 `packages/desktop/src/main/index.ts` 加了：
 
 ```ts
 if (process.env["ZCODE_HEADLESS"] === "1") {
@@ -280,78 +279,64 @@ if (process.env["ZCODE_HEADLESS"] === "1") {
 }
 ```
 
-**特性名不是凭记忆写的** —— 从 `electron.exe`（Electron 41.0.3 /
-Chrome 146.0.7680.80，212.5 MB）里逐字节检索确认全部存在。
-**写错的名字不会报错，只会静默无效**，所以必须验证。
+**特性名是从 electron.exe 二进制里逐字节验证过存在的**（不是凭记忆），
+开关也确实传进去了 —— 启动后的 video 进程命令行里能看到：
 
-### 结果：进程消失了，但内存几乎没省
+```
+--disable-features=AudioServiceOutOfProcess,...,MediaCapture,MediaRecorder,
+  ...,PictureInPicture,...,WebAudio
+```
 
-**基线**（优化前，10 个进程，共 **1433 MB**）：
+**但 `video_capture.mojom.VideoCaptureService` 照样被拉起。**
 
-| 进程 | MB |
+### 为什么无效（本轮查明）
+
+**`disable-features` 控制的是「功能开关」，不是「进程生命周期」。**
+
+- 我在 17:28 那次实测看到 video/audio 进程「消失了」，就以为成功 —— **那是偶然**
+  （服务是懒启动的，那一次没有被触发）
+- 17:45 复查发现 **video 服务又回来了，104 MB**
+- 时间线：壳主进程 17:44:10 创建 → video 服务 **17:45:13** 被拉起（约 1 分钟后）
+- 同期日志里**没有任何 media/capture 业务调用**，但注册了 `media-preview` RPC channel
+
+⇒ 它是**渲染进程初始化时无条件创建**的（Chromium media 子系统的默认预创建），
+不是被某个业务功能触发的。**禁用特性阻止不了它。**
+
+**⚠ 教训**：`disable-features` 的开关**生效了**（能在子进程命令行里看到）**≠ 目标达成**。
+「进程消失」这个观测必须**多次复查**，不能看一次就下结论 —— 懒启动的服务会骗人。
+
+### 第一轮的净收益：9 MB（可忽略）
+
+| | 优化前 | 优化后 |
+|---|---|---|
+| renderer | 307 | 313 |
+| MAIN ×3 | 530 | 604 |
+| utility(node) ×2 | 265 | 381 |
+| utility(video_capture) | 95 | （那次消失，下次又回来） |
+| 合计 | **1433** | **1424** |
+
+**−9 MB** —— 即使那一次 video 真消失了，省下的堆也被其它进程吸收
+（Chromium 内存池化）。**「关进程 = 省它的内存」这个直觉是错的。**
+
+### 第二轮：本轮查明的真实情况
+
+**video 服务无法用命令行开关阻止。** 在 electron.exe 里搜索：
+
+| 开关名 | 是否存在 |
 |---|---|
-| renderer | 307 |
-| MAIN | 226 |
-| MAIN | 156 |
-| utility(node) | 149 |
-| MAIN | 148 |
-| utility(node) | 116 |
-| utility(video_capture) | 95 |
-| utility(network) | 104 |
-| gpu-process | 73 |
-| utility(audio) | 59 |
+| `disable-media-capture` | ✗ 不存在 |
+| `disable-webcam` | ✗ 不存在 |
+| `use-fake-device-for-media-stream` | ✓ 存在（但那是测试用假设备，不省内存） |
 
-**优化后**（8 个进程，共 **1424 MB**）：
-
-| 进程 | MB |
-|---|---|
-| renderer | 313 |
-| MAIN | 248 |
-| utility(node) | 246 |
-| MAIN | 196 |
-| MAIN | 160 |
-| utility(node) | 135 |
-| gpu-process | 68 |
-| utility(network) | 58 |
-
-**变化：−9 MB。**
-
-### 为什么（这是我的推断，但有数据支撑）
-
-`video_capture`（95 MB）与 `audio`（59 MB）**两个进程确实消失了** ——
-开关生效了。但省下的内存被**其它进程吸收了**：
-
-- `utility(node)`：149 + 116 = **265** → 246 + 135 = **381**（+116）
-- `renderer`：307 → 313（+6）
-- `MAIN`：226 + 156 + 148 = **530** → 248 + 196 + 160 = **604**（+74）
-
-Chromium 的内存是**池化的** —— 进程少了，堆不会等比例释放，会被仍在跑的
-进程复用（各进程的内存本来就有大量共享页与预分配缓冲）。
-
-⇒ **"关掉进程 = 省下它的内存"这个直觉是错的。**
-如果目标是"省 154 MB"，那**没达成**。
-
-### 但这次改动仍然保留
-
-理由：
-1. **进程少了两个** —— 上下文切换、句柄、启动时间都有微幅改善（虽然测不出来）
-2. **风险已被验证为零** —— 优化后桥正常返回、captcha 链路三步齐备
-   （`request.received` → `request.respond` → `headers 已应用`）
-3. 代价是 0（只是几个命令行开关，且只在无头模式生效）
-
-### 顺带修掉的一个真实错误
-
-我最初写了 `app.commandLine.appendSwitch("disable-renderer-backgrounding", "0")`，
-以为"传 0 = 不启用"。**这是错的** —— 它是**布尔开关**，Chromium 只看它在不在，
-不看值。写上它反而让 renderer **保持前台优先级**，与想要的相反。已删除。
+**⇒ 当前没有已知的命令行手段能阻止 Chromium 预创建 video_capture 服务。**
 
 ### 内存还能怎么省（未做）
 
 | 方向 | 预期 | 风险 |
 |---|---|---|
-| **`--max-old-space-size` 限制 renderer V8 堆上限** | renderer 307 MB 里可能有可压缩空间 | 需实测；压太小会让 renderer OOM |
-| **禁用 renderer 的图片缓存**（桥不显示图片） | 未知 | captcha 可能依赖图片解码 |
-| **真正大头是 DSH 侧**（474 MB）而非壳 | 改 DSH 更直接 | 超出本项目范围 |
+| **真正大头是 DSH 侧**（535 MB）而非壳（1295 MB） | 改 DSH 更直接 | 超出本项目范围 |
+| 查 `media-preview` RPC channel 的注册方能否延迟 | 未知 | 需先搞清谁在用它 |
+| 接受现状 | —— | 壳 1295 MB 对桌面应用属正常量级 |
 
 ---
 
