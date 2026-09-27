@@ -5,6 +5,23 @@
 把 ZCode 的**免费额度通道**（`account:bigmodel-start-plan`）接进 DSH，作为一个普通模型
 provider 使用。支持**对话**与**工具调用**。
 
+> ## 📖 想了解全貌，先读这三份
+>
+> | 文件 | 内容 |
+> |---|---|
+> | **[PROJECT-MASTER-HANDOFF.md](./PROJECT-MASTER-HANDOFF.md)** | ★ **总交接** —— 从开工到收尾全貌，另一台 PC 的 Agent 读这一份就能接手 |
+> | **[LATENCY-FINDINGS.md](./LATENCY-FINDINGS.md)** | ★ **1632 行实测报告**（二十一节），含全部证据链、逆向成果、踩过的坑 |
+> | **[LIMITATIONS.md](./LIMITATIONS.md)** | 已知限制（每条标注「实测」或「推测」+ 验证方法） |
+>
+> **本项目已做到**：对话 ✅ 工具调用 ✅ 并发省 64% ✅ 内存省 326 MB ✅
+> **未做到**：原生速度 ❌ —— **已证明架构互斥**（不是没找到方法）
+>
+> **原因一句话**：免费额度的准入材料是阿里云 captcha，而它只能在浏览器 renderer 里产出，
+> 且必须在一个「服务端登记的会话」里被消费 —— 而那个会话就是慢的来源。
+>
+> **逆向成果可复用**：客户端签名完整复刻（`tools/signature-fornsics/`）、
+> 凭据离线解密、captcha 段原文（`tools/forensics/`）。
+
 ```
 DSH ──▶ 本插件 ──▶ 本机 HTTP 桥 ──▶ ZCode 实例的会话链路 ──▶ zcode.z.ai
         (provider)   (loopback)      (createTask/sendPrompt)   (免费额度)

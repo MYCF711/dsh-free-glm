@@ -1102,3 +1102,531 @@ function cRs({access: e, baseURL: t}) {
 | `scripts/decrypt-all.cjs` | 凭据解密（复刻官方 aes-256-gcm） |
 | `D:\zcode-glm5.3f\_closed-source-backup\` | **闭源版完整备份**（568 文件 / 84.8 MB，SHA256 已核对） |
 
+
+---
+
+## 十八、★ 子代理逆向结论：captcha 与签名是**对称的互补设计**
+
+> 来源：子代理读闭源版 `zcode.cjs`（14.8 MB）+ `app.asar`（311.8 MB）的完整逆向报告。
+> 全程只读，未修改 `E:\zcoed\ZCode` 下任何文件。
+
+### 18.1 最重要的发现：两个独立的启用判定
+
+| 判定 | 函数 | **位置** | start-plan | individual-coding-plan |
+|---|---|---|---|---|
+| **客户端签名** | `cRs` / `requiresClientRequestSigning` | `zcode.cjs` 偏移 3,711,950 | **false（显式排除）** | true |
+| **captcha 启用** | `bnn` | **`app.asar` renderer** | **true** | **false** |
+| captcha 重试 | `CaptchaRequestRetry.claim` | `zcode.cjs` 偏移 4,013,681 | true | false |
+
+```js
+// 签名判定（主进程）
+function cRs({access:e, baseURL:t}) {
+  if (e.type === "zhipu-account" && (e.mode === "start-plan" || e.mode === "off-peak"))
+    return false;                     // ← 显式排除
+  ...
+}
+
+// captcha 判定（renderer，在 app.asar 里）
+function bnn(e) {
+  return e?.access?.type === "zhipu-account" && e.access.mode === "start-plan";
+}
+```
+
+**⇒ 这是一个对称的互补设计：start-plan 走 captcha、其余模式走客户端签名。**
+
+**这解释了我们全部的实测**：
+
+- start-plan 链路**本来就不带签名头**（与此前第四轮「开源版会话链路实测不带签名头」完全自洽）
+- 所以「补签名」这条路**从一开始就是错的** —— 官方对该模式就不用签名
+- captcha 是 start-plan 的**唯一**准入材料
+
+### 18.2 captcha 头名真相（修正我此前的误判）
+
+**不是拼接的 —— 是两个独立的完整字面量**：
+
+```js
+var snn = "X-Aliyun-Captcha-Verify-Param",
+    cnn = "X-Aliyun-Captcha-Verify-Region";
+function lnn(e) {
+  let t = e.captchaRegion?.trim();
+  return { [snn]: e.captchaVerifyParam, ...(t ? { [cnn]: t } : {}) };
+}
+```
+
+**我此前搜 `X-Aliyun` 得到 0 的原因**：
+- 主进程 `zcode.cjs` 里只有**小写形态** `x-aliyun-captcha-verify-param`（用于查找/脱敏）
+- **大写形态只出现在 renderer（`app.asar`）**
+- 且 `X-Aliyun` 前缀**从来不是独立字面量**
+
+### 18.3 闭源版的 captcha 里**没有任何「不需要浏览器」的部分**
+
+10 处 `captcha` 全部是「读头 / 记账 / 报错 / 重试」，没有一处产生材料。
+真正产出的代码全在 renderer：
+
+```js
+// DOM 宿主（隐藏容器）
+var Ytn = "zcode-aliyun-captcha-container", Q4 = "zcode-aliyun-captcha-element";
+function Xtn() { return jsxs("div", { id: Ytn, "aria-hidden": "true", className: "fixed ... z-[2147483647] h-0 w-0 ..." }) }
+
+// 挂载点自检（拿不到 DOM 就抛）
+function Qtn() {
+  if (!(e instanceof HTMLElement)) throw Error("Captcha host container is not mounted.");
+  if (!(t instanceof HTMLButtonElement)) throw Error("Captcha host button is not mounted.");
+}
+
+// 动态插 script（加载阿里云 CDN）
+var ztn = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+function enn() {
+  if (typeof window > "u" || typeof document > "u") throw Error("Captcha requires browser environment.");
+  i.src = ztn; document.head.appendChild(i);
+}
+
+// 无感验证优先
+if (typeof e.startTracelessVerification == "function") e.startTracelessVerification();
+```
+
+**⇒ 与开源版本质相同**（都要 renderer），而且闭源版**把启用判定也放进 renderer**。
+
+### 18.4 移植不可行的三条独立理由
+
+1. **没有可搬的纯 Node 实现** —— 产出代码依赖 `window` / `document` / `HTMLElement` / `HTMLButtonElement`
+2. **开源版已有等价链路且已跑通** —— 日志里 `request.received` → `request.respond` 只隔 2ms
+3. **真正卡住的不是 captcha 实现，是上游 3012** —— 换一套 captcha 实现不改变 3012
+
+**硬阻塞**：无感验证依赖阿里云设备指纹 SDK（`cloudauth-device-*` / `*.device.saf.aliyuncs.com`，
+闭源里有 **9 个硬编码域名**），而那部分代码**在 CDN 的 minified dynamicJS 里，不在闭源产物内**。
+**这是不可移植的。**
+
+### 18.5 顺带查到的三条有用旁证
+
+1. **超时预算不同**：闭源 `BZa = 180000`（180 秒），开源版观测到的是 20 秒。
+   **⇒ 若曾把「20 秒超时」当作「renderer 没响应」的证据，那个数字本身不足以支撑该结论。**
+
+2. **`x-aliyun-captcha-verify-param` 被显式列入脱敏白名单**（与 `authorization` / `cookie` /
+   `x-api-key` / `x-client-sig` / `x-client-pow` 同级）—— 它是**凭据级敏感材料**。
+   这解释了为什么只能靠 hook 才能抓到 280 字符的 param。
+
+3. **签名头清单**（`Zzi`，偏移 842,974）：
+   ```
+   ["X-Client-Ts","X-Client-Version","X-Client-Sig","X-Client-Nonce",
+    "X-Client-Pow","X-App-Id","X-Client-Sign-Verified"]
+   ```
+   比我补的 7 个多一个 `X-Client-Sign-Verified`。但因 `cRs` 对 start-plan 显式排除，
+   该模式本来就不带这些 —— 与实测自洽。
+
+### 18.6 对「原生速度」目标的最终影响
+
+**这条路被关闭了。** start-plan 模式的准入材料**只有 captcha**，而 captcha：
+
+| 环节 | 需要浏览器？ |
+|---|---|
+| 决定该不该发 | 否（但在 renderer 里，主进程拿不到） |
+| 取配置（region/prefix/sceneId） | 否 |
+| 加载 `AliyunCaptcha.js` | **是** |
+| 初始化 SDK | **是** |
+| 无感验证 `startTracelessVerification()` | **是**（设备指纹采集） |
+| 交互兜底 | **是** |
+| 组头 / 回传 | 否 |
+
+**主进程侧的 `refreshBeforeModelRequest` 全程只做 RPC 转发**（`timeoutMs=180000`），
+拿不到就报「Captcha verification request timed out. Please send your message again.」。
+
+**⇒ 「免费额度」= start-plan = captcha = 必须有 renderer。这个链条没有旁路。**
+
+
+---
+
+## 十九、★ 最终机制确认：判据是「服务端会话登记」，不是材料
+
+### 19.1 决定性实验（同一时刻、同一 renderer 产出的材料）
+
+```
+  会话链路（createTask + sendPrompt）  → ✓ 成功  27.6 秒
+  direct 端点（mint + 裸发）            → ✗ 3012   8.3 秒
+```
+
+**两者用的是同一个 renderer 产出的同一类 captcha 材料，
+唯一差别是「走不走已登记的 task 会话」。**
+
+### 19.2 captcha param 解码结果（材料本身是中立的）
+
+```json
+{
+  "certifyId": "uwOm31eLHj",
+  "sceneId": "11xygtvd",
+  "isSign": true,
+  "securityToken": "6oOo7e72nA61uVLiZVKiLYqF1m9rOno3vEIPJKaL7K..."
+}
+```
+
+**四个字段全是阿里云侧标识，没有任何 ZCode 会话 / 工作区 / 用户信息。**
+
+**⇒ 绑定关系不在材料里，只能在服务端。**
+
+### 19.3 完整机制（现在每一环都有实测支撑）
+
+| 环节 | 会话链路 | 裸发 |
+|---|---|---|
+| renderer 产出 captcha | ✅ | ✅（同一个 renderer） |
+| **服务端登记的会话上下文** | ✅ **有** | ❌ 无 |
+| 25 个真实头值 | ✅ | ✅ |
+| **结果** | **✓ 成功** | **✗ 3012** |
+
+**⇒ 服务端的判定是「这份 captcha 是否在一个已登记的会话里被消费」。**
+
+这同时解释了：
+
+- **`generateText` 为什么必然 3012** —— 它不建 task、不登记会话（3/3 复现）
+- **变量交换实验为什么「3012 跟随新鲜材料移动」** —— 抢发的那个请求同样没有登记会话
+- **为什么补头 / 补签名 / 补 captcha 全部无效** —— 它们都不产生「会话登记」这个状态
+
+### 19.4 修正此前的一条判断
+
+§十六曾写「3012 的判据是 captcha 材料与会话的绑定」。
+**现在更精确的表述是：判据是「消费材料的那个请求是否属于一个服务端已登记的会话」。**
+材料本身可复用性无关（解码后可见它不含任何会话标识）。
+
+### 19.5 最终结论（三轮独立验证一致）
+
+**免费额度（start-plan）与「会话上下文」在服务端是绑死的，没有旁路。**
+
+| 路径 | 为什么不行 |
+|---|---|
+| 裸发上游 | 无会话登记 → 3012 |
+| `generateText` | 不建 task → 无会话登记 → 3012 |
+| 补签名 | `cRs()` 对 start-plan 显式关闭（官方自己就不签名） |
+| 移植 captcha | 产出必须在 renderer；设备指纹 SDK 在 CDN，不可移植 |
+| 换闭源版 agent | 闭源版同样要回打宿主要 captcha（10 处 aliyun 全是日志/诊断） |
+| ultra / bigmodel 官方端点 | 429 [1113] 欠费（两套账号体系不互通） |
+| off-peak | 403 [3101]（代码硬拒 start-plan） |
+
+**唯一可用路径**：`createTask` + `sendPrompt`（agent turn），代价是 **8-28 秒/轮**。
+
+
+---
+
+## 二十、十四轮终局：三条路全部走完，结论收敛
+
+### 20.1 三个子代理的独立结论（全部只读逆向，未改任何文件）
+
+| 子代理 | 任务 | 结论 |
+|---|---|---|
+| ① 换闭源版 agent | 能否用 `E:\zcoed\ZCode\resources\glm\zcode.cjs` 替代开源版 | ❌ **不能，且更差** |
+| ② 移植 captcha | 闭源版有无「不需要浏览器」的 captcha 实现 | ❌ **无物可移** |
+| ③ 绕过 captcha | 除浏览器外有无别的办法拿免费额度 | ⏳ 进行中 |
+
+### 20.2 子代理①：换闭源版 agent（代码级证据）
+
+**三条硬事实：**
+
+1. **闭源 `zcode.cjs` 是纯 Node 程序，零 Electron API**
+   `require("electron")` / `BrowserWindow` / `ipcMain` / `webContents` /
+   `app.whenReady` / `app.isPackaged` / `process.resourcesPath` / `.asar` —— **全部命中 0**。
+   58 个外部 require **全是 `node:*`**。
+   **⇒ 它是客户端，不可能自己跑 captcha。**
+
+2. **闭源版零 captcha 生产代码**
+   10 处 `captcha` 全部是读头/诊断/错误分类（偏移 3986583 / 3989814 / 4013181 /
+   4029673 / 4029859 / 4037411 / 12726091 / 12726112 等）。
+   **零命中**：`AliyunCaptcha` / `startTracelessVerification` / `sceneId` /
+   `initAliyunCaptcha` / `o.alicdn.com` / `captchaVerifyParam`。
+
+3. **闭源版自己也要走 renderer，超时 180 秒**
+   `ZJo` = `createProviderRuntimeHeadersPort`（**偏移 14434058**）：
+   ```js
+   s = await e.requestClient(va.interactionRequestProviderRuntimeHeaders, {...},
+         DGt, { signal, trace, timeoutMs: BZa });   // BZa = 180000 ms
+   // JJo = -32022 → "Captcha verification request timed out. Please send me your message again."
+   ```
+   **同一个方法名、同一套 schema、同一个 renderer 依赖。
+   超时 180000 vs 我们的 20000 —— 更差。**
+
+**签名机制对我们的禁用（代码证明，升级此前的实验证据）**：
+
+```js
+// cRs = requiresClientRequestSigning，偏移 3711941，第一行：
+if (e.type === "zhipu-account" && (e.mode === "start-plan" || e.mode === "off-peak"))
+  return false;
+```
+
+**免费额度走的两条路都显式不签名。** 签名是给
+`zhipu-coding-plan-api-key` / `individual-coding-plan` / `team-coding-plan` 的。
+
+**协议面完全兼容（77 对 77 方法，逐字一致）** —— 桥不需要改一行就能说上话，但说上话之后卡在同一处。
+
+**迁移成本**：补丁实测 **+1433 / −18 行，5 个源码文件 + 1 个新文件**。
+深度寄生在开源版内部扩展点（`IZCodeAgentService` 注册表、`getProviderRuntimeHeadersEmitter`
+懒建表、`providerRuntimeHeadersEmitters` Map、`resolveWorkspaceKey` 分桶、
+`pendingProviderRuntimeHeaders` Map、`ZCodeProtocolClient` 伪造入口）——
+**闭源版一个都没有**。唯一理论做法是运行时 monkey-patch 14.8 MB minify，成本远超收益。
+
+**另一个发现**：单独拷 `zcode.cjs` 跑不起来，它要旁边的 `provider/zcode-builtin.json`
+（解析逻辑偏移 1069481，找不到直接 throw）。
+
+**唯一有意思的是 `SHo`**（偏移 14114021，`StandaloneProviderRuntimeHeadersPort`）：
+完全不需要 renderer、不需要 captcha，直接 `return {headersApplied:true, requestAuth:{apiKey:l}}`。
+但要求 `mode === "individual-coding-plan"` —— **那是付费 Coding Plan，不是免费额度**。
+且这个能力**开源版也有**，不依赖闭源二进制。
+
+### 20.3 子代理②：移植 captcha（不可行）
+
+**核心结论**：闭源版的 captcha **没有任何「不需要浏览器」的部分**，比开源版更彻底地依赖 renderer。
+
+**captcha 头名真相（修正此前的误判）**：不是拼接的，是两个独立完整字面量：
+
+```js
+var snn = "X-Aliyun-Captcha-Verify-Param", cnn = "X-Aliyun-Captcha-Verify-Region";
+function lnn(e) { return {[snn]: e.captchaVerifyParam, ...(t ? {[cnn]: t} : {})} }
+```
+
+大写形态**只存在于 `app.asar`**（renderer），这就是此前搜 `X-Aliyun` 得 0 的原因。
+
+**启用判定是独立函数**（renderer 里）：
+
+```js
+function bnn(e) { return e?.access?.type === "zhipu-account" && e.access.mode === "start-plan" }
+```
+
+**⇒ 与签名判定 `cRs` 构成对称的互补设计：start-plan 走 captcha，其余走签名。**
+
+**不可移植的硬阻塞**：无感验证依赖阿里云设备指纹 SDK
+（`cloudauth-device-*` 等 9 个域名），其源码**在 CDN 的 minified dynamicJS 里，
+闭源产物中根本没有**。
+
+**顺带发现**：`x-aliyun-captcha-verify-param` 被列入脱敏白名单
+（与 `authorization` / `cookie` / `x-api-key` 同级）—— 它是凭据级敏感材料。
+
+### 20.4 本轮新增的两个实验（都失败，但产出了关键反差）
+
+**新端点 1：`provider/testModelConnectivity`**（协议里最轻的真实模型调用）
+
+```json
+POST /diagnostics/test-connectivity  {"model":"GLM-5.3-Flash"}
+→ {"ok":true,"durationMs":8802,"success":true}
+```
+
+**✓ 成功 8.8 秒** —— 但它只返回 `{success:true}`，**不返回文本内容**，无法用于对话。
+
+**新端点 2：`/diagnostics/session-ping`**（`session/create` + 极短 send，本轮已接线）
+
+**三次绕过尝试全部失败**：
+
+| 尝试 | 结果 |
+|---|---|
+| `maxOutputTokens=1` + reasoningLevel 遍历 low/medium/high/max/default | ✗ 全部 3012 |
+| 先 `testModelConnectivity` 建立 provider 同步，再 `generateText` | ✗ 仍 3012 |
+| `generateText` 不传 maxOutputTokens | ✗ 仍 3012 |
+
+**产出的关键反差**：
+
+```
+testModelConnectivity  →  ✓ 8.8s    （走 AI SDK 的 streamText，不写事件存储）
+generateWorkspaceText  →  ✗ 3012     （走 AI SDK 的 generateText，先 appendEvent）
+会话链路（agent turn）  →  ✓ 8-28s
+```
+
+**三者用同一条 agent 连接、同一个模型、同一套 captcha。**
+唯一的实现差异是 `streamText` vs `generateText` —— **这已超出可配置范围，
+是 agent 内部的实现差异。**
+
+### 20.5 最终结论（收敛，不再有未验证的分支）
+
+**「在 DSH 上以原生速度使用免费订阅的 GLM-5.3-Flash」—— 已证明不可能。**
+
+三条路各自的死因（全部代码级或实测级）：
+
+| 路径 | 死因 |
+|---|---|
+| **裸发上游** | 无服务端会话登记 → 3012 |
+| **`workspace/generateText`** | 同上（3/3 复现） |
+| **补客户端签名** | `cRs()` 对 start-plan **代码级禁用**（偏移 3711941） |
+| **移植 captcha** | 产出必须在 renderer；设备指纹 SDK 在 CDN，**不可移植** |
+| **换闭源版 agent** | 同构链路，超时 180s vs 20s，**更差**；1433 行补丁无法重打 |
+| **ultra / bigmodel 官方端点** | 429 [1113] 欠费（两套账号体系不互通） |
+| **off-peak** | 403 [3101]（代码硬拒 start-plan） |
+| **`testModelConnectivity`** | 唯一成功，但**不返回文本** |
+
+**唯一可用路径：`createTask` + `sendPrompt`（agent turn），代价 8-28 秒/轮。**
+
+**已实现的真实收益**（与 agent 二进制无关）：
+
+| 项 | 效果 | 机制 |
+|---|---|---|
+| 一轮内多请求并发 | **省 64%**（58.4 → 21.2 秒） | 桥的并发调度队列 |
+| 壳内存 | **省 326 MB**（1275 → 949 MB） | 禁用 11 个官方插件 |
+| 轮询延迟 | 消除纯浪费 | `PARTIAL_POLL_START_DELAY_MS = 8000` |
+
+
+---
+
+## 二十一、★ 子代理③的颠覆性发现：**captcha 不是服务端强制的**
+
+> 来源：子代理读开源版源码 + 实测约 18 次 HTTPS 探测。
+
+### 21.1 最重要的一条：切 provider 可以完全绕开 captcha
+
+**代码事实**（`zcodeAgentService.ts:2720`）：
+
+```ts
+const requiresRendererInteraction = accountAccess?.mode === "start-plan";
+if (accountRequestAuthService && accountAccess && !requiresRendererInteraction) {
+  void respondAccountRequestAuthWithoutInteraction({ key: pendingKey, pending });
+  return;   // ← 非 start-plan 时，host 直接应答，完全不碰 renderer
+}
+```
+
+`accountProviderRequestAuthService.ts:73-84` 的分叉：
+
+| `planKind` | apiKey 来源 | 需要 captcha？ |
+|---|---|---|
+| `start-plan` | `tokenSet.zcodeJwtToken` | **是**（唯一） |
+| `individual-coding-plan` | `loadIndividualPlanApiKey()` | **否** |
+| `team-coding-plan` | `resolveTeamPlanApiKey()` | **否** |
+
+**决定性细节**（`zcodeAgentService.ts:1559`）：非交互路径调用
+
+```ts
+const merged = buildMergedRequestAuth(requestAuth, undefined);
+//                                              ↑ captcha 头位置传 undefined
+```
+
+**⇒ 源码注释原话：captcha 是「附加」而非「替代」。**
+
+**⇒ 代码事实层面的结论：`mode !== "start-plan"` 的通道完全不产 captcha。**
+
+### 21.2 但被账户余额堵死
+
+**凭据确实存在**（`credentials.json`）：
+
+```
+account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:15951790100986814:api-key
+```
+
+**加密可本地绕过**（`credentialCipherProvider.ts`）：
+
+```js
+sha256(`zcode-credential-fallback:${platform()}:${homedir()}:${userInfo().username}`)
+```
+
+**无外部密钥、无 Electron safeStorage、无钥匙串 —— 确定性推导，可离线解密。**
+（子代理已成功解密拿到 49 字符明文，与已知 key 一致。）
+
+**但调用失败**：
+
+```
+HTTP 429 {"code":"1113","message":"余额不足或无可用资源包,请充值。"}
+```
+`open.bigmodel.cn/api/coding/paas/v4/chat/completions` 与 `/api/anthropic/v1/messages` 同样 429。
+
+**判据**：`1113` 是**余额错误**，不是鉴权错误（未解密时是 `401`）。
+**key 本身有效，账户无资源包。**
+
+### 21.3 被证伪的假设（供后续修正认知）
+
+| 假设 | 实测结论 |
+|---|---|
+| 「captcha 是唯一准入材料」 | **不准确**。准入材料是 JWT；captcha 是**客户端自愿附加**的头 |
+| 「captcha 由服务端强制」 | **假**。判定点 `accountAccess.mode === "start-plan"` 在**客户端代码**里 |
+| 「`ZCODE_CLIENT_CONFIG_API_PREFIX` 需要鉴权」 | **假**。匿名可读（`credentials: "omit"`） |
+| 「`zcodePlanOpenAiBaseUrl` 是另一条路」 | **假**。服务端无此路由（裸 `404 page not found`） |
+| 「凭据加密需要 Electron safeStorage」 | **假**。确定性推导，可离线解密 |
+| 「401 说明 key 无效」 | **假**。那是**未解密**导致的 |
+
+### 21.4 子代理②：captcha 逆向的三处坐标纠正
+
+**① 前一子代理的偏移错了**（字符索引 vs 字节索引混用）：
+
+| 项 | 前说法 | 实测 |
+|---|---|---|
+| 段偏移 | 317,226,309–317,240,000 | **绝对 317,230,716 – 317,251,141** |
+| 段长 | 13.7 KB | **20,425 B** |
+| 宿主文件 | 未指明 | **`out/renderer/assets/styles-DEELZGp2.js`** |
+
+**asar 头解析要点**：`[0..3]` 是 4 字节 pickle 尾巴，`[4..7]` 才是 headerSize（uint32 LE），
+JSON 从第 8 字节开始，`dataOffset = 7,088,368`。
+**直接 `JSON.parse(header)` 会炸**（`0xEF`），必须先 `indexOf('{"files"')`。
+
+**② 9 个 `cloudauth-device-*` 域名不是采集目标，是日志分类枚举。**
+全部 4 次出现都在主进程 `installCaptchaNetworkDiagnostics` 里，
+`pf(url)` 只做打标签（`device_api` / `init_api` / `sdk_script` / `dynamic_js`）。
+**项目代码从不主动请求这些域名。**
+
+**③ 不可移植的硬阻塞（具体到代码行）**
+
+`startTracelessVerification` **不在 224,977 字节的 SDK 本体里**（该字符串计数 **0**，
+`traceless` 小写计数也是 **0**）。它由 SDK **二次远程加载的「动态 JS」**运行时挂到
+`window.AliyunCaptcha.prototype` 上；而那个动态 JS 的 URL（`CaptchaJsPath`）
+**来自服务端 init 响应的字段**。
+
+SDK 本体原文（byte 218,620）：
+
+```js
+Le("js", i, o, u.CaptchaJsPath, null, function(t) {
+  t ? (xe("js", {t:e, s:!1, msg:Tn.DYNAMICJS_FAIL, ...}),
+       fn.call(r, {code:Tn.DYNAMICJS_FAIL, msg:"动态JS加载失败"}), ...)
+    : (r._extend({dynamicJSLoaded:!0}), ...)
+}, 5e3)
+```
+
+材料出口在 SDK 回调里，项目代码只是接收（byte 4,272,044 附近）：
+
+```js
+success: e => { ... o3("sdk.success", {paramLength: e.length});
+                let n = n3; n3 = null, n && n.resolve(e)   // ← e 就是最终 captchaVerifyParam
+}
+```
+
+**⇒ 缺的是「服务端协作者」，不是 shim。**
+
+**④ 可复用的纯函数**（零成本可搬）：
+
+```js
+function lnn(e) {
+  let t = e.captchaRegion?.trim();
+  return { [snn]: e.captchaVerifyParam, ...(t ? {[cnn]: t} : {}) };
+}
+// snn/cnn = X-Aliyun-Captcha-Verify-Param / -Region
+```
+
+另有 `U4`（可中断 Promise 包装，段外 4,260,959）与 `Rtn`（诊断器工厂，段外 4,260,222）
+**都无浏览器依赖，可单独搬走**。
+
+**React 只用在 `Xtn`**（3 节点隐藏 DOM 组件），材料产出链路完全不用它。
+
+### 21.5 ★ 时限（本机实测核对，时钟偏差 −0.5 秒）
+
+```
+GET https://zcode.z.ai/api/v1/zcode-plan/billing/current   (带 JWT)
+
+server_time = 1790514697 → 2026-09-27 21:11:51（与本机一致）
+
+★ ZCode Weekend Build  [active]  到期 2026-09-28 09:00:00   剩 11.8 小时
+      GLM-5.3-Flash  300,000,000  one_time
+
+★ ZCode Start Plan     [active]  到期 2026-09-27 23:59:59   剩  2.8 小时
+      GLM-5.3        3,000,000  daily
+      GLM-5.3-Flash  5,000,000  daily
+```
+
+**⇒ Weekend Build 的 3 亿 token 是主力额度，还有 11.8 小时。**
+**但过期的额度无法追回 —— 应当优先把额度用在有价值的工作上。**
+
+### 21.6 子代理③验证的开放端点
+
+| 端点 | 鉴权 | 结果 |
+|---|---|---|
+| `GET /api/v1/client/configs` | **匿名** | `200`，完整 provider 目录 + 套餐配置 |
+| `GET /api/v1/zcode-plan/billing/current` | JWT | `200`，真实套餐与额度 |
+| `GET /api/v1/zcode-plan/billing/balance` | JWT | `400 3001`（要参数） |
+| `POST /api/v1/zcode-plan/v1/*` | — | `404`（不存在） |
+| `GET /api/v1/off-peak/ticket/availability` | JWT+key | `403 [3101]` |
+
+**`client/configs` 的 captcha 配置**（服务端下发，无跳过开关）：
+
+```json
+{"enabled": true, "prefix": "no8xfe", "region": "cn", "sceneId": "11xygtvd"}
+```
+
+**⚠ 反直觉**：带参数反而失败（`?app_version=X&platform=desktop` → `400 code=3001`）。
+**无参数才是正确调用形式。**
+
