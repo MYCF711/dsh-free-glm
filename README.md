@@ -196,6 +196,26 @@ dsh plugin --profile web add file:D:/dsh-free-glm/dsh-zcode-bridge-0.2.1.tgz
 **⚠ 副作用警告**：`allowTools: true` 时**壳内工具会真的执行**（含写盘、执行命令）。
 仅在你明确需要时使用。
 
+**⚠⚠ 不传 `allowTools` 会 180 秒超时（实测，2026-09-27）**：
+
+| 请求 | 结果 |
+|---|---|
+| 带 `tools[]`，**不传** `allowTools` | **180.1 秒 → `finish_reason: "timeout"`，空文本** |
+| 带 `tools[]`，`allowTools: true` | **15.0 秒 → 正常返回** |
+
+**根因**：桥默认注入「不要调用工具」的前置说明 + 传 `toolDenylist`。
+模型看到「有工具表但不要用」时，会去调**壳内**工具，而那些会真的执行 →
+壳内长时间卡住 → 桥侧 180 秒超时。
+
+**⇒ 只要带了 `tools[]`，就必须同时传 `allowTools: true`。** 这是调用约定，不是 bug。
+
+实测返回（工具面正常）：
+
+```
+「我来查询杭州今天的天气。
+ ```json {"tool": "get_weather", "arguments": {"city": "杭州"}} ```」
+```
+
 ---
 
 ## 架构细节（给想改代码的人）

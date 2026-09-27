@@ -101,6 +101,18 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$($b.port)/v1/chat/complet
   -Headers $h -ContentType 'application/json' -Body $body -TimeoutSec 200
 ```
 
+### 2.2b ⚠ 带工具时必须同时传 `allowTools: true`（实测踩过）
+
+| 请求 | 结果 |
+|---|---|
+| 带 `tools[]`，**不传** `allowTools` | **180.1 秒 → `finish_reason: "timeout"`，空文本** |
+| 带 `tools[]`，`allowTools: true` | **15.0 秒 → 正常返回** |
+
+**根因**：桥默认注入「不要调用工具」的前置说明 + 传 `toolDenylist`。
+模型看到「有工具表但不要用」时，会去调**壳内**工具（那些会真的执行）→ 壳内卡住 → 180 秒超时。
+
+**⇒ 只要带了 `tools[]`，就必须同时传 `allowTools: true`。这是调用约定，不是 bug。**
+
 ### 2.3 改壳源码后
 
 ```powershell
