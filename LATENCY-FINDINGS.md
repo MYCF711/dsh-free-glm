@@ -1630,3 +1630,91 @@ server_time = 1790514697 → 2026-09-27 21:11:51（与本机一致）
 **⚠ 反直觉**：带参数反而失败（`?app_version=X&platform=desktop` → `400 code=3001`）。
 **无参数才是正确调用形式。**
 
+
+---
+
+## 二十二、子代理④：SDK 内部逆向 —— 第二条独立证据链
+
+> 来源：子代理把 CDN 上的 `AliyunCaptcha.js`（224,977 B）拉下来做字符串表破解。
+
+### 22.1 三处硬依赖（只有一处可伪造）
+
+| # | 依赖 | 可否伪造 | 依据 |
+|---|---|---|---|
+| 1 | 动态 `captcha.js` | **否** | URL 由**服务端 INIT 响应**下发 `CaptchaJsPath`；4 个候选路径**全部 404** |
+| 2 | `window.FEILIN` 运行时 | **否** | `DeviceToken` 的**唯一**来源 |
+| 3 | 字体探测依赖布局引擎 | 可（但需知真值） | `Be()` 比较 `span.offsetWidth/offsetHeight`；jsdom 无布局 → 恒为 0 |
+
+**第 3 条的退化是「特征本身变成异常信号」**：
+真实浏览器 `window._FN`（字体命中数）是 **100~200 的稳定整数**，
+无头环境下**恒为 0**（约 200 个候选字体 + 3 个基线字体逐个测量）。
+
+### 22.2 `startTracelessVerification` 不在本体（独立印证）
+
+全文出现 **0 次**。它由运行期动态 JS 挂到 `window.AliyunCaptcha.prototype`：
+
+```js
+function a() {
+  var e = window.AliyunCaptcha.prototype;
+  e.config = r; e.deviceConfig = ne;
+  n && n(u); t(u);
+  var i = new window.AliyunCaptcha;
+  r.getInstance && r.getInstance(i)
+}
+```
+
+### 22.3 Node 沙箱实证
+
+用 `node:vm` + 手写最小 DOM **成功加载了完整本体**（`[OK] 求值成功`），但：
+
+```
+window.initAliyunCaptcha = undefined
+window.AliyunCaptcha     = undefined
+```
+
+暴露了 `__ALIYUN_CAPTCHA_UTILS`（含 `makeURL`，可验证端点拼接），
+**但构造函数永远拿不到** —— 印证 §22.2。
+
+### 22.4 澄清常见猜测（实测计数）
+
+`getContext` / `WebGL` / `AudioContext` / `canvas` / `screen` 在**本体里出现次数全部为 0**。
+`navigator` 仅 1 次（core-js 特性检测）。
+
+**⇒ 「canvas/WebGL/音频指纹」在本体里不成立**，真正的多维采集在 FEILIN 内部（不可得）。
+
+### 22.5 端点探测（关键负结果）
+
+9 个硬编码域名已提取。裸 POST 探测：
+
+```
+POST https://pre-cn-shanghai.device.saf.aliyuncs.com  body=""     → 200, len=7, "success"
+POST 同上                                            body="{}"   → 200, len=7, "success"
+POST 同上                                            body=<完整Action参数> → 200, len=7, "success"
+```
+
+**任意 body（含空）返回一模一样的 7 字节** ⇒ **CDN/WAF 兜底层，区分度为 0，不是业务接口。**
+业务真实路径**未出现在客户端代码中**。
+
+**⇒ 不存在「纯 HTTP 直连拿 deviceToken」的接口。**
+
+### 22.6 官方服务端 API 也不能替代
+
+`VerifyIntelligentCaptcha` **确实存在**，但它是**校验**接口（输入 param → 输出 true/false），
+**不是签发接口**。不能替代前端生成。
+
+### 22.7 完整证据链（两条独立路径，结论一致）
+
+```
+「新鲜材料」← DeviceToken ← window.FEILIN.initFeiLin() ← 服务端下发的动态 JS ← 真实浏览器环境
+```
+
+**补充**：3012 不仅跟随「新鲜材料」移动，而且**「新鲜材料」本身必须是真品**。
+Jet Hub 的 happy-dom 方案能造出**结构正确**的赝品，但 `DeviceToken` 编造 →
+无法与指纹库匹配 → 3012。**那条路走不通，别重试。**
+
+### 22.8 未确定项（诚实标注）
+
+`dynamicJsPath` 真实主机、FEILIN 内部协议、`startTracelessVerification` 实现、
+生产 CDN 全名、生产 appKey —— **均未获取**（动态 JS 404 不可得）。
+**这是 SDK 的设计使然，不是调查疏漏。**
+
