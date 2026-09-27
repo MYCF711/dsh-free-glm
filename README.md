@@ -117,15 +117,19 @@ $t = 'E:\ZCode-official'
 
 ### 步骤 2：安装插件
 
+**当前版本 0.3.4**（tgz 已随仓库提供，在 `releases/` 下）：
+
 ```powershell
-# 直连
-dsh plugin --profile <你的profile> add https://github.com/MYCF711/dsh-free-glm/releases/download/v0.2.1/dsh-zcode-bridge-0.2.1.tgz
+# ① 克隆仓库后，用仓库内的 tgz 安装（推荐，离线可用）
+git clone https://github.com/MYCF711/dsh-free-glm.git
+cd dsh-free-glm
+dsh plugin --profile <你的profile> add "file:$PWD/releases/dsh-zcode-bridge-0.3.4.tgz"
 
-# 国内推荐：走镜像
-dsh plugin --profile <你的profile> add https://gh-proxy.com/https://github.com/MYCF711/dsh-free-glm/releases/download/v0.2.1/dsh-zcode-bridge-0.2.1.tgz
+# ② 国内网络（Gitee 镜像）
+git clone https://gitee.com/MYCF711/dsh-free-glm.git
 
-# 或者先下载再装本地文件
-dsh plugin --profile web add file:D:/dsh-free-glm/dsh-zcode-bridge-0.2.1.tgz
+# ③ 或者从 GitHub Release 下载（若已发布对应版本）
+dsh plugin --profile <你的profile> add https://github.com/MYCF711/dsh-free-glm/releases/download/v0.3.4/dsh-zcode-bridge-0.3.4.tgz
 ```
 
 > **注意**：
@@ -133,6 +137,7 @@ dsh plugin --profile web add file:D:/dsh-free-glm/dsh-zcode-bridge-0.2.1.tgz
 >   换了新版本先 bump 版本号。
 > - **不要手动拷贝到 `node_modules`** —— 那样绕过 lockfile，下次 `pnpm install`
 >   会被覆盖（实测踩过：版本莫名倒退）。
+> - 装完**必须重启 DSH**（插件模块在进程启动时读进内存）。
 
 ### 步骤 3：重启 DSH
 
