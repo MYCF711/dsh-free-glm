@@ -206,6 +206,78 @@ patches/
 
 ---
 
+## 为什么不能绕过「壳」直接调上游
+
+这是本项目最重要的一条结论，**已用实验钉死**。
+
+### 现象
+
+把请求直接发到 `https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages`，
+无论带什么头，稳定返回：
+
+```json
+{"code":3012,"msg":"request has been blocked due to unusual activity."}
+```
+
+注意**不是 3007**（那是 captcha 失败）。3012 发生在 captcha 之后的另一层。
+
+### 排查过程（全部实测）
+
+**第一步：把壳内真实请求的头全部提取出来。**
+hook `globalThis.fetch`，抓会话链路的出站请求，得到完整的头集合。
+
+**第二步：把「来源标识头」逐字段复制到直发请求上。**
+
+```
+User-Agent / HTTP-Referer / X-Title / X-ZCode-App-Version / X-Platform
+X-Release-Channel / X-Client-Language / X-Client-Timezone
+X-Os-Category / X-Os-Version / X-Device-Mid
+```
+
+（`X-Device-Mid` 取自 `<dataBaseDir>\.zcode\v2\telemetry-state.json`，
+**复用壳的真实身份**，不生成新的）→ 仍 3012。
+
+**第三步：做头集合 diff，补齐缺口。**
+
+对比后发现会话链路还带这些**桥没有的**头：
+
+```
+x-session-id / x-query-id / x-zcode-trace-id / x-zcode-session-type / x-zcode-agent
+anthropic-beta: mid-conversation-system-2026-04-07
+x-api-key（与 Authorization 同值）
+```
+
+全部补上，**头集合已与会话链路逐字段完全一致（25 个头）** → **仍 3012**。
+
+**第四步：排除签名假设。**
+
+官方闭源版确实有一套客户端签名机制
+（`ClientRequestSigningV4`：ed25519 + KDF + HMAC，握手端点
+`/api/paas/c1f3a7e2/v2/client`，动作 `get_sign_key`），
+但**开源版的会话链路实测不带签名头**（`X-Client-Sig` / `X-Client-Pow` 均无）。
+而且那套机制由**服务端 feature gate** 控制（`resolveSigningFeatureGate`，
+默认 `isEnabled: async () => false`）。
+
+⇒ **缺的不是签名。**
+
+### 结论
+
+**3012 的判据是「请求的会话注册状态」，不在 HTTP 头里。**
+
+决定性证据是一个**变量交换实验**：抢在桥之前用新鲜 captcha 自发（只带 3 个头）——
+**3012 转移到了抢发方**，桥反而拿到 3007（材料被抢先消费）。
+
+⇒ 3012 跟随「新鲜材料」移动，**不跟随发送者、不跟随头集合**。
+captcha param 本身解码后是 `{certifyId, sceneId, isSign, securityToken}`，
+**零个会话标识** —— 说明绑定关系在服务端按「谁先消费 + 消费时的会话态」判定，
+客户端无法预置。
+
+**所以：走会话链路（本插件的做法）是唯一可行且 100% 成功的方案。**
+桥里的 `bridgeSourceHeaders()` 与 `sessionHeaders` 保留着 —— 它们的价值是
+「把壳的请求特征完整复刻出来」，一旦上游放松风控即可直接使用。
+
+---
+
 ## 常见问题
 
 **Q：模型列表是空的 / 看不到 provider 分组？**

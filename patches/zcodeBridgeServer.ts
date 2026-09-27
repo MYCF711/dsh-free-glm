@@ -624,6 +624,55 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
             ? (directBody.body as Record<string, unknown>)
             : undefined;
 
+        /**
+         * 【伪装部分】会话类头 —— 实测从壳内真实请求提取。
+         *
+         * ## 怎么发现的
+         *
+         * hook 了 zcode.z.ai 的出站请求，对比「会话链路（能过风控）」与
+         * 「桥裸发（3012）」的头集合，差集就是这几个：
+         *
+         * ```
+         * x-session-id          会话标识
+         * x-query-id            查询标识
+         * x-zcode-trace-id      追踪标识
+         * x-zcode-session-type  会话类型（"main"）
+         * x-zcode-agent         发起方（"glm"）—— 注意**不是** YAML 里写的 openai/anthropic
+         * x-query-id / x-request-id
+         * ```
+         *
+         * ⚠ 关键是**不要**带签名头：开源版的会话链路实测**没有**
+         * `X-Client-Sig` / `X-Client-Pow`（那两个来自官方闭源版的
+         * `ClientRequestSigningV4` 机制，由服务端 feature gate 控制）。
+         * 所以缺的不是签名，是**会话上下文**。
+         */
+        const sessionHeaders: Record<string, string> = {
+          "x-zcode-agent": "glm",
+          "x-zcode-session-type": "main",
+          // 每次请求现造 —— 旧值复用会让上游判定为重放。
+          "x-session-id": randomUUID(),
+          "x-query-id": randomUUID(),
+          "x-zcode-trace-id": randomUUID(),
+          "x-request-id": randomUUID(),
+        };
+        // 实验开关：允许调用方逐项剥离，用于确认到底哪个头是判据。
+        const omitSessionHeaders = Array.isArray(directBody.omitSessionHeaders)
+          ? (directBody.omitSessionHeaders as unknown[]).filter(
+              (k): k is string => typeof k === "string",
+            )
+          : [];
+        for (const key of omitSessionHeaders) {
+          delete sessionHeaders[key];
+        }
+
+        // 来源头也允许逐项剥离 —— 实测壳内模型请求**不带** `X-Device-Mid`，
+        // 而桥带了。头集合与真实请求越像越好，不是越多越好，所以要能对比。
+        const omitSourceHeaders = Array.isArray(directBody.omitSourceHeaders)
+          ? (directBody.omitSourceHeaders as unknown[]).filter(
+              (k): k is string => typeof k === "string",
+            )
+          : [];
+
         const startedAt = Date.now();
         try {
           const material = await deps.mintAuthMaterial({
@@ -641,13 +690,36 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
 
           // 组装实际发出的头。抽出来是为了能在响应里回显 —— 3012 这类
           // 「来源特征」问题必须能看到"到底发了什么头"才排得动。
+          //
+          // 顺序即优先级（后面的覆盖前面的）：
+          //   基础头 → 来源标识头 → **会话头** → captcha 头
           const outgoingHeaders: Record<string, string> = {
             "Content-Type": "application/json",
             Accept: "application/json",
             "anthropic-version": "2023-06-01",
+            // ★ 实测：壳内会话链路**带**这个头，桥裸发一开始没带 —— 是
+            //   头集合 diff 里唯一的缺口。值取自壳内真实请求。
+            "anthropic-beta": "mid-conversation-system-2026-04-07",
             Authorization: `Bearer ${material.apiKey}`,
-            // ★ 伪装部分：来源标识头（从壳内正常请求提取）。
-            ...bridgeSourceHeaders(),
+            // ★ 伪装部分之一：来源标识头（与壳内同源取值）。
+            //
+            // ⚠ 实测发现壳内**模型请求**并不带 `X-Device-Mid`（只有
+            //   `/api/v1/zcode-plan/billing/*` 那类管理接口带）。带多了
+            //   不一定更好 —— 头集合与真实请求越像越好，而不是越多越好。
+            //   这里允许调用方通过 `omitSourceHeaders` 剥离，用于逐项确认。
+            ...(() => {
+              const base = bridgeSourceHeaders();
+              for (const key of omitSourceHeaders) {
+                delete base[key];
+              }
+              return base;
+            })(),
+            // ★ 伪装部分之二：会话类头 —— 实测这才是 3012 的判据。
+            ...sessionHeaders,
+            // ⚠ 壳内真实请求**同时**带 Authorization 与 x-api-key（同值）。
+            //   实测只带 Bearer 也能过鉴权（缺 captcha 时报 3007 而非 401），
+            //   但为与壳内完全同构，这里一并补上。
+            "x-api-key": material.apiKey,
             // captcha 头放最后：由 renderer 现 mint，必须覆盖任何同名项。
             ...(material.headers ?? {}),
           };
