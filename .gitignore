@@ -6,6 +6,10 @@ lib/
 
 # 打包产物
 *.tgz
+# 例外：releases/ 下的发布 tgz 要入库 ——
+# 使用者克隆后可直接 `dsh plugin add file:<repo>/releases/xxx.tgz`，
+# 无需自行构建（构建需完整开源版源码 + 10-40 分钟）。
+!releases/*.tgz
 
 # 临时/调试脚本
 test-adapter.mjs
