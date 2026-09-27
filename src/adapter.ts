@@ -386,6 +386,10 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
   private async consumeSse(
     response: Response,
     outerSignal: AbortSignal | undefined,
+    // 【真流式】收到一段**新增**文本时立刻回调，让上层能马上 yield 出去。
+    //
+    // 不传时就退回旧行为（只累加、最后一次性返回）—— 保证向后兼容。
+    onDelta?: (delta: string) => void,
   ): Promise<BridgeChatResponse> {
     const body = response.body;
     if (body === null) {
@@ -456,6 +460,9 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
                 announced = true;
                 this.onFirstText?.();
               }
+              // 【真流式】立刻把这一段增量推给上层 —— 用户就能看到字在往外冒，
+              // 而不是盯着"思考中"等整轮结束。
+              onDelta?.(deltaContent);
             }
             if (Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0) {
               toolCalls = choice.delta.tool_calls;
@@ -694,7 +701,12 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     options.signal?.addEventListener("abort", onOuterAbort, { once: true });
     const timer = setTimeout(() => abortController.abort(), this.requestTimeoutMs);
 
-    let payload: BridgeChatResponse;
+    // TS 的控制流分析在 try/catch 之后无法证明它已赋值（catch 分支里
+    // 可能是在赋值前抛出的）。这里用确定断言 —— 下面的代码路径只在
+    // try 成功走完之后才可达，catch 分支一律 throw。
+    let payload!: BridgeChatResponse;
+    // 文本是否已在 SSE 循环里逐段 yield 过 —— 决定后面还要不要再发一个文本块。
+    let streamedText = false;
     try {
       // ── 流式请求 ──────────────────────────────────────────────────────
       //
@@ -746,7 +758,75 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
       if (!contentType.includes("text/event-stream")) {
         payload = (await response.json()) as BridgeChatResponse;
       } else {
-        payload = await this.consumeSse(response, options.signal);
+        // ── 【真流式】边收边吐 ────────────────────────────────────────────
+        //
+        // 旧实现：`consumeSse` 只把内容累加进字符串，**到流结束才返回**，
+        // 之后第 829 行那个 `chunkChars` 分片循环才一次性跑完。
+        // 实测证据（2026-09-27，桥侧 SSE 直连 19.2 秒的请求）：
+        //
+        //   首个数据到达: 19244 ms
+        //   总耗时:       19249 ms      ← 首字节之后只花了 5ms
+        //
+        // ⇒ 所谓"流式"是**假流式**：用户盯着"思考中"整个中位 41 秒，
+        //   然后文字瞬间全出。注释里"文字在往外冒"的说法与代码行为矛盾。
+        //
+        // 现在：`consumeSse` 每收到一段 delta 就推进这个队列，
+        // 本生成器**并发地**把它取出来立刻 yield。
+        const pending: string[] = [];
+        let notify: (() => void) | undefined;
+        let streamDone = false;
+
+        const pushDelta = (delta: string): void => {
+          pending.push(delta);
+          notify?.();
+        };
+
+        const consumePromise = this.consumeSse(response, options.signal, pushDelta)
+          .then((result) => {
+            payload = result;
+          })
+          .finally(() => {
+            streamDone = true;
+            notify?.();
+          });
+
+        // 开一个文本块 —— 契约要求 text-delta 必须在 block-start 之后。
+        let textBlockOpen = false;
+        const ensureBlockOpen = function* (): Generator<StreamChunk> {
+          if (!textBlockOpen) {
+            textBlockOpen = true;
+            yield { type: "block-start", index: 0, blockType: "text" };
+          }
+        };
+
+        while (!streamDone || pending.length > 0) {
+          if (pending.length === 0) {
+            // 等下一段（或流结束）。`notify` 只在有新数据时被调用，
+            // 所以这里不会空转。
+            await new Promise<void>((resolve) => {
+              notify = resolve;
+            });
+            notify = undefined;
+            continue;
+          }
+          const delta = pending.shift();
+          if (delta === undefined) continue;
+          // 首块按需开 —— 不预先开块，避免空回合时留下一个空文本块。
+          if (!textBlockOpen) {
+            textBlockOpen = true;
+            yield { type: "block-start", index: 0, blockType: "text" };
+          }
+          // 直接吐原始增量（不再按 chunkChars 切片 —— 那只是模拟分片）。
+          yield { type: "text-delta", index: 0, text: delta };
+        }
+
+        // 收尾：把 consumeSse 的异常（如流中报错）在这里重新抛出。
+        await consumePromise;
+        if (textBlockOpen) {
+          yield { type: "block-end", index: 0, block: { type: "text", text: extractText(payload) } };
+          // 文本块已经完整发出（含 block-end）—— 后面不要再发第二遍。
+          streamedText = true;
+        }
       }
     } catch (error) {
       if (error instanceof LlmError) {
@@ -816,8 +896,15 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     }
 
     // 文本块 —— 只在有自然语言时才发。index 从 0 开始。
+    //
+    // ⚠ 【真流式】路径下文本**已经在上面的 SSE 循环里逐段 yield 过了**
+    //   （`streamedText === true`）。这里绝不能再发一遍 —— 否则 DSH 会收到
+    //   两份内容，表现为"回答重复了两遍"。
+    //
+    //   流式路径只负责"已经吐出去的字节"；非流式路径（整包 JSON、或旧版桥）
+    //   仍走下面这个分片循环。
     let index = 0;
-    if (hasText) {
+    if (hasText && !streamedText) {
       yield { type: "block-start", index, blockType: "text" };
       for (let offset = 0; offset < proseText.length; offset += this.chunkChars) {
         yield {
@@ -828,6 +915,9 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
       }
       yield { type: "block-end", index, block: { type: "text", text: proseText } };
       index += 1;
+    } else if (streamedText) {
+      // 流式路径已经把 index 0 用掉了（块也已 block-end）。工具块从 1 开始。
+      index = 1;
     }
 
     // 工具块 —— 每个调用一个 index，连续递增。
