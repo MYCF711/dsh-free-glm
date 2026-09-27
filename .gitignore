@@ -1,0 +1,24 @@
+# 依赖
+node_modules/
+
+# 构建产物（发布走 tgz，不入库）
+lib/
+
+# 打包产物
+*.tgz
+
+# 临时/调试脚本
+test-adapter.mjs
+test-apply.mjs
+
+# 编辑器
+.vscode/
+.idea/
+
+# 系统
+Thumbs.db
+.DS_Store
+
+# 日志与备份（排查过程留下的）
+*.bak-*
+*.log
