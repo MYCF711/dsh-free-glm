@@ -158,30 +158,67 @@ function resolveBuiltInNodeReplMcpServers(e){
 - 我的 PR 定位是**「已知路线不通，这是实测可行的替代」**，不是「再加一个 provider」
 - **未 push**：还没建远程分支
 
-### 4.3 【未攻克】纯 Node 路径 —— **最有价值的方向**
+### 4.3 【已判死】纯 Node 路径 —— **走不通，captcha 是死结**
 
-**实测：`zcode.cjs` 是完整 CLI，纯 Node 24 能启动它。**
+**我一度认为这是最有价值的方向**（走通能省 338 MB）。**本轮已查明走不通。**
 
-```powershell
-node D:\DSH-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs --version
-# → 0.16.9  (exit 0)
+#### 逐层证据
 
-node ...zcode.cjs doctor
-# → version: 0.16.9 / node: v24.20.0 / exit 0
+**① `zcode.cjs` 纯 Node 能跑**（实测）：
+```
+$ node zcode.cjs --version      → 0.16.9  (exit 0)
+$ node zcode.cjs doctor         → node: v24.20.0  (exit 0)
 ```
 
-**但 `--prompt` 失败**：
-```powershell
-node ...zcode.cjs --prompt "只回答两个字：正常" --cwd D:\zcode-glm5.3f
-# → Error: Model creation failed (traceId: ...)   exit 1
+**② `--prompt` 失败，我定位到精确抛点**（读打包代码）：
+```js
+function Nwn(e, t={}) {
+  let n = t.selection ?? e.getSessionModelSelection();   // ← 纯 Node 下返回空
+  let o = WC(e, { selection: n, ... });
+}
+function WC(e, t) {
+  if (!t.selection) throw Gr(fr.ConfigurationError,
+    "Select a model before continuing");                  // ← 就是这里
+}
+```
+⇒ **不是缺凭据，是缺「模型选择」这条会话状态**（本该由 host 投递）。
+✓ 理论上可由外部调 RPC `setSessionModelSelection` 补上（它是 runtime 公开方法）。
+
+**③ 但真正的死结在 captcha —— 字符串计数是决定性的：**
+
+```
+纯 Node 的 CLI (zcode.cjs, 16 MB)：
+  captcha=0  Captcha=0  X-Aliyun=0  aliyun=0  certifyId=0  securityToken=0
+  → 全部 0 次
+
+Electron renderer 产物（styles-S9_69L9k.js，5.64 MB）：
+  captcha=60 次   ← 全仓库唯一命中的文件
 ```
 
-**日志里没有记录**，说明它用了不同的数据目录、配置未正确传递。
+renderer 里的原文：
+```js
+var yqt = `https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js`,
+    wqt = `X-Aliyun-Captcha-Verify-Param`,
+    Tqt = `X-Aliyun-Captcha-Verify-Region`,
+    Eqt = `Captcha verification failed. Plea...`
+```
 
-⇒ **如果这条路走通，可以彻底扔掉 Electron 外壳（省约 338 MB：renderer 212 + gpu 68 + network 58）。**
+**它加载阿里云 CDN 的 `AliyunCaptcha.js`** —— 那是个**浏览器 SDK，需要 DOM**。
 
-**下一步建议**：查 `Model creation failed` 在 `zcode.cjs` 里的抛出点，
-看它缺什么（凭据？provider 配置？还是必须有个 host 提供 provider config）。
+#### 结论
+
+**captcha 是 renderer 独占的能力。** 纯 Node 的 CLI 里一行相关代码都没有。
+
+**唯一的绕法是自己造浏览器环境**（happy-dom / jsdom）——
+**但那正是 Jet Hub 已经做过的**（`solver.js` 64 KB + happy-dom），
+而它的文档 `docs/zcode-405-root-cause.md` 自陈：
+
+> 状态：未定位到根因。已排除 13 个维度，全部证伪。
+> 证据 B —— 真实 Chromium 产的 param 仍然 3012
+
+**⇒ 造浏览器环境这条路，别人已经走到底且失败了。不要再走。**
+
+**（子代理 d8475df8 在做独立评估，若它的结论与上述相反，以它的证据为准。）**
 
 ### 4.4 【未做】日志字段补充
 

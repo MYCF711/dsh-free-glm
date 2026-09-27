@@ -189,25 +189,57 @@ DSH 由 `dsh-launcher.exe` 长驻进程拉起，而 Windows 进程的环境块
 | `--disable-features` 关 media 服务省内存 | **无效**：开关传进去了，进程照样起。原因：该开关控制「功能」不控制「进程生命周期」 |
 | 关 media 服务省内存（任何做法） | **上限只有 7.4 MB** —— `video_capture` 的 104 MB 里私有只有 7.4 MB，其余是共享页 |
 | `--enable-low-end-device-mode` 省内存 | **省 95 MB，但弄坏 captcha**（122 秒返回空文本） |
-| 用纯 Node 跑 `zcode.cjs` 脱离 Electron | **能跑起来**（`--version` / `doctor` 都 OK），但 `--prompt` 报 `Model creation failed`。**未攻克** |
+| 用纯 Node 跑 `zcode.cjs` 脱离 Electron | **能跑起来**（`--version` / `doctor` 都 OK），`--prompt` 报 `Model creation failed` —— **已查明是死结，见下** |
 
-### 关于最后一条（**未完成，但是最有价值的方向**）
+### 关于纯 Node 路径：**已判死，不要再试**
 
-`zcode.cjs` 是完整 CLI，**纯 Node 24 能启动它**：
+**结论：captcha 是 renderer 独占的能力，纯 Node 里一行相关代码都没有。**
+
+**实测证据（字符串计数）**：
 
 ```
-$ node zcode.cjs --version
-0.16.9
-$ node zcode.cjs doctor
-version: 0.16.9
-node: v24.20.0
+纯 Node 的 CLI（zcode.cjs，16 MB）：
+  captcha=0  Captcha=0  X-Aliyun=0  aliyun=0  certifyId=0  securityToken=0
+  → 全部 0 次
+
+Electron renderer 产物（styles-S9_69L9k.js，5.64 MB）：
+  captcha=60 次   ← 全仓库唯一命中的文件
 ```
 
-`--prompt` 模式失败在 `Model creation failed`，且**日志里没有记录**
-（说明它用了不同的数据目录，配置未正确传递）。
+renderer 里的原文：
+```js
+var yqt = `https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js`,
+    wqt = `X-Aliyun-Captcha-Verify-Param`,
+    Tqt = `X-Aliyun-Captcha-Verify-Region`
+```
 
-**如果这条路走通，可以彻底扔掉 Electron 外壳（省约 338 MB：renderer + gpu + network）。**
-**目前未攻关完成，列为已知缺口。**
+**它加载阿里云 CDN 的 `AliyunCaptcha.js`** —— 浏览器 SDK，**需要 DOM**。
+
+**`--prompt` 失败的精确抛点我也定位到了**（读打包代码）：
+
+```js
+function Nwn(e, t={}) {
+  let n = t.selection ?? e.getSessionModelSelection();   // ← 纯 Node 下返回空
+  let o = WC(e, { selection: n, ... });
+}
+function WC(e, t) {
+  if (!t.selection) throw Gr(fr.ConfigurationError,
+    "Select a model before continuing");                  // ← 就是这里
+}
+```
+
+⇒ 缺的是「模型选择」这条会话状态（本该由 host 投递）。
+**理论上可补**（`setSessionModelSelection` 是 runtime 公开方法），
+**但补上之后仍然卡在 captcha** —— 所以这条路整体不值得走。
+
+**唯一的绕法是自己造浏览器环境**（happy-dom / jsdom）——
+**那正是 Jet Hub 已做过的**（`solver.js` 64 KB + happy-dom），
+而它自己的文档 `docs/zcode-405-root-cause.md` 写着：
+
+> 状态：未定位到根因。已排除 13 个维度，全部证伪。
+> 证据 B —— 真实 Chromium 产的 param 仍然 3012
+
+**⇒ 造浏览器环境这条路别人已经走到底且失败了。不要再走。**
 
 ---
 
