@@ -76,13 +76,13 @@ $t = 'E:\ZCode-official'
 
 ```powershell
 # 直连
-dsh plugin --profile <你的profile> add https://github.com/MYCF711/dsh-free-glm/releases/download/v0.2.0/dsh-zcode-bridge-0.2.0.tgz
+dsh plugin --profile <你的profile> add https://github.com/MYCF711/dsh-free-glm/releases/download/v0.2.1/dsh-zcode-bridge-0.2.1.tgz
 
 # 国内推荐：走镜像
-dsh plugin --profile <你的profile> add https://gh-proxy.com/https://github.com/MYCF711/dsh-free-glm/releases/download/v0.2.0/dsh-zcode-bridge-0.2.0.tgz
+dsh plugin --profile <你的profile> add https://gh-proxy.com/https://github.com/MYCF711/dsh-free-glm/releases/download/v0.2.1/dsh-zcode-bridge-0.2.1.tgz
 
 # 或者先下载再装本地文件
-dsh plugin --profile web add file:D:/dsh-free-glm/dsh-zcode-bridge-0.2.0.tgz
+dsh plugin --profile web add file:D:/dsh-free-glm/dsh-zcode-bridge-0.2.1.tgz
 ```
 
 > **注意**：
@@ -320,8 +320,40 @@ DSH 是由 `dsh-launcher.exe` 这个**长驻进程**拉起的，它持有**创�
 
 | 版本 | 变更 |
 |---|---|
+| **0.2.1** | **修复路径硬编码（别人装了也能用）** + 桥侧 preamble 修复（DSH 工具调用放行） |
 | 0.2.0 | 工具调用（提示词桥接）+ 空回复明确报错 + provider 显示修复 |
 | 0.1.x | 基础对话链路 |
+
+### 0.2.1 修的两个「装了不能用」
+
+**① 路径硬编码 → 动态探测**
+
+早先候选路径是**写死的绝对路径**（作者本机的 `D:\DSH-WEB\ZCode-official\...`）。
+别人装了 → 候选全不存在 → `resolveSpawnConfig()` 返回 undefined →
+**不报错、不提示**，只是 provider 分组永远空着。
+
+现在按已知安装位置动态枚举（多盘符 × 多种目录布局 + 官方安装版），
+环境变量仍为最高优先。
+
+**② 桥的 preamble 把 DSH 工具也禁掉了**
+
+桥原先注入「**不要调用任何工具**」，而 DSH 下发的工具表写在 system 段里
+—— 这句禁令在前，**压过了工具表**。
+
+实测症状：模型在真实 DSH 会话里回答
+「按本次桥接模式的约束，我不能调用工具」，read/glob/ls 全用不了。
+
+改为**区分两类工具**：自己的内置工具 → 禁止（避免真执行 + 防超时）；
+调用方给的工具协议 → 鼓励（那正是要透传的）。
+
+修复后实测（`dsh --profile zcbtest2 --json "<任务>"`）：
+
+```
+事件流: tool_call × 2, tool_result × 2
+模型回答: "dist 目录下只有 1 个文件：dsh-zcode-bridge-0.2.0.tgz"
+```
+
+**数字来自真实工具执行，不是文档记忆。**
 
 **完整开发历史**（含每次修复的 diff 与根因说明）在 [`dev-history` 分支](https://github.com/MYCF711/dsh-free-glm/tree/dev-history)：
 

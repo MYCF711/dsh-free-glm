@@ -1,5 +1,5 @@
 diff --git a/packages/desktop/src/host/index.ts b/packages/desktop/src/host/index.ts
-index 9de80f6..25692ff 100644
+index 9de80f6..527f8a7 100644
 --- a/packages/desktop/src/host/index.ts
 +++ b/packages/desktop/src/host/index.ts
 @@ -15,6 +15,9 @@
@@ -68,7 +68,7 @@ index 9de80f6..25692ff 100644
    activeLocalResourceTelemetry = registerHostServiceResourceTelemetry({
      services,
      postMessage: (message) => parentPort?.postMessage(message),
-@@ -1863,6 +1892,604 @@ function wireLocalResourceTelemetry(services: ServiceCollection): void {
+@@ -1863,6 +1892,617 @@ function wireLocalResourceTelemetry(services: ServiceCollection): void {
    });
  }
  
@@ -385,26 +385,39 @@ index 9de80f6..25692ff 100644
 +          // 3. 发送 prompt —— 多条消息拼成首条输入
 +          //    （sendPrompt 一次发一条用户输入；system 用前置说明承载）
 +          //
-+          // ★ 必须显式声明「这是一次代答，不要动工具」（实测踩过）。
++          // ★ 桥接模式说明。
 +          //
-+          //   桥把上游消息拍平成 `User: ...` / `Assistant: ...` 的纯文本，
-+          //   作为**一条用户输入**发进会话。若不说明，模型会把这段文本当成
-+          //   真实对话现场，进而**自作主张调用壳内工具**（Bash/Read/Glob…），
-+          //   而壳内工具会真的执行 —— 结果是回复迟迟不产生，一直挂到
-+          //   180 秒超时并返回空文本。
++          // ## 措辞为什么这么讲究（实测踩过，两轮才改对）
 +          //
-+          //   实测证据：带工具往返历史的多轮请求耗时 69s（简单请求仅 13s），
-+          //   且模型回复里出现"重新列过了""需要的话我可以进去看看"这类
-+          //   明显在执行真实验证的语气；日志里 `bridge.chat.completed`
-+          //   反复出现 durationMs≈180000 且 textLength=0。
++          // 桥把上游消息拍平成 `User: ...` / `Assistant: ...` 的纯文本，
++          // 作为**一条用户输入**发进会话。若不说明，模型会把这段文本当成
++          // 真实对话现场，进而**自作主张调用壳内工具**（Bash/Read/Glob…），
++          // 而壳内工具会真的执行 —— 结果是回复迟迟不产生，一直挂到
++          // 180 秒超时并返回空文本。
++          //
++          // 实测证据：带工具往返历史的多轮请求耗时 69s（简单请求仅 13s），
++          // 且模型回复里出现"重新列过了""需要的话我可以进去看看"这类
++          // 明显在执行真实验证的语气；日志里 `bridge.chat.completed`
++          // 反复出现 durationMs≈180000 且 textLength=0。
++          //
++          // **但**早先的措辞是「不要调用任何工具」，它**连 DSH 侧的工具
++          // 桥接也一起禁掉了** —— 调用方（DSH agent）下发的工具表写在
++          // system 段里，而这句禁令在前，压过了工具表。实测后果：模型在
++          // 真实 DSH 会话里明确回答「按本次桥接模式的约束，我不能调用工具」，
++          // 于是 DSH 的 read/glob/ls 全都用不了。
++          //
++          // ⇒ 正确措辞要**区分两类工具**：
++          //   - 「你自己的内置工具」→ 禁止（避免真执行 + 180 秒超时）
++          //   - 「调用方给你的工具协议」→ 鼓励（那正是我们要透传的）
 +          const bridgePreamble = params.allowTools === true
-+            // 【实验模式】放开工具：不注入"不要调用工具"，让模型自由调用。
-+            // 用途是验证工具面透传（捕获结构化 tool_call）。
++            // 【实验模式】放开壳内工具：让模型自由调用，用于捕获结构化 tool_call。
 +            ? "[桥接模式] 下面是一段待续写的对话记录。请输出下一条 assistant 回复。\n\n"
-+            : "[桥接模式] 下面是一段待续写的对话记录。"
-+              + "请**只输出**下一条 assistant 回复的正文，不要调用任何工具，"
-+              + "不要执行命令，不要读取文件 —— 工具由发起方负责，"
-+              + "你只需基于记录中已有的信息作答。\n\n";
++            : "[桥接模式] 下面是一段待续写的对话记录。请输出下一条 assistant 回复的正文。\n\n"
++              + "**重要**：不要使用你自己的内置工具（不要执行命令、不要读取文件、"
++              + "不要列目录）—— 那些由发起方负责，你只需基于记录中已有的信息作答。\n\n"
++              + "但是：如果记录里给出了**工具调用协议**（通常是一份工具表 + 约定的"
++              + "输出格式），那必须照它执行 —— 那是发起方要求你用的接口，"
++              + "与你的内置工具无关。该调工具时就调，不要因为上面那句而放弃。\n\n";
 +          const systemParts = params.messages
 +            .filter((m) => m.role === "system")
 +            .map((m) => m.content);
@@ -673,7 +686,7 @@ index 9de80f6..25692ff 100644
  function disposeLocalResourceTelemetry(): void {
    try {
      activeLocalResourceTelemetry?.dispose();
-@@ -2895,6 +3522,7 @@ parentPort.on("message", async (e: Electron.MessageEvent) => {
+@@ -2895,6 +3535,7 @@ parentPort.on("message", async (e: Electron.MessageEvent) => {
            services.register(IZCodeTaskService, reportingZCodeTaskService);
          }
          wireLocalResourceTelemetry(services);
