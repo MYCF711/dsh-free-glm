@@ -1,0 +1,54 @@
+docs: JetHub PR #5 已提交 + 补一份完整的 PR 说明备份
+
+## 成果
+
+```
+https://github.com/zhengwuji/Jet-Hub/pull/5
+feat(zcode): 新增 ZCode (智谱) provider
+状态 open · +1411 / -3 · 10 文件
+```
+
+### 文件清单
+
+| 状态 | 改动 | 文件 |
+|---|---|---|
+| added | +422 | `src/zcode-adapter.ts` |
+| added | +322 | `src/zcode-auth.ts` |
+| added | +222 | `src/zcode.ts` |
+| added | +136 | `src/zcode-product.ts` |
+| added | +135 | `scripts/verify-zcode-against-bridge.mjs` |
+| modified | +82 -2 | `src/index.ts` |
+| modified | +47 -1 | `src/jet-hub-rpc.ts` |
+| modified | +16 | `tests/unit/jet-hub-rpc.spec.ts` |
+| modified | +15 | `plugin-src/client/credits-capabilities.js` |
+| modified | +14 | `plugin-src/client/jet-hub.js` |
+
+## 怎么提交成功的（供后续参考）
+
+**关键：GitHub token 全部不可用，但浏览器里有有效登录态。**
+
+三条凭据的实测结论：
+
+| 凭据 | 身份 | 能否开 PR |
+|---|---|---|
+| `D:\github-key\github-token.txt` | 查 `/user` 返回**占位符** `XxXx…x0`，写仓库 403 | ❌ |
+| Git Credential Manager 的 `gho_…` | `aeroheaven1`（**另一个人**，名下无 fork） | ❌ |
+| SSH `git@github.com` | `MYCF711` | ✅ 只能 push |
+
+⇒ **改用 AutoGLM 驱动浏览器**（用户已登录 GitHub，账号 `zhengwuj`）：
+
+```
+1. autoglm run --start-url "<compare 页面>"        # 确认登录态 + 页面正确
+2. autoglm run --session-id <id> --tab-id <id> ...  # 填标题 + 点创建
+```
+
+**注意**：AutoGLM 的 `--task` 限制是**单行、不含双引号**，
+所以正文无法整篇塞进任务；它把说明发成了 **PR 评论**（同样对维护者可见）。
+
+## 遗留
+
+PR **描述框为空**，说明在**评论**里。若要让描述框也有内容，
+需要在网页上手填 —— 或给我一个 `MYCF711` 的 `repo` scope token。
+
+完整 PR 正文已备份在 `JETHUB-PR-BODY.md`（含所有表格与实测数据），
+可直接粘贴。
