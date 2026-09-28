@@ -332,6 +332,41 @@ export function spawnHostProcess(
      * 所以**唯一可行**的自动化点是「让 ZCode 自己走一遍 startLogin」——
      * 这正是本分支的作用。
      */
+    /**
+     * ★ host 请求用系统浏览器打开 URL（2026-09-28 新增）。
+     *
+     * ## 用途
+     *
+     * 服务端中介登录（桥的 `/oauth/cli-login`）需要打开授权页。
+     * host 是纯 Node fork，拿不到 electron 的 `shell.openExternal`，
+     * 所以由 main 代劳。
+     *
+     * ## 与 StartOAuthLogin 的区别
+     *
+     * 那个要**经过 renderer**（生成 state、注册、开浏览器）；
+     * 本分支**只开浏览器** —— 因为服务端中介路径不需要 renderer。
+     *
+     * ⚠ 加载脚本时 electron 已在主进程上下文，用静态 import 即可；
+     *   这里用动态 import 是为了避免 host 侧模块被误加载（host 不能碰 electron）。
+     */
+    if (result.data.type === HostResponseTypes.OpenExternalUrl) {
+      const targetUrl = result.data.url;
+      void (async () => {
+        try {
+          const electronModule = await import("electron");
+          await electronModule.shell.openExternal(targetUrl);
+          dependencies.logger.info(
+            `[spawnHostProcess] 已用系统浏览器打开: ${targetUrl.slice(0, 140)}`,
+          );
+        } catch (error) {
+          dependencies.logger.warn(
+            `[spawnHostProcess] 打开网页失败: ${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      })();
+      return;
+    }
+
     if (result.data.type === HostResponseTypes.StartOAuthLogin) {
       const windows = BrowserWindow.getAllWindows().filter((w) => !w.isDestroyed());
       const target = windows[0];

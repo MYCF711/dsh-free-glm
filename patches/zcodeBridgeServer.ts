@@ -41,7 +41,7 @@ import {
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { arch, platform, release } from "node:os";
 import {
@@ -925,7 +925,46 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
    * ⚠ 它只影响**桥自己的请求**，不改动壳的状态 ——
    *   所以对「壳内会话链路」无影响（那是另一条路径）。
    */
-  let injectedJwt: string | undefined;
+  /**
+   * ★ 持久化的注入 token 文件（2026-09-28）。
+   *
+   * 注入本来是内存态，重启桥就丢 —— 而「换账号」是一次性动作，
+   * 每次重启都要重新注入不合理。
+   *
+   * 所以：`/oauth/use-token` 注入时**同时写这个文件**，
+   * 桥启动时**自动读取**。
+   *
+   * 关闭方式：`ZCODE_BRIDGE_INJECTED_JWT_DISABLED=1`
+   * （若注入的 token 失效导致全部请求失败，用它回退到壳凭据）。
+   */
+  const injectedJwtFilePath = join(deps.dataBaseDir, ".zcode", "v2", "injected-jwt.txt");
+
+  function loadInjectedJwtFromDisk(): string | undefined {
+    if (process.env["ZCODE_BRIDGE_INJECTED_JWT_DISABLED"] === "1") return undefined;
+    try {
+      const raw = readFileSync(injectedJwtFilePath, "utf8").trim();
+      /** 粗校验：JWT 是三段点分结构。防止空文件/损坏文件导致全链路失败。 */
+      return raw.split(".").length === 3 ? raw : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  let injectedJwt: string | undefined = loadInjectedJwtFromDisk();
+
+  /** 写盘（失败不影响主流程 —— 内存态仍然生效）。 */
+  function persistInjectedJwt(value: string | undefined): void {
+    try {
+      if (value === undefined) {
+        if (existsSync(injectedJwtFilePath)) rmSync(injectedJwtFilePath, { force: true });
+        return;
+      }
+      mkdirSync(dirname(injectedJwtFilePath), { recursive: true });
+      writeFileSync(injectedJwtFilePath, value, "utf8");
+    } catch {
+      /* 忽略 */
+    }
+  }
 
   function bridgeSourceHeaders(): Record<string, string> {
     const locale = (() => {
@@ -1955,6 +1994,7 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
         const raw = typeof injectBody["token"] === "string" ? injectBody["token"].trim() : "";
         if (raw.length === 0) {
           injectedJwt = undefined;
+          persistInjectedJwt(undefined);
           json(response, 200, { ok: true, cleared: true, message: "已清除注入，回退到壳凭据。" });
           return;
         }
@@ -1964,6 +2004,7 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
           return;
         }
         injectedJwt = raw;
+        persistInjectedJwt(raw);
         /** 解析 payload 便于确认账号（不校验签名，仅展示）。 */
         let payload: unknown = null;
         try {
@@ -2302,7 +2343,8 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
           const upstream = await fetch(billingUrl, {
             method: "GET",
             headers: {
-              authorization: `Bearer ${material.apiKey}`,
+              /** 优先用外部注入的 token（见 /oauth/use-token）。 */
+              authorization: `Bearer ${injectedJwt ?? material.apiKey}`,
               ...(deviceMid.length > 0 ? { "x-device-mid": deviceMid } : {}),
               "user-agent": `ZCode/${appVersion}`,
               accept: "application/json",
