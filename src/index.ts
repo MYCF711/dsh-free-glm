@@ -115,12 +115,73 @@ import {
 // schema，会丢掉 schema 类型（TS2349）。
 const configSchema = z
   .object({
+    /** 按 provider/模型 禁用单个模型（模型可见性开关写这里）。 */
     disabledModels: z.dict(z.dict(z.boolean())).default({}),
+
+    // ──────────────────────────────────────────────────────────────
+    // 以下为 2026-09-28 新增：把运行时可调项从「环境变量」搬到设置页。
+    //
+    // 为什么搬：这些开关此前只能靠环境变量，而 DSH 由长驻 launcher 拉起 ——
+    // launcher 的环境块可能几天不更新，改环境变量后重启 DSH 也读不到
+    // （本项目实测踩过这个坑）。配置项走 DSH 自己的配置系统，不受影响。
+    // ──────────────────────────────────────────────────────────────
+
+    /**
+     * 每日额度检索间隔（分钟），默认 20。
+     *
+     * 后台定时任务每隔这么久：补激活上报 → 查 preview → 领取派发额度。
+     *
+     * ⚠ 别设太小：第三方实现提到 billing 接口连续查询易触发 WAF。
+     *   20 分钟 = 一天 72 次，是安全区。
+     */
+    quotaCheckIntervalMinutes: z.number().min(1).default(20),
+
+    /** 检索失败后的冷却时间（分钟），默认 10。 */
+    quotaFailureCooldownMinutes: z.number().min(1).default(10),
+
+    /** 关闭后台检索（默认开启 = 自动领取派发额度）。 */
+    quotaGuardDisabled: z.boolean().default(false),
+
+    /**
+     * captcha 凭据预取池（实验特性，默认关闭）。
+     *
+     * 后台提前 mint 一个未使用的 captcha 凭据放进池，请求到来时直接取用
+     * （省掉 mint 的约 230ms）。
+     *
+     * ⚠ 默认关闭的原因（本项目实测）：
+     *   开启后中位 3.28s，关闭后中位 3.20s —— 差异在噪声范围内。
+     *   因为 mint 只占 230ms，而上游 ttft 波动 ±1.1s 把它淹没了。
+     */
+    captchaPoolEnabled: z.boolean().default(false),
+
+    /**
+     * 外部注入的 zcode JWT（换账号用）。
+     *
+     * 默认用壳凭据库里的 JWT。若要换成另一个账号（例如新号的每日免费
+     * 额度），把那个账号的 JWT 填在这里。
+     *
+     * 怎么拿：执行 /zcode-login —— 它走服务端中介路径，成功后会把新 JWT
+     * 自动写进桥的持久化文件，这里通常不需要手动填。
+     */
+    injectedJwt: z.string().default(""),
   })
   .volatile();
 
-export const Config: z<{ disabledModels: Record<string, Record<string, boolean>> }> =
-  configSchema as unknown as z<{ disabledModels: Record<string, Record<string, boolean>> }>;
+export const Config: z<{
+  disabledModels: Record<string, Record<string, boolean>>;
+  quotaCheckIntervalMinutes: number;
+  quotaFailureCooldownMinutes: number;
+  quotaGuardDisabled: boolean;
+  captchaPoolEnabled: boolean;
+  injectedJwt: string;
+}> = configSchema as unknown as z<{
+  disabledModels: Record<string, Record<string, boolean>>;
+  quotaCheckIntervalMinutes: number;
+  quotaFailureCooldownMinutes: number;
+  quotaGuardDisabled: boolean;
+  captchaPoolEnabled: boolean;
+  injectedJwt: string;
+}>;
 
 /**
  * 保活检查间隔。
@@ -504,6 +565,45 @@ function probeSettings(ctx: Context): { available: boolean; namespaces: string[]
  * headless / CLI profile 没有 settings 服务，返回 `undefined` ——
  * 适配器不过滤，那些 profile 也没有设置页，开关无从谈起。
  */
+/**
+ * 读取本插件的设置段（2026-09-28 新增）。
+ *
+ * ## 为什么单独一个函数
+ *
+ * 新增的配置项（检索间隔 / 冷却 / 关闭守卫 / 池开关 / 注入 JWT）都要读它，
+ * 而读取路径与 `createModelVisibility` 里的模式一致 ——
+ * 抽出来避免重复，也便于统一降级。
+ *
+ * ## 降级语义（重要）
+ *
+ * 读不到时返回 **undefined**，调用方各自回退到环境变量或内置默认值。
+ * 这与本插件一贯的做法一致：
+ * 「拿不到配置不是错误，只是退回默认行为」——
+ * 因为 headless profile 可能根本没有 settings 服务。
+ */
+interface BridgeConfigValues {
+  readonly quotaCheckIntervalMinutes?: number;
+  readonly quotaFailureCooldownMinutes?: number;
+  readonly quotaGuardDisabled?: boolean;
+  readonly captchaPoolEnabled?: boolean;
+  readonly injectedJwt?: string;
+}
+
+function readBridgeConfig(ctx: Context): BridgeConfigValues | undefined {
+  try {
+    const settings = ctx.get("settings") as
+      | { describe?: () => { ns: string; value?: unknown }[] }
+      | undefined;
+    if (settings === undefined || typeof settings.describe !== "function") return undefined;
+    const row = settings.describe!().find((r) => r.ns === SETTINGS_NS);
+    if (row === undefined || row.value === undefined || row.value === null) return undefined;
+    return row.value as BridgeConfigValues;
+  } catch {
+    /** describe() 会遍历所有 entry 的 schema，别人不合规也会抛 —— 不该因此让本插件失效。 */
+    return undefined;
+  }
+}
+
 function createModelVisibility(ctx: Context): ModelVisibility | undefined {
   const settings = ctx.get("settings") as
     | {
@@ -865,11 +965,24 @@ export async function apply(ctx: Context): Promise<void> {
    * 关闭：`ZCODE_QUOTA_GUARD_DISABLED=1`
    * 调间隔：`ZCODE_QUOTA_GUARD_INTERVAL_MS=600000`
    */
+  const bridgeConfig = readBridgeConfig(ctx);
   const quotaGuard = createQuotaGuard({
     log: {
       info: (message: string) => ctx.logger?.info?.(message),
       warn: (message: string) => ctx.logger?.warn?.(message),
     },
+    /**
+     * ★ 从设置页读（2026-09-28 新增），未配置时内部回退到环境变量/默认值。
+     *
+     * 为什么优先用设置页而不是环境变量：DSH 由长驻 launcher 拉起，
+     * 环境块可能几天不更新（改环境变量重启也读不到）。
+     */
+    ...(typeof bridgeConfig?.quotaCheckIntervalMinutes === "number"
+      ? { intervalMs: bridgeConfig.quotaCheckIntervalMinutes * 60_000 }
+      : {}),
+    ...(typeof bridgeConfig?.quotaFailureCooldownMinutes === "number"
+      ? { cooldownMs: bridgeConfig.quotaFailureCooldownMinutes * 60_000 }
+      : {}),
   });
   ctx.effect(() => () => {
     quotaGuard.stop();

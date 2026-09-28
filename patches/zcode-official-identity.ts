@@ -131,29 +131,50 @@ export function buildOfficialSystemBlocks(
   options: { cwd: string; model?: string } = { cwd: "." },
 ): Array<{ type: "text"; text: string; cache_control: { type: "ephemeral" } }> {
   const ephemeral = { type: "ephemeral" as const };
-  const E = OFFICIAL_ENVIRONMENT_LABELS;
   const stable = OFFICIAL_STABLE_SECTIONS.join("\n\n");
 
-  const platform = "win32";
-  const shellText = "cmd";
-  const environmentLines = [
-    E.heading,
-    `- ${E.cwdLabel}: ${options.cwd}`,
-    E.invokedLine,
-    `- ${E.platformLabel}: ${platform}`,
-    `- ${E.shellLabel}: ${shellText}`,
-    `- ${E.osVersionLabel}: 10.0.26100`,
-    E.poweredByLine
-      .replace("{provider}", "bigmodel-api")
-      .replace("{model}", options.model ?? "glm-5.3-flash"),
-    `- ${E.gitLabel}: ${E.gitNo}`,
-  ].join("\n");
-  const dynamic = [
-    OFFICIAL_DYNAMIC_BEFORE_ENV,
-    environmentLines,
-    OFFICIAL_DYNAMIC_AFTER_ENV,
-  ].join("\n\n");
-
+  /**
+   * ★★ 只发「准入必需」的两块 —— 砍掉 5KB 行为指令（2026-09-28 实测）。
+   *
+   * ## 为什么砍（这是「DSH 里变笨」的根因）
+   *
+   * 上游的内容检查**只要求身份块存在**，不要求它的行为指令段。
+   * 实测三种组合：
+   *
+   * | system 内容 | 字符数 | 结果 |
+   * |---|---|---|
+   * | 完整三块（含 dynamic 段） | 7599 | ✓ 200 |
+   * | **仅 cliPrefix + stable** | **2355** | **✓ 200** |
+   * | 仅 cliPrefix | 42 | ✗ 3012 |
+   *
+   * **⇒ 砍掉的 5244 字符是「dynamic 段」，它对准入无影响。**
+   *
+   * ## 那 5KB 里有什么（为什么它有害）
+   *
+   * `dynamicSections` 含两段**给 ZCode 内 coding agent 的行为指令**：
+   *
+   * - `# Communicating with the user`
+   *   「Before your first tool call, say in a sentence what you're about to do」
+   *   「while working, give brief updates」「Lead with the outcome」
+   * - `# Context management`
+   *   「You are operating autonomously」「Before ending your turn, check...」
+   *
+   * 这些**与 DSH 自己的行为规范冲突**：它们鼓励「先声明再做事、边做边汇报、
+   * 最后总结」，而 DSH 的语境不需要这些 —— 表现出来就是「啰嗦、慢、
+   * 一个简单任务要 39 秒起」。
+   *
+   * 而它们被放在 system **开头**（7.6KB），**压过了追加在后面的 DSH prompt**。
+   *
+   * ## 现在的形状
+   *
+   * ```
+   * block[0] = cliPrefix（42 字符）    ← 准入必需
+   * block[1] = stable（2313 字符）     ← 准入必需
+   * block[2..] = 调用方的 system（DSH 的完整 prompt）  ← 现在它是主角
+   * ```
+   *
+   * 调用方内容仍然追加在最后（身份块必须在开头），但**不再被 5KB 行为指令压制**。
+   */
   const blocks: Array<{
     type: "text";
     text: string;
@@ -161,7 +182,6 @@ export function buildOfficialSystemBlocks(
   }> = [
     { type: "text", text: OFFICIAL_CLI_PREFIX, cache_control: ephemeral },
     { type: "text", text: stable, cache_control: ephemeral },
-    { type: "text", text: `\n\n${dynamic}`, cache_control: ephemeral },
   ];
   if (typeof callerSystem === "string" && callerSystem.trim().length > 0) {
     blocks.push({ type: "text", text: callerSystem, cache_control: ephemeral });

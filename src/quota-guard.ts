@@ -58,6 +58,8 @@ export interface QuotaGuardOptions {
   };
   /** 检索间隔（毫秒）。未设置时用 `ZCODE_QUOTA_GUARD_INTERVAL_MS` 或默认值。 */
   readonly intervalMs?: number;
+  /** 失败冷却（毫秒）。未设置时用 `ZCODE_QUOTA_GUARD_COOLDOWN_MS` 或默认值。 */
+  readonly cooldownMs?: number;
   /** 首次延迟（毫秒）。 */
   readonly firstDelayMs?: number;
 }

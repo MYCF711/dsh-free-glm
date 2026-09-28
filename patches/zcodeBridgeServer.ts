@@ -953,6 +953,94 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
   let injectedJwt: string | undefined = loadInjectedJwtFromDisk();
 
   /** 写盘（失败不影响主流程 —— 内存态仍然生效）。 */
+  /**
+   * ★★ captcha 凭据预取池（2026-09-28 新增）。
+   *
+   * ## 为什么能做（本轮实测的凭据生命周期）
+   *
+   * 此前认为材料「一次性、只能立即用」。**实测推翻了这一半**：
+   *
+   * | 生成后经过 | 使用结果 |
+   * |---|---|
+   * | 0 秒 | ✅ ok |
+   * | 10 秒 | ✅ ok |
+   * | 30 秒 | ✅ ok |
+   * | 60 秒 | ✅ ok |
+   * | 120 秒 | ❌ 3007 |
+   *
+   * **⇒ 有效期在 60-120 秒之间；「一次性」只指「用一次就作废」，
+   *    不指「必须立刻用」。**
+   *
+   * ## 收益（实测）
+   *
+   * mint 耗时：中位 230ms，最慢 506ms，平均 282ms。
+   * 预取后热路径**零等待**，省掉这部分，并消除抖动。
+   *
+   * ## 与旧「材料缓存」的区别（旧方案已因 400 关闭，不要混淆）
+   *
+   * - 旧缓存：缓存**用过的**材料 → 复用时上游返回 400/3007
+   * - 本池：只缓存**未使用**的凭据，用完即弃 → 不违反一次性
+   *
+   * ## TTL 取 45 秒的理由
+   *
+   * 实测 60 秒仍有效，120 秒失效。取 45 秒留 15 秒余量，
+   * 避免「刚好卡在边界」的不确定性。
+   *
+   * 开关：`ZCODE_BRIDGE_CAPTCHA_POOL=1` 启用（默认关闭，先观察稳定性）。
+   */
+  const CAPTCHA_POOL_TTL_MS = 45_000;
+  const CAPTCHA_POOL_ENABLED = process.env["ZCODE_BRIDGE_CAPTCHA_POOL"] === "1";
+  interface PooledMaterial {
+    readonly material: FastMaterial;
+    readonly atMs: number;
+  }
+  let captchaPool: PooledMaterial | undefined = undefined;
+
+  /** 后台预取一个凭据入池（不阻塞调用方）。 */
+  function prefetchCaptcha(): void {
+    if (!CAPTCHA_POOL_ENABLED) return;
+    if (deps.mintAuthMaterial === undefined) return;
+    if (captchaPool !== undefined && Date.now() - captchaPool.atMs < CAPTCHA_POOL_TTL_MS) return;
+    void (async () => {
+      try {
+        const material = await deps.mintAuthMaterial!({
+          providerId: DEFAULT_PROVIDER_ID,
+          modelId: ALLOWED_MODELS[0],
+          workspacePath: bridgeWorkspacePath(),
+        });
+        if (material?.apiKey !== undefined) {
+          captchaPool = { material, atMs: Date.now() };
+        }
+      } catch {
+        /* 预取失败不影响主流程，下次请求会现 mint */
+      }
+    })();
+  }
+
+  /** 从池里取（取走即清空 —— 因为凭据用一次就作废）。 */
+  function takePooledCaptcha(): FastMaterial | undefined {
+    if (!CAPTCHA_POOL_ENABLED) return undefined;
+    const p = captchaPool;
+    if (p === undefined) {
+      /**
+       * ★ 池空也补一次（2026-09-28）。
+       *
+       * 否则首次请求走现 mint、不补池 ⇒ **池永远是空的**，
+       * 这个优化形同虚设（这是实现时的真实陷阱）。
+       */
+      prefetchCaptcha();
+      return undefined;
+    }
+    if (Date.now() - p.atMs >= CAPTCHA_POOL_TTL_MS) {
+      captchaPool = undefined;
+      return undefined;
+    }
+    captchaPool = undefined;
+    /** 立即补下一个（不等它完成）。 */
+    prefetchCaptcha();
+    return p.material;
+  }
+
   function persistInjectedJwt(value: string | undefined): void {
     try {
       if (value === undefined) {
@@ -2691,9 +2779,28 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
             const cached = FAST_MATERIAL_CACHE_DISABLED
               ? undefined
               : fastMaterialCache.get(cacheKey);
+            /**
+             * ★★ 池取用（2026-09-28）：后台预取的**未使用**凭据。
+             *
+             * 定义见 `takePooledCaptcha()`（在 `persistInjectedJwt` 附近）。
+             * 未启用（默认）或池空时返回 undefined，落到下面的现 mint 逻辑。
+             */
+            const pooledMaterial = takePooledCaptcha();
             let material: Awaited<ReturnType<typeof deps.mintAuthMaterial>>;
             let materialFromCache = false;
-            if (cached !== undefined && nowMs - cached.atMs < FAST_MATERIAL_TTL_MS) {
+            /** 是否命中 captcha 预取池（2026-09-28，便于日志归因）。 */
+            let materialFromCaptchaPool = false;
+            /**
+             * ★★ 池优先（2026-09-28）：池里的凭据是后台提前 mint 的、**未使用过**的。
+             * 取走即弃并自动补下一个 ⇒ 热路径零等待。
+             *
+             * 未启用（默认）或池空时，落到下面的现 mint 逻辑。
+             */
+            if (pooledMaterial !== undefined && pooledMaterial.apiKey !== undefined) {
+              material = pooledMaterial;
+              materialFromCache = false;
+              materialFromCaptchaPool = true;
+            } else if (cached !== undefined && nowMs - cached.atMs < FAST_MATERIAL_TTL_MS) {
               material = cached.material;
               materialFromCache = true;
             } else {
@@ -3432,6 +3539,7 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
                  */
                 mintMs,
                 materialFromCache,
+                materialFromCaptchaPool,
               });
               return;
             }
