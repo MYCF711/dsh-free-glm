@@ -2756,3 +2756,90 @@ GET /billing/preview →
 **⚠ 而 ① 需要完成一次 OAuth 授权** —— 由于 `/oauth/token` 端点故障
 （详见第三十四节），须走新增的 `/oauth/cli-login` 路径
 （服务端中介，绕开故障端点）；拿到 token 后用 `/oauth/use-token` 注入桥。
+
+---
+
+## 三十六、★★ 最终成果：每日免费订阅额度接入（2026-09-28）
+
+### 成果
+
+桥现在使用 **ZCode Start Plan（`period: daily`）**：
+
+```
+套餐: ZCode Start Plan
+周期: daily                      ← 每日刷新，非一次性活动
+额度: GLM-5.3 3,000,000/日 + GLM-5.3-Flash 5,000,000/日
+到期: 每日 23:59:59（次日自动恢复）
+账号: 8921790563081630（新账号）
+```
+
+**实测扣减证据**：`GLM-5.3-Flash 已用=37890 / 总=5000000`，
+请求头 dump 显示 `user_id: 8921790563081630`。
+
+### 达成的三条关键修复
+
+**① `/oauth/token` 端点故障 → 服务端中介登录**
+
+该端点自 09-28 起稳定返回 `500 / code 2007`（假 code 直测也是 500 ⇒ 端点故障）。
+
+改用官方 3.12.3 桌面版默认方式：
+```
+POST /api/v1/oauth/cli/init  {provider}  Bearer <32字节hex>
+  → { flow_id, authorize_url, poll_interval_sec }
+浏览器打开 authorize_url（服务端记录授权，**回调不回本机**）
+GET  /api/v1/oauth/cli/poll/{flow_id}
+  → status:"ready" 时返回 { token, user, bigmodel:{access_token} }
+```
+**完全不经过 `/oauth/token`。**
+
+**② 无需写凭据库 → JWT 直接注入**
+
+原以为需把 JWT 写进 `credentials.json`（AES-GCM 加密、格式未公开）。
+**实测：只要 JWT 有效就能调 API** —— 桥内覆盖即可。
+
+- `POST /oauth/use-token` 注入
+- fast path 用 `effectiveApiKey = injectedJwt ?? material.apiKey`
+- billing 端点同样优先用注入值
+- **持久化**到 `<dataBaseDir>/.zcode/v2/injected-jwt.txt`，启动时自动加载
+- 禁用：`ZCODE_BRIDGE_INJECTED_JWT_DISABLED=1`
+
+**③ renderer 路径的两个真 bug**
+
+| bug | 表现 | 根因 |
+|---|---|---|
+| `OpenExternalUrl` 的 main 侧处理缺失 | 桥返回 `browserOpened: true` 但**浏览器没开** | host 发 postMessage 后 main 无分支处理，**消息被静默丢弃** |
+| renderer 跑旧产物 | 收到「宿主请求登录」后**不执行** | `ui` 包改动未重建 renderer |
+
+修复后实测：
+```
+已把登录请求转给 renderer (windowId=1, provider=bigmodel)
+OAuth polling flow started {"expiresInMs":300000,"pollIntervalMs":2000}
+oauth.startOAuthWithPolling OK (92.5ms)
+```
+
+### 最终验收（全部通过）
+
+| 项 | 证据 |
+|---|---|
+| 每日免费订阅额度 | `ZCode Start Plan` / `daily` / 扣减实测 |
+| 插件让 DSH 调用 | 工具调用成功，dump 确认新账号 |
+| 登录 → 授权 | CLI 路径拿到 token |
+| 时刻检索 + 自动领取 | 落盘实测（`quota-guard.ndjson`） |
+| **不依赖外部应用** | **杀光壳后 20 秒自愈，且带上新账号凭据** |
+| 集成优点、融合 | 官方身份块（解 3012）+ 工具透传 |
+
+### 方法论教训（本轮新增）
+
+1. **「返回成功 ≠ 真的做了」**
+   `openUrl` 返回 `ok: true`，但 main 侧根本没处理 ——
+   host 只负责**发消息**，不确认对方**是否处理**。
+   凡是这种「发出即成功」的接口，都要在另一端加**可观测的落盘证据**。
+
+2. **`ui` 包的改动必须重建 renderer**
+   否则 renderer 跑旧产物，链路**静默失效**（无报错、无日志）。
+   判据：查 renderer 产物的修改时间 vs 源码修改时间。
+
+3. **重复触发有副作用的端点要先想清楚**
+   `/oauth/login` 与 `/oauth/cli-login` **每次调用都会创建新流程并弹浏览器**。
+   排查时反复重试会导致用户收到多个授权页（本次实际发生 3 次）。
+   **正确做法**：先用一个长超时的调用覆盖整个等待窗口，而不是反复短调用。
