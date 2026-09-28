@@ -1245,7 +1245,103 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
    * 串行是**确定性**的：它要么完全不撞，要么说明问题不在并发。
    * 先拿到「串行下 429 归零」这个事实，再谈放宽。
    */
-  const FAST_PATH_SERIALIZE = process.env["ZCODE_BRIDGE_SERIALIZE"] !== "0";
+  /**
+   * ★★★ 降级检测 + 自动退避（2026-09-29）。
+   *
+   * ## 为什么需要（这是实测的血泪）
+   *
+   * 上游的 captcha 是有**信誉**概念的。设备信誉不足时会从
+   * 「无感验证（静默通过）」**降级为「滑块验证（需人工）」**。
+   *
+   * 而一旦降级，**继续请求不会让它恢复，反而让它更糟**。
+   * 实测单日日志的分布非常典型：
+   *
+   * ```
+   * 00 时:  96 次 mint 超时    ← 密集调试，越撞越糟
+   * 01-05 时: 各 5-7 次        ← 空闲后的自然重试
+   * ```
+   *
+   * 00 时那 96 次是我的调试造成的，而它们**没有任何一次成功收尾** ——
+   * 纯损耗。这正是本机制要防的事。
+   *
+   * ## 机制
+   *
+   * 把 mint 失败当成**连续信号**而非独立事件：
+   *
+   * | 连续失败次数 | 行为 |
+   * |---|---|
+   * | 1-2 | 正常重试（瞬时抖动，自己会好） |
+   * | ≥3 | 进入**退避**：按指数增长冷却，期间直接快速失败 |
+   * | 一次成功 | **立即清零**，退出退避 |
+   *
+   * 退避期间的请求**很快返回**（不阻塞 20 秒），
+   * 且错误信息明确告诉调用方「这是降级冷却，不是配置错误」。
+   *
+   * ## 为什么「快速失败」比「继续等」好
+   *
+   * 原来的行为：每次都等满 20 秒超时。
+   * 后果有两个：
+   *   1. 用户侧每个请求白等 20 秒（DSH 的多步循环会累加）
+   *   2. **持续向上游发请求**，维持甚至加重降级
+   *
+   * 退避后两者都改善。
+   *
+   * ## 可调
+   *
+   * `ZCODE_BRIDGE_BACKOFF=0` 关闭（诊断用）。
+   */
+  const BACKOFF_ENABLED = process.env["ZCODE_BRIDGE_BACKOFF"] !== "0";
+  /** 连续 mint 失败计数。 */
+  let mintFailureStreak = 0;
+  /** 退避到期时刻（毫秒时间戳）；0 表示不在退避中。 */
+  let mintBackoffUntilMs = 0;
+  /** 退避步长（毫秒）：第 3 次失败起生效，逐次翻倍。 */
+  const BACKOFF_BASE_MS = 60_000;
+  const BACKOFF_MAX_MS = 30 * 60_000;
+  /** 触发退避的连续失败阈值。 */
+  const BACKOFF_THRESHOLD = 3;
+
+  /** mint 成功 —— 立即清零退避。 */
+  function noteMintSuccess(): void {
+    if (mintFailureStreak > 0 || mintBackoffUntilMs > 0) {
+      log("bridge.mint.recovered", {
+        afterFailures: mintFailureStreak,
+        wasBackingOff: mintBackoffUntilMs > 0,
+      });
+    }
+    mintFailureStreak = 0;
+    mintBackoffUntilMs = 0;
+  }
+
+  /**
+   * mint 失败 —— 累计并可能进入退避。
+   *
+   * 返回**下一次可尝试的时刻**（0 表示不冷却）。
+   */
+  function noteMintFailure(reason: string): number {
+    mintFailureStreak += 1;
+    if (!BACKOFF_ENABLED || mintFailureStreak < BACKOFF_THRESHOLD) return 0;
+
+    // 第 3 次 → 1 分钟，第 4 次 → 2 分钟，第 5 次 → 4 分钟 …… 上限 30 分钟
+    const step = mintFailureStreak - BACKOFF_THRESHOLD;
+    const cooldownMs = Math.min(BACKOFF_BASE_MS * 2 ** step, BACKOFF_MAX_MS);
+    mintBackoffUntilMs = Date.now() + cooldownMs;
+
+    log("bridge.mint.backoff.entered", {
+      streak: mintFailureStreak,
+      cooldownMs,
+      reason: reason.slice(0, 200),
+    });
+    return mintBackoffUntilMs;
+  }
+
+  /** 当前是否在退避中；是则返回剩余毫秒数。 */
+  function mintBackoffRemainingMs(): number {
+    if (!BACKOFF_ENABLED) return 0;
+    const remain = mintBackoffUntilMs - Date.now();
+    return remain > 0 ? remain : 0;
+  }
+
   /** 串行闸门的尾指针 —— 每个新请求接在上一个之后。 */
   let fastPathTail: Promise<void> = Promise.resolve();
   /** 当前排队中的请求数（仅用于诊断）。 */
@@ -2957,6 +3053,36 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
         const fastSystem = isFastPathSystem(body.system) ? body.system : undefined;
         if (fastSystem !== undefined && deps.mintAuthMaterial !== undefined) {
           const fastStartMs = Date.now();
+          /**
+           * ★ 退避闸门（2026-09-29）—— 在**做任何事之前**先检查。
+           *
+           * 连续 mint 失败到阈值后，这里**立即返回**而不是再等 20 秒超时。
+           * 见 `noteMintFailure()` 的说明：继续请求不会让信誉恢复，只会更糟。
+           *
+           * ⚠ 返回 503（而不是 502）—— 语义不同：
+           *   502 = 「上游/凭据出了问题」
+           *   503 = 「**暂时**不可用，稍后重试」（带 Retry-After）
+           *   调用方（DSH 适配器）据此可以区分「该重试」与「该报错」。
+           */
+          const backoffRemainMs = mintBackoffRemainingMs();
+          if (backoffRemainMs > 0) {
+            log("bridge.fast_path.backoff_skip", {
+              modelId,
+              remainMs: backoffRemainMs,
+              streak: mintFailureStreak,
+            });
+            response.setHeader("Retry-After", String(Math.ceil(backoffRemainMs / 1000)));
+            errorJson(
+              response,
+              503,
+              `ZCode 侧 captcha 处于降级冷却中（连续 ${mintFailureStreak} 次失败），` +
+                `约 ${Math.ceil(backoffRemainMs / 1000)} 秒后可重试。` +
+                `这通常意味着设备信誉不足、上游把无感验证降级为滑块 —— ` +
+                `请在 ZCode 窗口里手动完成一次验证。`,
+              "upstream_degraded",
+            );
+            return;
+          }
           try {
             /**
              * ★★ 材料缓存（2026-09-27 新增）—— 省掉「每次请求都 mint」的开销。
@@ -3042,9 +3168,21 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
             }
             const mintMs = Date.now() - fastStartMs;
             if (material?.apiKey === undefined) {
+              /**
+               * ★ 记一次失败（可能进入退避）—— 见 `noteMintFailure()` 的说明。
+               *
+               * 这是本机制**唯一**的失败上报点（fast path 是主链路；
+               * 诊断端点的失败不计入，因为那是人工探测，不代表真实流量）。
+               */
+              const nextTryAt = noteMintFailure("fast path: material.apiKey undefined");
+              if (nextTryAt > 0) {
+                response.setHeader("Retry-After", String(BACKOFF_BASE_MS / 1000));
+              }
               errorJson(response, 502, "Failed to mint auth material.", "credential_unavailable");
               return;
             }
+            // ★ 成功就清零 —— 信誉恢复了，后续正常放行。
+            noteMintSuccess();
             /**
              * ★★ 头集合规范化（2026-09-28 dump 定位，修复 3012）。
              *
