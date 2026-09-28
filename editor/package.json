@@ -1,0 +1,24 @@
+{
+  "name": "dsh-card-editor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DSH 模型卡片视觉编辑器 —— 可视化搭建 provider 卡片，导出 JSON 供落成 React 组件",
+  "type": "module",
+  "main": "lib/index.js",
+  "scripts": {
+    "start": "node scripts/serve.mjs",
+    "build": "node scripts/bundle.mjs"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "entry": "./lib/client.js"
+    }
+  },
+  "files": [
+    "lib",
+    "build",
+    "scripts",
+    "README.md"
+  ]
+}

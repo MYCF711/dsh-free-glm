@@ -1,0 +1,157 @@
+feat: 视觉编辑器打包 + 官方模板落地 + 脱壳可行性实测
+
+## 一、视觉编辑器已打包为插件格式
+
+`editor/` 目录（`D:\dsh-card-editor` 同步而来）：
+
+```
+editor/
+├── package.json         插件格式（含 dsh.client 声明）
+├── build/builder.html   编辑器本体（单文件，无外部依赖，59 KB）
+├── scripts/serve.mjs    本地服务器（端口自动顺延 + no-store）
+└── README.md            用法与已知限制
+```
+
+启动：`cd editor; node scripts/serve.mjs` → http://127.0.0.1:8899/
+
+### 本轮编辑器改动
+
+**① Tab 切换时内容不跟着换**（用户报）
+
+根因：`tabbar` 只渲染自己（下划线会动），但**没有任何机制去控制
+下面的内容区** —— 两者是完全独立的两块。
+
+新增 `tabpanel` 组件，用 `bind` 属性与 tabbar 关联：
+
+```
+tabbar    bind="t1"        →  tabState["tab:t1"] = 0|1
+tabpanel  bind="t1" idx=0  →  仅当 idx 匹配时显示
+tabpanel  bind="t1" idx=1  →  仅当 idx 匹配时显示
+```
+
+`renderEl` 每次重绘都重跑，状态一变面板自动显隐，无需事件订阅。
+
+**② 容器太小，拖不进去**（用户报）
+
+两处叠加：`.rowbox` 只有 32px 高，且落进容器要求精确命中虚线框。
+改成 **112px + padding 14px + 12px 命中外扩**，并在拖拽中高亮所有容器。
+
+真实浏览器实测：容器覆盖画布 **19% → 77%**（外扩后 93%）。
+
+**③ Tab 自动配套面板**（用户报「tab 肯定需要一个绑定的容器」）
+
+原来拖一个裸 `tabbar` 进来是**不可用**的 —— 要能用必须再拖 N 个 panel
+并逐个设属性，这是把实现细节暴露成操作负担。
+现在拖入 tabbar 时**自动按项数创建面板**，`bind` 指向它，`idx` 依次 0..N-1。
+
+空面板还会标明所属 Tab（「模型 面板 · 把内容拖进来」），
+否则两个空面板长得一样、用户不知道哪个是哪个。
+
+## 二、模型卡片改用 DSH 官方「自定义模型」模板
+
+结构逐字取自 `dsh-client-ui-settings-models/lib/client.js`（186 KB）：
+从 `.zGbnIq_*` 规则里抠出 **70 条 CSS**（存于 `bench/_official-card-css.txt`），
+字段名从中文案表提取。
+
+新卡片结构：
+
+```
+[rowCard]  卡片头     zcode-bridge · 自定义 · ● …… [编辑] [删除]
+           └ 展开区（点「编辑」后）
+             ├ API 密钥 / 显示名称 / API 地址 / API 协议   ← 官方字段
+             ├ ★ 添加账号 / 签到 / 持续领取               ← 我们的三按钮
+             ├ ★ Tab：模型 | 账号管理                     ← 我们的 Tab
+             │   ├ panel[0] 模型      → 模型目录（四列 grid）
+             │   └ panel[1] 账号管理  → 账号行
+             └ 取消 / 保存
+```
+
+**取消「添加模型」按钮**（用户要求）—— 加模型靠再拖一行进来。
+
+编辑器左栏新增 5 个官方模板组件：
+`卡片头` / `字段·输入框` / `字段·下拉` / `模型目录` / `模型行`。
+
+真实浏览器验证（headless Edge + CDP 真实鼠标事件）：
+
+```
+结构断言         11/11  ✓
+  · 卡片头含提供商名 + 「自定义」标签
+  · 4 个字段名全对
+  · 三个操作按钮都在
+  · Tab 配套 2 个面板
+  · 模型目录 2 行
+  · ★ 没有「添加模型」按钮
+Tab 切换          3/3   ✓   e13 → e19，下划线 idx 0 → 1
+```
+
+## 三、官方「思考深度」的机制已逆向清楚
+
+从官方闭源版 `_asar_host/host_index.js`（1.4 MB）挖到：
+
+| 字段 | 出现次数 | 说明 |
+|---|---|---|
+| `budget_tokens` | **0** | Anthropic 标准字段，官方**完全不用** |
+| `reasoning_effort` | **0** | OpenAI 风格，也不用 |
+| `thinking` | 1 | 几乎不用 |
+| **`reasoningLevel`** | **64** | ✅ 官方自己的字段 |
+
+结构是**声明式转换表**：
+
+```js
+{ defaultLevel: string,
+  levels: { "档位名": { anthropic: {set, unset},
+                       "openai-compatible": {set, unset} } } }
+```
+
+每个档位可为不同协议 `set` / `unset` 不同字段。已知合法值 `"max"`
+（桥侧源码 `reasoningLevel: deps.reasoningLevel ?? "max"`）。
+
+⚠ **当前 fast path 完全没转发 `reasoningLevel`** ⇒ 它目前不生效。
+要加就必须先实测，而实测卡在 captcha 上（见下）。
+
+## 四、脱壳可行性：**captcha 不需要 ZCode 壳，但必须是 Electron**
+
+用户提出「captcha 用别的浏览器也行」。实测（同脚本、同页面、同网络）：
+
+| 环境 | UA 关键片段 | 结果 |
+|---|---|---|
+| ZCode 实例 | `ZCodeDev/41.0.3` Electron/41 | ✅ ok=true |
+| **最小 Electron**（零 ZCode 代码） | `minielectron/1.0.0` Electron/41 | ✅ **ok=true** |
+| headless Edge 154 | **`HeadlessChrome`** Edg/154 | ❌ F001 |
+
+⇒ 判据是 **Electron 内核**，不是 ZCode 这个具体应用。
+
+收尾验证：独立产出的 param + 官方身份块 + JWT，**绕开桥**直打上游：
+
+```
+POST https://zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages
+→ HTTP 200  3180ms  model=glm-5.3-flash
+```
+
+⇒ 脱壳路径打通（价值在减少依赖，不是解决故障）。
+未做：常驻化、预热池、并发与失败重试。详见 `bench/SHELL-DEPENDENCY-AUDIT.md`。
+
+## 五、⚠ 环境故障（影响实测，不影响代码）
+
+本机 captcha 已**降级为人工滑块**（`aliyunCaptcha-puzzle: visible`），
+所有 mint 请求 20 秒超时 ⇒ 桥返回空回复。
+
+这是我此前密集压测（单日 1175 次 captcha 请求）造成的设备信誉下降，
+**需要人工在 ZCode 窗口里拖一次滑块才能恢复**。
+详见 `bench/INCIDENT-2026-09-29-captcha.md`。
+
+**因此本文档中「benchmark 3/3 通过」等结论来自故障前**，
+故障期间的实测只覆盖「协议形状正确」这一层（已单独说明）。
+
+## 六、测试总览
+
+| 套件 | 结果 |
+|---|---|
+| `_b_test.mjs` | 62 / 62 |
+| `_tab_test.mjs` | 12 / 12 |
+| `_usability_test.mjs` | 19 / 19 |
+| `bench/verify-real-geometry.mjs` | 9 / 9（真实浏览器几何） |
+| `bench/verify-real-drag.mjs` | 8 / 8（真实浏览器拖放） |
+| `bench/verify-official-template.mjs` | 14 / 14（真实浏览器） |
+
+合计 **124 项**，其中 **31 项在真实浏览器里执行**（headless Edge + CDP）。
