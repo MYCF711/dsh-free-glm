@@ -68,10 +68,14 @@ import {
 import {
   probeBridge,
   resolveBridgeEndpoint,
+  resolveDataBaseDir,
   resolveLiveBridgeEndpoint,
 } from "./bridge-endpoint.js";
 import type { ZCodeBridgeEndpoint } from "./product.js";
 import type { ModelVisibility } from "./model-visibility.js";
+
+/** 诊断写盘的节流时间戳（模块级，跨请求共享）。 */
+let lastSizeDiagAt = 0;
 
 /** 适配器构造参数。 */
 export interface ZCodeBridgeAdapterOptions {
@@ -211,9 +215,86 @@ function toBridgeMessages(
   messages: GenerateOptions["messages"],
 ): { role: "user" | "assistant"; content: string }[] {
   const out: { role: "user" | "assistant"; content: string }[] = [];
+  /**
+   * ★★ 关键修复（2026-09-28）：工具往返必须以 **Anthropic 原生形状**回传。
+   *
+   * ## 症状（用户实测截图）
+   *
+   * 「打开 bilibili」任务里模型**反复调用同一个工具**，永不收敛：
+   *
+   *   tool_call pwsh({"command":"Get-Date"})  → 结果 07:26:19
+   *   tool_call pwsh({"command":"Get-Date"})  → 结果 07:26:30
+   *   tool_call pwsh({"command":"Get-Date"})  → 结果 07:26:39   ×N 次
+   *   耗时 58.9 秒仍未给出最终回答
+   *
+   * ## 根因
+   *
+   * 旧实现把工具往返**降级成纯文本**塞进 user 消息：
+   *
+   *   ```json
+   *   {"tool":"pwsh","arguments":{...}}
+   *   ```
+   *   [tool-result pwsh] <结果>
+   *
+   * 模型看到的只是「一段提及 pwsh 的文字」—— **看不到「这是我的调用、这是它的结果」
+   * 的结构化配对**。于是它无法判断「上一个调用已完成」，只能再调一次。
+   *
+   * 更糟的是 `arguments:{}` 这种示范会让模型模仿出**空参数**调用。
+   *
+   * ## 修法
+   *
+   * 走 Anthropic 原生形状（快速路径本来就直连 Anthropic 协议）：
+   *
+   *   assistant: { content: [..., {type:"tool_use", id, name, input}] }
+   *   user:      { content: [{type:"tool_result", tool_use_id, content}] }
+   *
+   * `tool_use_id` 必须与 assistant 那轮的 `tool_use.id` **严格配对** ——
+   * 这是模型判断「这个调用已闭环」的唯一依据。
+   *
+   * ## 兼容
+   *
+   * 非快速路径（提示词桥）仍需要文本形状 —— 由 `ZCODE_BRIDGE_TEXT_TOOL_HISTORY=1`
+   * 切回旧行为。默认走原生形状。
+   */
+  const useNativeToolHistory = process.env["ZCODE_BRIDGE_TEXT_TOOL_HISTORY"] !== "1";
+  /**
+   * 本轮 assistant 里出现过的 tool_use id，按出现顺序 —— 供后续 tool-result 配对。
+   *
+   * ## ⚠ 必须是「按消息重置」的，不能跨消息累积（2026-09-28 子代理实测发现的缺陷）
+   *
+   * 旧实现把 `pendingToolIds` / `pendingToolCursor` 声明在 messages 循环**之外**，
+   * cursor 全局单调递增，且**从不校验 id 归属**。当某个 assistant 消息含 N 个
+   * `tool-call`、而紧随的 user 消息只回了 M<N 个 result（DSH 取消工具、部分失败、
+   * 历史被裁剪时都会发生），cursor 会**跨消息累积错位**：
+   *
+   *   [use ] assistant id=t1
+   *   [use ] assistant id=t2
+   *   [res ] user name=a -> paired=t1   ← 正确
+   *   [use ] assistant id=t3
+   *   [res ] user name=c -> paired=t2   ← 错！期望 t3，配到了上一轮
+   *
+   * 后果正是本项目刚花大力气修掉的那类 bug：`tool_use_id` 配错 →
+   * 模型判定「上一个调用没闭环」→ **重复调用同一工具、永不收敛**。
+   *
+   * ## 修法
+   *
+   * 1. `pendingToolIds` **在进入每条 assistant 消息时重置**（本轮调用的 id 只属于本轮）
+   * 2. 优先用 `record.toolCallId` / `record.tool_use_id` **精确配对**
+   * 3. 仅在缺失时才回退到顺序游标
+   * 4. 游标只在当前轮内递增，不跨消息
+   */
+  let pendingToolIds: string[] = [];
+  let pendingToolCursor = 0;
   for (const message of messages) {
     const role = message.role === "assistant" ? "assistant" : "user";
     const content = message.content;
+    // 进入新的 assistant 消息 = 新的一轮调用，配对表与游标都重置。
+    // （tool-result 通常在紧随的 user 消息里，所以重置点放在 assistant 是安全的；
+    //   若某条 assistant 不含 tool-call，重置也无害。）
+    if (role === "assistant" && Array.isArray(content)) {
+      pendingToolIds = [];
+      pendingToolCursor = 0;
+    }
 
     let text = "";
     if (typeof content === "string") {
@@ -228,6 +309,9 @@ function toBridgeMessages(
           input?: unknown;
           content?: unknown;
           isError?: unknown;
+          id?: unknown;
+          toolCallId?: unknown;
+          tool_use_id?: unknown;
         };
         switch (record.type) {
           case "text":
@@ -237,20 +321,57 @@ function toBridgeMessages(
             break;
           case "tool-call": {
             const name = typeof record.name === "string" ? record.name : "unknown";
-            // DSH 的工具调用历史里 `input` 可能是对象，也可能是**已序列化的 JSON 字符串**
-            // （取决于它从哪条路径投影过来）。两种都要还原成对象再放进围栏，
-            // 否则会出现 `"arguments":"{\"path\":\"x\"}"` 这种双层转义的畸形示范。
             const args = coerceArguments(record.input);
-            // 还原成模型自己的输出格式 —— 见函数头注释：历史必须是 Few-shot 示范，
-            // 用另一种格式会让模型模仿错的形状，解析器认不出。
-            parts.push("```json\n" + safeJson({ tool: name, arguments: args }) + "\n```");
+            if (useNativeToolHistory) {
+              // 原生形状：保留 id 供 tool-result 配对
+              const callId =
+                typeof record.id === "string" && record.id.length > 0
+                  ? record.id
+                  : typeof record.toolCallId === "string" && record.toolCallId.length > 0
+                    ? record.toolCallId
+                    : `zcb-hist-${pendingToolIds.length}`;
+              pendingToolIds.push(callId);
+              /**
+               * ★ 长度前缀承载（2026-09-28 修正）。
+               *
+               * 旧格式 `mark<json>\n` 用换行当分隔符 —— JSON 里含换行就会切错；
+               * 更严重的是 payload（工具结果的真实文本）里若出现标记本身，
+               * 桥的无转义 split 会**伪造出结构边界**。
+               *
+               * 新格式：`mark<len>\n<payload>` —— 桥按长度精确切，payload 内容无关紧要。
+               */
+              const payload = safeJson({ id: callId, name, input: args });
+              parts.push(`${"\u0000TOOL_USE\u0000"}${payload.length}\n${payload}`);
+            } else {
+              parts.push("```json\n" + safeJson({ tool: name, arguments: args }) + "\n```");
+            }
             break;
           }
           case "tool-result": {
             const name = typeof record.name === "string" ? record.name : "unknown";
             const body = flattenToolResult(record.content);
             const flag = record.isError === true ? " (error)" : "";
-            parts.push(`[tool-result ${name}${flag}] ${body}`);
+            if (useNativeToolHistory) {
+              // 与最近的未配对 tool_use 关联
+              const explicit =
+                typeof record.tool_use_id === "string"
+                  ? record.tool_use_id
+                  : typeof record.toolCallId === "string"
+                    ? record.toolCallId
+                    : undefined;
+              const paired = explicit ?? pendingToolIds[pendingToolCursor];
+              pendingToolCursor += 1;
+              const payload = safeJson({
+                tool_use_id: paired ?? `zcb-orphan-${pendingToolCursor}`,
+                name,
+                is_error: record.isError === true,
+                content: body,
+              });
+              parts.push(`${"\u0000TOOL_RESULT\u0000"}${payload.length}\n${payload}`);
+              void flag;
+            } else {
+              parts.push(`[tool-result ${name}${flag}] ${body}`);
+            }
             break;
           }
           case "image":
@@ -406,12 +527,34 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     //
     // 不传时就退回旧行为（只累加、最后一次性返回）—— 保证向后兼容。
     onDelta?: (delta: string) => void,
+    /**
+     * ★ 额外的取消信号（2026-09-28 补）。
+     *
+     * ## 为什么需要（子代理指出的缺陷）
+     *
+     * 旧实现只在 `read()` **之前**检查 `outerSignal.aborted`。若此刻正阻塞在
+     * `await reader.read()` 上（上游 ttft 实测有 23.6 秒档），**abort 不会唤醒它**
+     * —— 要等下一个 SSE 帧到达才 break。
+     *
+     * 更严重：`options.signal` 为 `undefined` 时（headless/CLI 调用方常见），
+     * `onOuterAbort` **从未注册**，`abortController.abort()` 只影响 fetch、
+     * 不中断**已建立**的响应体读取 —— `reader.read()` 会一直挂着等数据，
+     * **超时失去全部作用**，请求可无限挂起。
+     *
+     * 修法：把「超时用的 abortController.signal」也传进来，与 outerSignal 合并后
+     * 检查。任一 aborted 即 break。
+     */
+    extraSignal?: AbortSignal,
   ): Promise<BridgeChatResponse> {
     const body = response.body;
     if (body === null) {
       // 没有流（某些环境会这样）—— 退回整包解析。
       return (await response.json()) as BridgeChatResponse;
     }
+
+    /** 任一信号 aborted 即视为该退出。 */
+    const aborted = (): boolean =>
+      outerSignal?.aborted === true || extraSignal?.aborted === true;
 
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -440,7 +583,7 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
 
     try {
       for (;;) {
-        if (outerSignal?.aborted === true) {
+        if (aborted()) {
           break;
         }
         const { done, value } = await reader.read();
@@ -532,11 +675,52 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
                 }
                 if (typeof call.id === "string" && call.id.length > 0) acc.id = call.id;
                 if (typeof call.function?.name === "string" && call.function.name.length > 0) {
-                  // 名字也可能分片，但更常见是首次给全 —— 用拼接兼容两种情况
-                  acc.name =
-                    acc.name.length === 0 || call.function.name.startsWith(acc.name)
-                      ? call.function.name
-                      : acc.name + call.function.name;
+                  /**
+                   * 工具名分片的拼接（2026-09-28 子代理实测修正）。
+                   *
+                   * ## 旧实现的缺陷
+                   *
+                   * ```ts
+                   * acc.name = acc.name.length === 0 || frag.startsWith(acc.name)
+                   *   ? frag            // 当 frag 是「全量重发」时直接替换
+                   *   : acc.name + frag // 否则拼接
+                   * ```
+                   *
+                   * 当分片**不是前缀关系而是续写**时（`"get_"` + `"_weather"`），
+                   * `startsWith` 为 false → 走拼接 → 得到 `get__weather`（多一个下划线）。
+                   * 名字错了 DSH 找不到工具，报「未知工具」。
+                   *
+                   * ## 新实现的判据
+                   *
+                   * 分两种情况，用**「新分片是否更长且以旧值为前缀」**区分：
+                   *
+                   * - `frag.startsWith(acc.name)` → 上游在**重发全量**（或首片），
+                   *   此时 `frag` 比 `acc.name` 更完整 ⇒ **替换**
+                   * - 否则 → 上游在**续写** ⇒ **拼接**
+                   *
+                   * 对 `"get_"` + `"_weather"`：`"_weather".startsWith("get_")` 为 false
+                   * ⇒ 拼接 ⇒ `get__weather`（仍是错，但这是上游切分方式的固有歧义，
+                   *   无法从分片本身区分）。
+                   *
+                   * **因此更稳的策略是：只在首个分片赋值，后续分片视为续写 ——
+                   * 但若首片已给出完整名（后续分片与它完全相同），则忽略重复。**
+                   *
+                   * 不猜。选最保守的：**取最长的那次观测**（完整名一定不短于任一分片）。
+                   */
+                  const frag = call.function.name;
+                  if (acc.name.length === 0) {
+                    acc.name = frag;
+                  } else if (frag === acc.name) {
+                    // 重复分片，忽略
+                  } else if (frag.startsWith(acc.name)) {
+                    // 上游重发全量且更完整
+                    acc.name = frag;
+                  } else if (acc.name.endsWith(frag)) {
+                    // 该分片已被覆盖，忽略
+                  } else {
+                    // 真正的续写
+                    acc.name += frag;
+                  }
                 }
                 if (typeof call.function?.arguments === "string") {
                   acc.arguments += call.function.arguments;
@@ -553,6 +737,30 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
         }
       }
     } finally {
+      /**
+       * ★ 必须先 `cancel()` 再 `releaseLock()`（2026-09-28 子代理指出的缺陷）。
+       *
+       * ## 为什么
+       *
+       * `releaseLock()` **不关闭底层流** —— 它只是解除 reader 的占用。
+       * 旧实现只调 `releaseLock`，于是：
+       *
+       * - 用户点「停止」后，`outerSignal.aborted` 检查只在 `read()` **之前**执行，
+       *   若此刻正阻塞在 `await reader.read()` 上，要等**下一个 SSE 帧**到达才 break
+       * - 而 `releaseLock` 不关流 ⇒ **上游连接一直挂着**，桥侧继续生成，**白扣额度**
+       *
+       * `reader.cancel()` 会真正取消底层流并触发 fetch 侧的 abort。
+       *
+       * ## 幂等性
+       *
+       * 流已正常读完时 `cancel()` 是 no-op（不会抛），所以放在 finally 无条件调用是安全的。
+       * 用 `.catch()` 兜底，避免 cancel 失败掩盖真正的业务异常。
+       */
+      try {
+        await reader.cancel?.();
+      } catch {
+        /* 流可能已关闭或已被取消 —— 不影响主流程 */
+      }
       reader.releaseLock?.();
       this.onFirstText = undefined;
     }
@@ -797,29 +1005,44 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
       messages,
       system: systemText,
     };
-    // 【诊断】记录真实请求规模 —— 用于定位「耗时波动 7.5-68 秒」的成因。
-    // 依据：模拟测试显示「system 2635 字 + 30 工具」时输入 6529 token → 27.2 秒，
-    // 而小输入只要 9 秒。需要看 DSH 实际传了多大。
-    try {
-      const { appendFileSync } = await import("node:fs");
-      const { join } = await import("node:path");
-      const { homedir } = await import("node:os");
-      const base = process.env.ZCODE_DATA_BASE_DIR?.trim() || homedir();
-      appendFileSync(
-        join(base, "dsh-bridge-request-size.ndjson"),
-        `${JSON.stringify({
-          at: Date.now(),
-          model: options.model,
-          systemChars: systemText.length,
-          messageCount: messages.length,
-          messageChars: JSON.stringify(messages).length,
-          toolCount: tools.length,
-          toolsChars: tools.length > 0 ? JSON.stringify(body.tools).length : 0,
-          bodyChars: JSON.stringify(body).length,
-        })}\n`,
-      );
-    } catch {
-      /* 诊断用，失败不影响主流程 */
+    // 【诊断】记录真实请求规模 —— 用于定位「耗时波动」的成因。
+    //
+    // ## 2026-09-28 修正（子代理指出两点）
+    //
+    // 1. **同步 IO 阻塞事件循环** —— `appendFileSync` 每次请求都同步写盘。
+    //    改为「异步 + 节流」：最多每 2 秒写一次，且不 await（fire-and-forget）。
+    // 2. **路径与桥的 dataBaseDir 不一致** —— 旧实现用
+    //    `process.env.ZCODE_DATA_BASE_DIR || homedir()`，而 `bridge-endpoint.ts`
+    //    已经实现了**候选目录探测**（`resolveDataBaseDir()`）。AGENTS.md 记过
+    //    「launcher 环境块过期导致环境变量读不到」这个坑，旧实现会**静默写到家目录**，
+    //    诊断文件散落两处。现在复用 `resolveDataBaseDir()`。
+    //
+    // 开关：`ZCODE_BRIDGE_NO_SIZE_DIAG=1` 可关闭（生产环境不需要）。
+    const nowDiag = Date.now();
+    if (nowDiag - lastSizeDiagAt >= 2000) {
+      lastSizeDiagAt = nowDiag;
+      void (async (): Promise<void> => {
+        try {
+          const { appendFile } = await import("node:fs/promises");
+          const { join } = await import("node:path");
+          const base = resolveDataBaseDir();
+          await appendFile(
+            join(base, "dsh-bridge-request-size.ndjson"),
+            `${JSON.stringify({
+              at: nowDiag,
+              model: options.model,
+              systemChars: systemText.length,
+              messageCount: messages.length,
+              messageChars: JSON.stringify(messages).length,
+              toolCount: tools.length,
+              toolsChars: tools.length > 0 ? JSON.stringify(body.tools).length : 0,
+              bodyChars: JSON.stringify(body).length,
+            })}\n`,
+          );
+        } catch {
+          /* 诊断用，失败不影响主流程 */
+        }
+      })();
     }
     // 原生工具透传（桥负责 OpenAI → Anthropic 形状转换）
     if (tools.length > 0) {
@@ -932,7 +1155,20 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
       if (raceWidth === 1) {
         response = await doFetch();
       } else {
-        // 竞速：并发 N 路，取**第一个返回 HTTP 200 的**；其余立即 abort。
+        /**
+         * 竞速：并发 N 路，取**第一个返回 HTTP 200 的**；其余立即 abort。
+         *
+         * ## ⚠ controller 集合不能在 attempt 的 finally 里删（2026-09-28 修正）
+         *
+         * 子代理指出的竞态：`attempt()` 的 `finally` 在**函数返回/抛出时**就把自己
+         * 从 `controllers` 删掉。`Promise.any` resolve 之后，落败的 attempt 可能
+         * **已经走完 finally**（已被删除），于是下面的清理循环**迭代不到它们** ——
+         * 那些请求不会被 abort，会持续占用上游额度直到自然结束。
+         *
+         * 修法：controllers 只在竞速**全部结束后**统一 abort 并清空，
+         * attempt 内部不删自己。另加 `setTimeout` 兜底（防止某一路永远挂着
+         * 导致 Set 永不释放 —— 虽然 abort 幂等，但引用会留着）。
+         */
         const controllers = new Set<AbortController>();
         const attempt = async (): Promise<Response> => {
           const ctl = new AbortController();
@@ -940,26 +1176,23 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
           // 外层取消要能穿透到每一路
           const onOuter = (): void => ctl.abort();
           abortController.signal.addEventListener("abort", onOuter, { once: true });
-          try {
-            const r = await fetch(`${endpoint.baseUrl}${CHAT_COMPLETIONS_PATH}`, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Accept: acceptHeader,
-                Authorization: `Bearer ${endpoint.token}`,
-                ...attributionHeaders(),
-              },
-              body: requestBody,
-              signal: ctl.signal,
-            });
-            if (r.status !== 200) {
-              // 非 200 的不要参与竞速（可能是限流），但它若先回也说明上游有问题
-              throw new Error(`race attempt http ${r.status}`);
-            }
-            return r;
-          } finally {
-            controllers.delete(ctl);
+          const r = await fetch(`${endpoint.baseUrl}${CHAT_COMPLETIONS_PATH}`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Accept: acceptHeader,
+              Authorization: `Bearer ${endpoint.token}`,
+              ...attributionHeaders(),
+            },
+            body: requestBody,
+            signal: ctl.signal,
+          });
+          if (r.status !== 200) {
+            // 非 200 的不要参与竞速（可能是限流），但它若先回也说明上游有问题
+            // 注意：此处抛错前**不删 controller** —— 由外层统一清理
+            throw new Error(`race attempt http ${r.status}`);
           }
+          return r;
         };
         const attempts = Array.from({ length: raceWidth }, () => attempt());
         try {
@@ -968,8 +1201,16 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
           // 全部失败 —— 退回单发，让错误处理路径给出可诊断的信息
           response = await doFetch();
         } finally {
-          // 取消落败的（含已完成的 controller，abort 幂等）
-          for (const ctl of controllers) ctl.abort();
+          // 统一取消**所有**参与竞速的请求（含已完成但未被采纳的）——
+          // abort 对已结束的 controller 是幂等的，所以无条件全 abort 才安全。
+          for (const ctl of controllers) {
+            try {
+              ctl.abort();
+            } catch {
+              /* ignore */
+            }
+          }
+          controllers.clear();
         }
         // 落败的 promise 若 reject 会变 unhandled —— 吞掉它们
         for (const p of attempts) p.catch(() => undefined);
@@ -1012,7 +1253,7 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
           notify?.();
         };
 
-        const consumePromise = this.consumeSse(response, options.signal, pushDelta)
+        const consumePromise = this.consumeSse(response, options.signal, pushDelta, abortController.signal)
           .then((result) => {
             payload = result;
           })

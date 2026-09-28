@@ -509,21 +509,59 @@ function errorJson(
   json(response, statusCode, { error: { message, type, code: statusCode } });
 }
 
-async function readBody(request: IncomingMessage, limitBytes = 4 * 1024 * 1024): Promise<string> {
+/**
+ * 读取请求体。
+ *
+ * ## 2026-09-28 修正（子代理指出两点）
+ *
+ * 1. **超限分支没有真正止住累积** —— 旧代码 `reject` + `destroy` 后**没有 `settled` 标记**，
+ *    后续 `data` 事件仍会跑进 `size += ...` 与 `chunks.push(chunk)`（destroy 不是同步生效的），
+ *    既浪费内存也让错误路径不确定。
+ * 2. **错误信息不含实际大小、上限不可配** —— 长上下文 + 大量工具时 body 可达数十 KB，
+ *    触顶后只报笼统的 `Request body too large`，无法判断是「略超」还是「完全跑偏」。
+ *    上限改由 `ZCODE_BRIDGE_MAX_BODY_BYTES` 覆盖（默认 16 MiB，比旧值宽 4 倍）。
+ */
+async function readBody(request: IncomingMessage, limitBytes?: number): Promise<string> {
+  const limit = ((): number => {
+    if (typeof limitBytes === "number" && Number.isFinite(limitBytes) && limitBytes > 0) {
+      return limitBytes;
+    }
+    const raw = process.env["ZCODE_BRIDGE_MAX_BODY_BYTES"]?.trim();
+    const n = raw === undefined || raw.length === 0 ? Number.NaN : Number(raw);
+    return Number.isSafeInteger(n) && n > 0 ? n : 16 * 1024 * 1024;
+  })();
   return await new Promise<string>((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
+    let settled = false;
     request.on("data", (chunk: Buffer) => {
+      if (settled) return;
       size += chunk.length;
-      if (size > limitBytes) {
-        reject(new Error(`Request body too large (>${limitBytes} bytes)`));
+      if (size > limit) {
+        // 先置 settled —— 后续 data 事件直接短路，不再累积
+        settled = true;
+        chunks.length = 0;
+        reject(
+          new Error(
+            `Request body too large: received >=${size} bytes, limit ${limit} bytes` +
+              ` (override with ZCODE_BRIDGE_MAX_BODY_BYTES)`,
+          ),
+        );
         request.destroy();
         return;
       }
       chunks.push(chunk);
     });
-    request.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
-    request.on("error", reject);
+    request.on("end", () => {
+      if (settled) return;
+      settled = true;
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    });
+    request.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
   });
 }
 
@@ -1593,9 +1631,154 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
               "x-zcode-session-type": "main",
               "x-zcode-agent": "glm",
             };
+            /**
+             * ★★ 把插件传来的「工具往返标记」还原成 Anthropic 原生 block
+             * （2026-09-28 修复：模型重复调用同一工具、永不收敛）。
+             *
+             * ## 症状（用户实测）
+             *
+             *   tool_call pwsh({"command":"Get-Date"}) → 结果 07:26:19
+             *   tool_call pwsh({"command":"Get-Date"}) → 结果 07:26:30   ×N 次
+             *   58.9 秒后仍未给出最终回答
+             *
+             * ## 根因
+             *
+             * 旧路径把工具往返**降级成纯文本**（```json {"tool":...}``` + `[tool-result ...]`）。
+             * 模型看不到「这是我的调用、这是它的结果」的**结构化配对**，
+             * 于是无法判断「上次调用已完成」→ 只能再调一次。
+             *
+             * ## 修法
+             *
+             * 插件用 NUL 前缀标记承载结构化数据（避免与正文冲突），桥在这里
+             * 拆成 Anthropic 形状：
+             *
+             * ## 承载格式：**长度前缀**（2026-09-28 修正）
+             *
+             * 旧实现用 `raw.split(TOOL_USE_MARK)` 做**无转义的字面切分**。而标记后面
+             * 承载的是**工具结果的真实文本** —— 只要某条工具输出里出现
+             * `\u0000TOOL_RESULT\u0000`（NUL 是合法 UTF-8，来自读二进制文件、cat 内容、
+             * 或上一轮桥自己回显的文本），就会被当成结构边界，**伪造出一个 tool_result block**，
+             * 把任意 `tool_use_id` 配到模型面前。
+             *
+             * 修法：标记后跟**十进制长度 + 换行**，再跟 payload 本体：
+             *
+             *     \u0000TOOL_RESULT\u0000<len>\n<payload>
+             *
+             * 解析时按长度精确切 payload —— **payload 里出现任何标记都无害**。
+             * 长度前缀也天然防住了「JSON 里含换行」等歧义。
+             *
+             * 兼容：若标记后不是「数字+\n」（旧格式），回退到按换行切 JSON 的老逻辑。
+             */
+            const TOOL_USE_MARK = "\u0000TOOL_USE\u0000";
+            const TOOL_RESULT_MARK = "\u0000TOOL_RESULT\u0000";
+            /** 解析 `mark + <len>\n<payload>`；不是长度前缀格式时返回 undefined。 */
+            const readLenPrefixed = (
+              after: string,
+            ): { payload: string; rest: string } | undefined => {
+              const nl = after.indexOf("\n");
+              if (nl <= 0) return undefined;
+              const head = after.slice(0, nl);
+              if (!/^\d+$/.test(head)) return undefined;
+              const len = Number(head);
+              if (!Number.isSafeInteger(len) || len < 0) return undefined;
+              const body = after.slice(nl + 1);
+              if (body.length < len) return undefined;
+              return { payload: body.slice(0, len), rest: body.slice(len) };
+            };
             const fastMessages = messages
               .filter((m) => m.role !== "system")
-              .map((m) => ({ role: m.role, content: m.content }));
+              .map((m) => {
+                const raw = m.content;
+                if (
+                  typeof raw !== "string" ||
+                  (!raw.includes(TOOL_USE_MARK) && !raw.includes(TOOL_RESULT_MARK))
+                ) {
+                  return { role: m.role, content: raw };
+                }
+                const blocks: Array<Record<string, unknown>> = [];
+                const pushText = (t: string): void => {
+                  const v = t.trim();
+                  if (v.length > 0) blocks.push({ type: "text", text: v });
+                };
+                /**
+                 * 从一段文本里**按顺序**抽出「文本 / tool_use / tool_result」。
+                 *
+                 * 两种标记格式都支持：
+                 * - 新：`mark<len>\n<payload>`（payload 可含任意内容）
+                 * - 旧：`mark<json>\n<剩余>`（按换行切）
+                 */
+                let cursor = 0;
+                const text0 = raw;
+                const scan = (): void => {
+                  while (cursor < text0.length) {
+                    const iUse = text0.indexOf(TOOL_USE_MARK, cursor);
+                    const iRes = text0.indexOf(TOOL_RESULT_MARK, cursor);
+                    let i = -1;
+                    let kind: "use" | "result" | undefined;
+                    if (iUse >= 0 && (iRes < 0 || iUse < iRes)) {
+                      i = iUse;
+                      kind = "use";
+                    } else if (iRes >= 0) {
+                      i = iRes;
+                      kind = "result";
+                    }
+                    if (i === -1 || kind === undefined) {
+                      pushText(text0.slice(cursor));
+                      cursor = text0.length;
+                      return;
+                    }
+                    pushText(text0.slice(cursor, i));
+                    const markLen =
+                      kind === "use" ? TOOL_USE_MARK.length : TOOL_RESULT_MARK.length;
+                    const after = text0.slice(i + markLen);
+                    const lens = readLenPrefixed(after);
+                    let payload: string;
+                    if (lens !== undefined) {
+                      payload = lens.payload;
+                      cursor = i + markLen + (after.length - lens.rest.length);
+                    } else {
+                      // 旧格式回退：JSON 在首个换行之前
+                      const nl = after.indexOf("\n");
+                      payload = nl >= 0 ? after.slice(0, nl) : after;
+                      cursor = i + markLen + payload.length + (nl >= 0 ? 1 : 0);
+                    }
+                    try {
+                      if (kind === "use") {
+                        const o = JSON.parse(payload) as {
+                          id?: string;
+                          name?: string;
+                          input?: unknown;
+                        };
+                        blocks.push({
+                          type: "tool_use",
+                          id: o.id ?? `zcb-bridge-${blocks.length}`,
+                          name: o.name ?? "unknown",
+                          input: o.input ?? {},
+                        });
+                      } else {
+                        const o = JSON.parse(payload) as {
+                          tool_use_id?: string;
+                          content?: unknown;
+                          is_error?: boolean;
+                        };
+                        blocks.push({
+                          type: "tool_result",
+                          tool_use_id: o.tool_use_id ?? `zcb-orphan-${blocks.length}`,
+                          content:
+                            typeof o.content === "string"
+                              ? o.content
+                              : JSON.stringify(o.content ?? ""),
+                          ...(o.is_error === true ? { is_error: true } : {}),
+                        });
+                      }
+                    } catch {
+                      pushText(payload);
+                    }
+                  }
+                };
+                scan();
+                return { role: m.role, content: blocks };
+              });
             /**
              * ★ 必须把 OpenAI 形状的 `tools` 转成 Anthropic 的 `tools`。
              *
@@ -1637,13 +1820,74 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
                 };
               })
               .filter((t): t is { name: string; description?: string; input_schema: Record<string, unknown> } => t !== undefined);
-            // 有工具时必须显式声明 tool_choice，否则上游可能不启用工具面
-            const fastToolChoice =
-              fastTools.length === 0
-                ? undefined
-                : body.tool_choice === "none"
-                  ? undefined
-                  : { type: "auto" as const };
+            /**
+             * `tool_choice` 全量映射（2026-09-28 修正）。
+             *
+             * ## 旧实现的缺陷（子代理指出）
+             *
+             * 只判断 `=== "none"`，其余取值**一律降级成 `{type:"auto"}`**：
+             *
+             * - `"required"` → 本应 `{type:"any"}`（强制调某个工具）→ 静默失效，
+             *   模型可能不调工具直接闲聊
+             * - `{type:"function",function:{name}}` → 本应 `{type:"tool",name}` →
+             *   指定工具被忽略
+             *
+             * ## OpenAI ↔ Anthropic 的对应
+             *
+             *   "none"                              → 不传（且不启用工具面）
+             *   "auto"                              → { type: "auto" }
+             *   "required"                          → { type: "any" }
+             *   {type:"function",function:{name}}   → { type: "tool", name }
+             */
+            const fastToolChoice = ((): Record<string, unknown> | undefined => {
+              if (fastTools.length === 0) return undefined;
+              const tc = body.tool_choice;
+              if (tc === "none") return undefined;
+              if (tc === "required") return { type: "any" };
+              if (tc === "auto" || tc === undefined || tc === null) return { type: "auto" };
+              if (tc !== null && typeof tc === "object") {
+                const rec = tc as {
+                  type?: unknown;
+                  function?: { name?: unknown };
+                  name?: unknown;
+                };
+                // OpenAI 形状：{type:"function",function:{name}}
+                const fnName =
+                  typeof rec.function?.name === "string"
+                    ? rec.function.name
+                    : typeof rec.name === "string"
+                      ? rec.name
+                      : undefined;
+                if (fnName !== undefined && fnName.length > 0) {
+                  return { type: "tool", name: fnName };
+                }
+                // Anthropic 原生形状透传
+                if (typeof rec.type === "string") {
+                  return rec as Record<string, unknown>;
+                }
+              }
+              if (typeof tc === "string" && tc.length > 0) {
+                // 未知字符串取值 —— 保守用 auto，但记一条日志便于排查
+                log("bridge.fast_path.unknown_tool_choice", { toolChoice: tc });
+                return { type: "auto" };
+              }
+              return { type: "auto" };
+            })();
+            /**
+             * `stop_sequences` 透传（2026-09-28 补）。
+             *
+             * OpenAI 的 `stop`（string 或 string[]）对应 Anthropic 的 `stop_sequences`（string[]）。
+             * 旧实现完全丢弃 —— 调用方设的停止串不起作用，模型可能输出不该出现的标记。
+             */
+            const fastStopSequences = ((): string[] | undefined => {
+              const raw = body.stop ?? body["stop_sequences"];
+              if (typeof raw === "string" && raw.length > 0) return [raw];
+              if (Array.isArray(raw)) {
+                const arr = raw.filter((s): s is string => typeof s === "string" && s.length > 0);
+                return arr.length > 0 ? arr : undefined;
+              }
+              return undefined;
+            })();
             const upstream = await fetch(`${ZCODE_PLAN_ANTHROPIC_BASE}/v1/messages`, {
               method: "POST",
               headers: fastHeaders,
@@ -1654,6 +1898,9 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
                 ...(body.stream === true ? { stream: true } : {}),
                 ...(fastTools.length === 0 ? {} : { tools: fastTools }),
                 ...(fastToolChoice === undefined ? {} : { tool_choice: fastToolChoice }),
+                ...(fastStopSequences === undefined
+                  ? {}
+                  : { stop_sequences: fastStopSequences }),
                 messages: fastMessages,
               }),
             });
@@ -1840,7 +2087,24 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
               } catch (error) {
                 streamErr = error instanceof Error ? error.message : String(error);
               }
-              send({}, finishReason ?? (sawToolCall ? "tool_calls" : "stop"));
+              /**
+               * 收尾 finish_reason 的兜底（2026-09-28 修正）。
+               *
+               * ## 旧实现的漏洞（子代理指出）
+               *
+               * 兜底只看 `sawToolCall`，而它**只在 `content_block_start` with
+               * `type==="tool_use"` 时置位**。若上游（某些 Anthropic 兼容实现）
+               * 把 tool_use 直接放在非流式 message 里、流式分片里没有
+               * `content_block_start`，就会误报 `"stop"` → **DSH 不执行工具**。
+               *
+               * ## 判据加强
+               *
+               * 除 `sawToolCall` 外，再看两个信号：
+               *   - `blockToToolIndex.size > 0` —— 有过任何 tool block 映射
+               *   - `finishReason` 若是 `"tool_use"`（message_delta 给过）也算
+               */
+              const hadToolBlock = sawToolCall || blockToToolIndex.size > 0;
+              send({}, finishReason ?? (hadToolBlock ? "tool_calls" : "stop"));
               response.write("data: [DONE]\n\n");
               response.end();
               const totalMs = Date.now() - fastStartMs;
@@ -1942,8 +2206,22 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
                     ...(reasoningOut.length > 0 ? { reasoning_content: reasoningOut } : {}),
                     ...(toolCallsOut.length === 0 ? {} : { tool_calls: toolCallsOut }),
                   },
+                  /**
+                   * Anthropic `stop_reason` → OpenAI `finish_reason` 全量映射
+                   * （2026-09-28 补齐）。
+                   *
+                   *   end_turn       → stop
+                   *   stop_sequence  → stop      （命中停止串，语义上属正常结束）
+                   *   max_tokens     → length
+                   *   tool_use       → tool_calls
+                   *   其他/缺失      → stop
+                   *
+                   * 旧实现只判 `max_tokens`，`tool_use` 靠 `toolCallsOut` 兜底 ——
+                   * 若上游给了 `stop_reason:"tool_use"` 但 content 里没有可解析的
+                   * tool_use block，会被误报 `stop`，DSH 不执行工具。
+                   */
                   finish_reason:
-                    toolCallsOut.length > 0
+                    toolCallsOut.length > 0 || parsed.stop_reason === "tool_use"
                       ? "tool_calls"
                       : parsed.stop_reason === "max_tokens"
                         ? "length"

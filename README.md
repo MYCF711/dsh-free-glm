@@ -121,19 +121,19 @@ $t = 'E:\ZCode-official'
 
 ### 步骤 2：安装插件
 
-**当前版本 0.4.1**（tgz 已随仓库提供，在 `releases/` 下）：
+**当前版本 0.5.2**（tgz 已随仓库提供，在 `releases/` 下）：
 
 ```powershell
 # ① 克隆仓库后，用仓库内的 tgz 安装（推荐，离线可用）
 git clone https://github.com/MYCF711/dsh-free-glm.git
 cd dsh-free-glm
-dsh plugin --profile <你的profile> add "file:$PWD/releases/dsh-zcode-bridge-0.4.1.tgz"
+dsh plugin --profile <你的profile> add "file:$PWD/releases/dsh-zcode-bridge-0.5.2.tgz"
 
 # ② 国内网络（Gitee 镜像）
 git clone https://gitee.com/MYCF711/dsh-free-glm.git
 
 # ③ 或者从 GitHub Release 下载（若已发布对应版本）
-dsh plugin --profile <你的profile> add https://github.com/MYCF711/dsh-free-glm/releases/download/v0.4.1/dsh-zcode-bridge-0.4.1.tgz
+dsh plugin --profile <你的profile> add https://github.com/MYCF711/dsh-free-glm/releases/download/v0.5.2/dsh-zcode-bridge-0.5.2.tgz
 ```
 
 > **注意**：

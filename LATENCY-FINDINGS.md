@@ -2448,3 +2448,117 @@ B 竞速 3 路: 9.3 / 8.9 / 14.8 / 17.2s 中位 14.8s
 
 **不要再试**：材料缓存、并发竞速、复制实例（前两个会更差，第三个起不来）。
 
+
+---
+
+## 三十、★★★ 死循环根因：工具往返历史必须以原生 block 回传（v0.5.x）
+
+### 30.1 症状（用户截图）
+
+「打开 bilibili 网页」任务里模型**反复调用同一工具、永不收敛**：
+
+```
+tool_call  {"tool":"pwsh","arguments":{}}      ← 参数为空！
+tool_call  {"tool":"pwsh","arguments":{}}
+tool_call  {"tool":"pwsh","arguments":{}}
+深度求索中，用时 2 分 15 秒 …（继续）
+```
+
+### 30.2 诊断路径
+
+**第一步：确认桥侧没问题。** 直连打桥，按 `index` 累加流式分片：
+
+```
+[index=0]
+  id   = call_7f31e77c4a884548b8a48e49
+  name = pwsh
+  args = {"command":"Get-ChildItem -Path 'D:\\zcode-glm5.3f' ...","description":"..."}
+  args 长度 = 179   能否 JSON.parse: 是
+```
+
+⇒ **桥发出的 `tool_calls` 完全正确。**
+
+**第二步：确认 DSH 侧也没问题。** 真实会话里：
+
+```
+tool_call  pwsh({"command":"Get-Date","description":"获取当前系统时间"})   ← input 完整
+tool_result  2026年9月28日 7:26:19
+tool_call  pwsh({"command":"Get-Date","description":"Get current date and time"})  ← 又调
+tool_result  2026年9月28日 7:26:30
+tool_call  pwsh({"command":"Get-Date"})  × 5 次 …
+耗时 58.9 秒
+```
+
+⇒ **工具调用与结果都正常，问题是「调完不收敛」。**
+
+**第三步：定位到历史回传格式。** `{"tool":"pwsh","arguments":{}}`
+**不是 DSH 原生形状**（DSH 用 `input`）—— 那是插件 `tool-bridge.ts` 的**提示词桥遗留格式**。
+
+### 30.3 根因
+
+旧实现把工具往返**降级成纯文本**塞进 user 消息：
+
+```
+```json
+{"tool":"pwsh","arguments":{...}}
+```
+[tool-result pwsh] <结果>
+```
+
+**模型看到的只是「一段提及 pwsh 的文字」** —— 看不到「这是我的调用、这是它的结果」
+的**结构化配对**，于是无法判断「上次调用已完成」→ 只能再调一次。
+
+更糟的是 `arguments:{}` 这个示范会让模型模仿出**空参数**调用。
+
+### 30.4 修法
+
+走 Anthropic 原生形状（快速路径本就直连 Anthropic 协议）：
+
+```
+assistant: { content: [..., {type:"tool_use", id, name, input}] }
+user:      { content: [{type:"tool_result", tool_use_id, content}] }
+```
+
+`tool_use_id` **严格配对**是模型判断闭环的唯一依据。
+
+**承载方式**：用带长度前缀的 NUL 标记跨层传递（避免与正文冲突、避免无转义切分）：
+
+```
+\u0000TOOL_USE\u0000<len>\n<payload>
+\u0000TOOL_RESULT\u0000<len>\n<payload>
+```
+
+### 30.5 实测对比
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 同任务 | 6 次重复调用、58.9s 不收敛 | **1 次调用、16.3s、正确回答** |
+| 参数 | `{}` 空 | 完整合法 JSON |
+
+**多步任务回归**：
+
+```
+tool_call  pwsh 列出 .md 文件      → tool_result 41 个
+tool_call  pwsh 统计行数            → tool_result 15255
+text       「共 41 个 .md，合计 15,255 行」+ 分类表格
+turn_end   completed                （2 调用 / 2 结果 / 1 回答，完全配对）
+```
+
+### 30.6 附录：子代理复核发现的另外 9 条缺陷
+
+| # | 缺陷 | 严重度 | 修复 |
+|---|---|---|---|
+| 1 | **配对游标跨消息错位**（重开本 bug） | 高 | `pendingToolIds` 按消息重置 + 精确配对 |
+| 2 | 工具名分片拼成 `get__weather` | 中 | 改判据（全量重发 vs 续写） |
+| 3 | `releaseLock` 不关上游连接（白扣额度） | 高 | 补 `reader.cancel()` |
+| 4 | 标记无转义切分（正文含 NUL 可伪造 tool_result） | 中 | 改长度前缀 |
+| 5 | 竞速 controller 提前删除（落败请求漏杀） | 中 | 外层统一 abort |
+| 6 | 超时对流式无效（不传 signal 可无限挂起） | 中 | `AbortSignal.any` + extraSignal |
+| 7 | `tool_choice` 只认 `"none"` | 中 | 全量映射 + `stop_sequences` 透传 |
+| 8 | 流式 `finish_reason` 兜底不足 | 中 | 加 `blockToToolIndex.size` 判据 |
+| 9 | 诊断同步 IO + 路径与桥不一致 | 低 | 异步+节流 + 复用 `resolveDataBaseDir()` |
+| 10 | `readBody` 超限不清空、不可诊断 | 低 | `settled` 标记 + 上限可配 + 报实际大小 |
+
+**第 1 条尤其关键** —— 它是本 bug 的**边界条件重现路径**：任一轮 tool-result 数少于
+tool-call 数（多工具并行时取消、部分失败、历史截断）就会让后续**所有配对整体错位**。
+
