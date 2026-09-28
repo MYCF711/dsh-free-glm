@@ -89,8 +89,32 @@ const geo = await ev(`(() => {
 })()`);
 console.log("  " + JSON.stringify(geo));
 
-check(".rowbox 真实高度 ≥ 48px", geo.rowbox && geo.rowbox.h >= 48, geo.rowbox ? `${geo.rowbox.h}px` : "不存在");
-check(".r-panel 真实高度 ≥ 28px", geo.panel && geo.panel.h >= 28, geo.panel ? `${geo.panel.h}px` : "不存在");
+check(".rowbox 真实高度 ≥ 100px", geo.rowbox && geo.rowbox.h >= 100, geo.rowbox ? `${geo.rowbox.h}px` : "不存在");
+check(".r-panel 真实高度 ≥ 100px", geo.panel && geo.panel.h >= 100, geo.panel ? `${geo.panel.h}px` : "不存在");
+
+// ── 1b. 空容器 vs 有内容的容器 ────────────────────────────────
+console.log("\n── 1b. 容器随内容增长（不是固定高度）──");
+const growth = await ev(`(() => {
+  const saved = JSON.parse(JSON.stringify(els));
+  // 空 col 容器
+  els = [{ id: "gEmpty", kind: "col", props: { gap: 6, children: [] } }];
+  draw();
+  const emptyH = Math.round(document.querySelector('.colbox').getBoundingClientRect().height);
+  // 塞 6 个按钮
+  const kids = [];
+  for (let i = 1; i <= 6; i++) kids.push({ id: "gk"+i, kind: "btn", props: { text: "按钮"+i, variant: "default" } });
+  els = [{ id: "gFull", kind: "col", props: { gap: 6, children: kids } }];
+  draw();
+  const fullH = Math.round(document.querySelector('.colbox').getBoundingClientRect().height);
+  els = saved; draw();
+  return { emptyH, fullH, count: 6 };
+})()`);
+console.log("  " + JSON.stringify(growth));
+check("空容器有 112px 级的高度", growth.emptyH >= 100, `${growth.emptyH}px`);
+check("装 6 个元素后容器长高了", growth.fullH > growth.emptyH,
+  `空 ${growth.emptyH}px → 满 ${growth.fullH}px`);
+check("6 个元素没被压扁（高度 ≈ 6 × 按钮高）", growth.fullH >= 6 * 26,
+  `${growth.fullH}px ≥ ${6 * 26}px`);
 
 // ── 2. 命中率：容器面积 vs 整个画布 ────────────────────────────
 console.log("\n── 2. 容器可命中面积占比 ──");

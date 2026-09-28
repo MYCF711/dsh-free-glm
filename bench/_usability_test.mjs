@@ -43,16 +43,37 @@ const minHeightOf = (sel) => {
   return m ? Number(m[1]) : 0;
 };
 
+/**
+ * ⚠ 阈值随**有意的设计决定**更新（2026-09-28 二次修正）。
+ *
+ * 第一版断言「≥ 48px」，因为我当时把 32 提到 56 就以为够了。
+ * 用户指出本质：「容器本来就要装很多东西」——
+ * 尺寸不该按「最小可用」定，而应按**内容驱动**。
+ *
+ * 所以现在断言 **≥ 100px**（实际 112px，约 4 个按钮高）。
+ * 把阈值贴着实际值写，才能在有人把它改小时立刻报警 ——
+ * 断言太松等于没断言。
+ */
 const rowMin = minHeightOf(".rowbox");
 const colMin = minHeightOf(".colbox");
 const panelMin = minHeightOf(".r-panel");
 
-check(".rowbox 最小高度 ≥ 48px", rowMin >= 48, `实际 ${rowMin}px`);
-check(".colbox 最小高度 ≥ 48px", colMin >= 48, `实际 ${colMin}px`);
-check(".r-panel 最小高度 ≥ 28px", panelMin >= 28, `实际 ${panelMin}px`);
+check(".rowbox 最小高度 ≥ 100px", rowMin >= 100, `实际 ${rowMin}px`);
+check(".colbox 最小高度 ≥ 100px", colMin >= 100, `实际 ${colMin}px`);
+check(".r-panel 最小高度 ≥ 100px", panelMin >= 100, `实际 ${panelMin}px`);
 
 const rowPad = (ruleOf(".rowbox").match(/padding:\s*(\d+)px/) ?? [0, 0])[1];
-check(".rowbox padding ≥ 6px", Number(rowPad) >= 6, `实际 ${rowPad}px`);
+check(".rowbox padding ≥ 10px", Number(rowPad) >= 10, `实际 ${rowPad}px`);
+
+/* 容器必须是 `min-height` 而非固定 `height` —— 否则装不下第 4 个元素。
+   这是个容易被"优化"掉的性质，值得单独钉住。 */
+check("容器用 min-height（不是固定 height）",
+  /min-height:\s*\d+px/.test(ruleOf(".rowbox")) && !/[^-]height:\s*\d+px/.test(ruleOf(".rowbox")),
+  ruleOf(".rowbox").replace(/\s+/g, " ").trim());
+
+/* tabpanel 必须声明为容器，否则往面板里拖东西会掉到别处 */
+check("tabpanel 渲染时带 data-container",
+  /class="r-panel"\s+data-container="1"/.test(html));
 
 check(
   "存在拖拽中的容器高亮规则",
