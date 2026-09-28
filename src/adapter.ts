@@ -77,6 +77,23 @@ import type { ModelVisibility } from "./model-visibility.js";
 /** 诊断写盘的节流时间戳（模块级，跨请求共享）。 */
 let lastSizeDiagAt = 0;
 
+/**
+ * 【临时诊断 2026-09-28】把 role 分布写到 dataBaseDir。
+ *
+ * 用同步 IO + 候选目录探测 —— 实测 DSH 子进程里 `ZCODE_DATA_BASE_DIR` 为空，
+ * 用环境变量会静默写到 cwd（那正是上一次诊断「没生成」的原因）。
+ */
+function writeRoleDiag(line: string): void {
+  try {
+    // 用 require 的动态形式避免顶层 import 影响 ESM 打包
+    const fs = require("node:fs") as typeof import("node:fs");
+    const path = require("node:path") as typeof import("node:path");
+    fs.appendFileSync(path.join(resolveDataBaseDir(), "dsh-role-dist.ndjson"), line);
+  } catch {
+    /* 诊断失败不影响主流程 */
+  }
+}
+
 /** 适配器构造参数。 */
 export interface ZCodeBridgeAdapterOptions {
   /** 产品描述对象；省略用 {@link ZCODE_BRIDGE}。 */
@@ -213,7 +230,7 @@ function extractText(payload: BridgeChatResponse): string {
  */
 function toBridgeMessages(
   messages: GenerateOptions["messages"],
-): { role: "user" | "assistant"; content: string }[] {
+): { messages: { role: "user" | "assistant"; content: string }[]; systemText: string } {
   const out: { role: "user" | "assistant"; content: string }[] = [];
   /**
    * ★★ 关键修复（2026-09-28）：工具往返必须以 **Anthropic 原生形状**回传。
@@ -285,7 +302,96 @@ function toBridgeMessages(
    */
   let pendingToolIds: string[] = [];
   let pendingToolCursor = 0;
+  /**
+   * ★★ 关键修复（2026-09-28）：把 `role:"system"` 的消息**提出来**，而不是降级成 user。
+   *
+   * ## 症状
+   *
+   * 「打开 bilibili」任务耗时 6 分 14 秒，模型行为失控：
+   * 用 `& "完整路径\autoglm-browser-service.exe" run` 直调 exe
+   * （SKILL.md 规则 5 明令禁止），撞上 service lock 报 os error 5，然后反复重试。
+   *
+   * ## 根因
+   *
+   * 落盘诊断显示桥只收到 `systemChars=33`（恰等于探针前缀长度），`baseSystemChars=0`
+   * —— **DSH 的 agent 规范完全没到达模型**。
+   *
+   * 链路断在这里：
+   *
+   *   1. DSH 把 agent 规范以 `messages[].role === "system"` 的形式传下来
+   *      （`GenerateOptions.system` 字段是空的）
+   *   2. 旧代码 `role === "assistant" ? "assistant" : "user"` ——
+   *      **把 system 降级成了 user**
+   *   3. 桥侧 `.filter((m) => m.role !== "system")` 再过滤一次
+   *   4. ⇒ 模型只看到 33 字符探针前缀，看不到任何行为规范
+   *
+   * ## 修法
+   *
+   * 把 system 消息的**文本收集起来**，与 `options.system` 合并后作为桥的
+   * `system` 字段发送（快速路径原生支持 `system`）。
+   */
+  const systemParts: string[] = [];
+  /**
+   * 【临时诊断 2026-09-28】记录 DSH 传来的 role 分布 ——
+   * 用于判断 system 到底是「没传」还是「传在别处」。
+   * 确认后可删。
+   */
+  {
+    try {
+      const roles: Record<string, number> = {};
+      for (const m of messages) {
+        const r = String((m as { role?: unknown }).role ?? "?");
+        roles[r] = (roles[r] ?? 0) + 1;
+      }
+      const first = messages[0] as { role?: unknown; content?: unknown } | undefined;
+      const info = {
+        at: Date.now(),
+        roles,
+        total: messages.length,
+        firstRole: first?.role,
+        firstContentType: Array.isArray(first?.content) ? "array" : typeof first?.content,
+        firstContentHead:
+          typeof first?.content === "string"
+            ? first.content.slice(0, 300)
+            : JSON.stringify(first?.content ?? null).slice(0, 300),
+      };
+      void import("node:fs").then(({ appendFileSync }) =>
+        import("node:path").then(({ join }) => {
+          /**
+           * 用 `resolveDataBaseDir()`（候选目录探测）而不是环境变量 ——
+           * DSH 由长驻 launcher 拉起时环境块可能过期，实测在 DSH 子进程里
+           * `ZCODE_DATA_BASE_DIR` 为空，会静默写到 cwd。
+           */
+          appendFileSync(
+            join(resolveDataBaseDir(), "dsh-role-dist.ndjson"),
+            `${JSON.stringify(info)}\n`,
+          );
+        }),
+      );
+    } catch {
+      /* 诊断失败不影响主流程 */
+    }
+  }
   for (const message of messages) {
+    // 用宽松访问：DSH 的 Message 联合类型在收窄 role 后会把 content 变成 never，
+    // 但运行时确实可能是 string / block[]。
+    const msgRole = (message as { role?: unknown }).role;
+    if (msgRole === "system") {
+      const c = (message as { content?: unknown }).content;
+      if (typeof c === "string" && c.length > 0) {
+        systemParts.push(c);
+      } else if (Array.isArray(c)) {
+        const t = c
+          .map((b) => {
+            const r = b as { type?: unknown; text?: unknown };
+            return r.type === "text" && typeof r.text === "string" ? r.text : "";
+          })
+          .filter((s) => s.length > 0)
+          .join("\n");
+        if (t.length > 0) systemParts.push(t);
+      }
+      continue; // system 不进 messages —— 它走桥的 system 字段
+    }
     const role = message.role === "assistant" ? "assistant" : "user";
     const content = message.content;
     // 进入新的 assistant 消息 = 新的一轮调用，配对表与游标都重置。
@@ -394,7 +500,17 @@ function toBridgeMessages(
     }
     out.push({ role, content: text });
   }
-  return out;
+  return {
+    messages: out,
+    /**
+     * 从 `messages[].role === "system"` 里收集出来的 system 文本。
+     *
+     * ⚠ 这**不是**可选信息 —— DSH 的 agent 规范（身份、行为准则、
+     * skill 使用规则）就走这条路。丢了它模型会行为失控（实测：6 分 14 秒
+     * 反复用错误方式调工具）。
+     */
+    systemText: systemParts.join("\n\n"),
+  };
 }
 
 /** 把工具参数规整成对象：字符串先尝试 parse，失败则原样包成 `{ raw }`。 */
@@ -964,7 +1080,51 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     }
 
     // 2. 组请求体（OpenAI chat-completions 形状）。
-    const messages = toBridgeMessages(options.messages);
+    //
+    // ⚠ `toBridgeMessages` 同时返回从 messages 里**抽出的 system 文本** ——
+    //    DSH 把 agent 规范放在 `messages[].role === "system"`，而不是
+    //    `options.system` 字段（实测：后者为空）。两处都要合并。
+    const built = toBridgeMessages(options.messages);
+    const messages = built.messages;
+    /**
+     * 【临时诊断 2026-09-28】记录 DSH 传来的 role 分布 + 第一条的头部。
+     *
+     * 放在这里（而不是 toBridgeMessages 内部）是因为内部那段被 try/catch 吞了
+     * 异常、看不到失败原因。这里的写法把错误直接写进同一个文件。
+     */
+    {
+      try {
+        const roles: Record<string, number> = {};
+        for (const m of options.messages) {
+          const r = String((m as { role?: unknown }).role ?? "?");
+          roles[r] = (roles[r] ?? 0) + 1;
+        }
+        const first = options.messages[0] as { role?: unknown; content?: unknown } | undefined;
+        const info = {
+          at: Date.now(),
+          roles,
+          total: options.messages.length,
+          optionsSystemLen: typeof options.system === "string" ? options.system.length : -1,
+          builtSystemLen: built.systemText.length,
+          firstRole: first?.role,
+          firstContentType: Array.isArray(first?.content) ? "array" : typeof first?.content,
+          firstContentHead:
+            typeof first?.content === "string"
+              ? first.content.slice(0, 400)
+              : JSON.stringify(first?.content ?? null).slice(0, 400),
+        };
+        // 用同步 IO + 顶层已 import 的模块，避免动态 import 在 ESM 下的时序问题
+        writeRoleDiag(`${JSON.stringify(info)}\n`);
+      } catch (err) {
+        try {
+          writeRoleDiag(
+            `${JSON.stringify({ at: Date.now(), err: String(err) })}\n`,
+          );
+        } catch {
+          /* 连诊断都失败 —— 放弃 */
+        }
+      }
+    }
 
     // ── 工具表注入 ────────────────────────────────────────────────────────
     //
@@ -988,8 +1148,22 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     // 渲染成提示词的老路保留为**回退**（当调用方显式要求 `promptToolBridge` 时）。
     const ZCODE_PROBE_PREFIX = "You are ZCode connectivity probe.";
     const tools = options.tools ?? [];
-    const baseSystem =
-      typeof options.system === "string" && options.system.length > 0 ? options.system : "";
+    /**
+     * system 的两个来源合并（2026-09-28）。
+     *
+     * 1. `options.system` —— 契约字段（实测 DSH 这里是空的）
+     * 2. `messages[].role === "system"` 的文本 —— **DSH 实际用这条路**
+     *
+     * 合并顺序：`options.system` 在前（若有），messages 里的 system 在后。
+     * 两者都可能为空 —— 那就只剩探针前缀（这是**功能退化**，不是正常状态）。
+     */
+    const baseSystem = [
+      typeof options.system === "string" ? options.system : "",
+      built.systemText,
+    ]
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+      .join("\n\n");
 
     // 探针前缀必须**在最前**（实测：前缀匹配，后面可追加任意内容）
     //
@@ -1032,6 +1206,17 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
               at: nowDiag,
               model: options.model,
               systemChars: systemText.length,
+              /**
+               * 【2026-09-28 加】记录 system 的**实际内容前缀** ——
+               * 用于判断「DSH 没传 system」还是「插件把它丢了」。
+               *
+               * 实测背景：某次长任务里 `systemChars=33`
+               * （恰等于探针前缀 `"You are ZCode connectivity probe."` 的长度），
+               * 说明 `options.system` 是**空的** —— 模型看不到 DSH 的 agent 规范
+               * （含 skill 使用规则），于是行为失控（反复用错误方式调工具）。
+               */
+              systemHead: systemText.slice(0, 300),
+              baseSystemChars: baseSystem.length,
               messageCount: messages.length,
               messageChars: JSON.stringify(messages).length,
               toolCount: tools.length,

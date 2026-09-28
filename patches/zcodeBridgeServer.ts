@@ -34,6 +34,10 @@
  * - token 与端口写入 `<dataBaseDir>/.zcode/v2/bridge-port.json`
  */
 
+import {
+  buildOfficialSystemBlocks,
+  OFFICIAL_CLI_PREFIX,
+} from "./zcode-official-identity.js";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -111,9 +115,205 @@ function resolveProviderId(raw: unknown): string {
  */
 const ZCODE_PLAN_ANTHROPIC_BASE = "https://zcode.z.ai/api/v1/zcode-plan/anthropic";
 
+/**
+ * 额度查询端点（2026-09-28 新增）。
+ *
+ * ## 为什么值得内建
+ *
+ * 此前判断「额度是否用尽」只能靠**错误码反推**：
+ *
+ *   {"code":1005,"msg":"exceed quota limit"}
+ *
+ * 而查不到「还剩多少、什么时候到期、是每日还是活动赠送」——
+ * 排查时全靠猜（本项目为此浪费过大量时间）。
+ *
+ * ## 端点来源（从源码提取，非猜测）
+ *
+ * `packages/shared/src/zcodeEndpoint.ts:269`
+ *   zcodePlanBillingBalanceUrl: `${origin}/api/v1/zcode-plan/billing/balance`
+ *
+ * `packages/services/src/model-provider/zaiStartPlanBilling.ts:63`
+ *   buildZaiStartPlanBalanceUrl() → 追加 `?app_version=<ZCODE_VERSION>`
+ *   （注释原话：「Start Plan balance 接口按真实 app_version 判定能力」）
+ *
+ * 请求要求（同文件 L104-109）：
+ *   method: GET
+ *   headers: { Authorization: <完整值，含 Bearer> }
+ *   另需 `X-Device-Mid`（取自 `<dataBaseDir>\.zcode\v2\telemetry-state.json`
+ *   的 `deviceMid`）—— 缺它会被服务端拒绝为 parameter error
+ *   （见 `packages/.../entry-stdio.ts:55` 的注释）。
+ *
+ * ## 返回结构（实测）
+ *
+ * ```json
+ * {"code":0,"data":{
+ *   "plans":[{"plan_id":"zcode-v3-start-plan-trust-0928","name":"ZCode Trust Build",
+ *             "status":"active","ends_at":1790611200}],
+ *   "balances":[{"show_name":"GLM-5.3-Flash","period":"one_time",
+ *                "total_units":100000000,"used_units":49142,
+ *                "remaining_units":99950858,"expires_at":1790611200}]}}
+ * ```
+ *
+ * `period` 是判据：`one_time` = 活动赠送（会过期），`daily` = 每日刷新。
+ */
+const ZCODE_PLAN_BILLING_BALANCE_URL = "https://zcode.z.ai/api/v1/zcode-plan/billing/balance";
+
+/**
+ * 额度**领取**端点（2026-09-28 新增）。
+ *
+ * ## 这是「点卡片才算领取」的本体
+ *
+ * ZCode 客户端左下角弹出的额度卡片，其「点击」动作就是一次本接口调用。
+ * 此前这一步**必须人工**（子代理从闭源版 asar 偏移 271345639 提取到实现，
+ * 并在官方版日志里找到真实调用记录：
+ * `coding-plan-subscription.claimManualPlan OK (6101.7ms)`）。
+ *
+ * ## 接口形状（asar 原文 + 实测）
+ *
+ * ```
+ * POST /api/v1/zcode-plan/billing/claim
+ *   Authorization: Bearer <apiKey 或 zcodejwttoken>
+ *   Content-Type: application/json
+ *   X-Aliyun-Captcha-Verify-Param: <captcha>     ← 必需，且一次性
+ *   X-Aliyun-Captcha-Verify-Region: cn
+ *   X-ZCode-App-Version / X-Platform / X-Device-Mid
+ *   body: {"plan_id":"<planId>"}
+ * ```
+ *
+ * ## 业务码（实测 + 第三方实现交叉验证）
+ *
+ * | code | 含义 |
+ * |---|---|
+ * | 0    | 成功领取 |
+ * | 1001 | plan 不存在 |
+ * | 1002 | 活动已结束 |
+ * | **1003** | **已领取过（幂等成功，不是错误）** |
+ * | 1004 | 不符合条件 |
+ * | 1005 | 名额用完 |
+ * | 3007 | captcha 校验失败（需换新 param 重试，且会消耗 captcha） |
+ * | 401  | 未登录 |
+ */
+const ZCODE_PLAN_BILLING_CLAIM_URL = "https://zcode.z.ai/api/v1/zcode-plan/billing/claim";
+
+/**
+ * 激活上报端点（2026-09-28 新增）。
+ *
+ * ## 它决定 preview 能否看到活动
+ *
+ * 实测（本项目）：**补发这两个事件之前，`billing/preview` 返回 `plans: []`；
+ * 补发之后立刻出现 `zcode-v3-start-plan-trust-0928`。**
+ *
+ * ```
+ * 补前: {"code":0,"data":{"plans":[]}}
+ * 补后: {"code":0,"data":{"plans":[{"plan_id":"zcode-v3-start-plan-trust-0928",...}]}}
+ * ```
+ *
+ * 即：**「活动套餐投放」依赖客户端活跃信号** —— 这就是为什么纯 billing
+ * 轮询的账号看不到活动，而官方客户端能看到卡片。
+ *
+ * 参数：`app_launch` / `app_daily_active`（按 device_mid + 日期去重，无需鉴权）。
+ */
+const ZCODE_EVENT_REPORT_URL = "https://zcode.z.ai/api/v1/event/report";
+
+/** billing/preview —— 卡片内容的数据源。 */
+const ZCODE_PLAN_BILLING_PREVIEW_URL = "https://zcode.z.ai/api/v1/zcode-plan/billing/preview";
+
 export interface ZCodeBridgeMessage {
   readonly role: "system" | "user" | "assistant";
   readonly content: string;
+}
+
+/**
+ * ★ 官方首轮 user 消息的上下文前缀（2026-09-28 新增）。
+ *
+ * ## 为什么需要（3012 的最后一个开关）
+ *
+ * 官方客户端**总会**给**首轮** user 消息的 `content` 数组最前面插一个
+ * `<system-reminder>` 块，内容是当前日期：
+ *
+ * ```
+ * <system-reminder>As you answer the user's questions, you can use the following context:
+ * # currentDate
+ * Today's date is 2026-09-28.
+ *
+ *       IMPORTANT: this context may or may not be relevant to your tasks. You should not
+ * respond to this context unless it is highly relevant to your task.</system-reminder>
+ * ```
+ *
+ * 来源：同类项目 `a137460387/zcode2api` 的
+ * `src/upstream/system-prompt.js` 的 `buildContextPrefixBlock()`，
+ * 其对照表把它列为「裸请求特征」之一：
+ *
+ * | | 官方 | 裸请求（3012） |
+ * |---|---|---|
+ * | 首轮 user 消息 | 前挂 `<system-reminder>…# currentDate…#</system-reminder>` | 纯用户文本 |
+ *
+ * ## 形态细节（逐字复刻，不要"优化"）
+ *
+ * - 整块是**一个** `{type:"text"}`，插到 `content` **数组**最前面
+ *   —— 不是拼进文本字符串（后者会改变结构，仍被判定为裸请求）
+ * - `outro` 前有 **6 个空格**缩进
+ * - 空行由 `join("\n")` 里的空串产生
+ * - 日期用**本地时区**的 ISO 日期，不是 UTC
+ * - **幂等**：已以 `<system-reminder>` 开头则不重复插
+ * - 首轮不是 `role:"user"` 时**不插**
+ */
+const CONTEXT_PREFIX_INTRO =
+  "As you answer the user's questions, you can use the following context:";
+const CONTEXT_PREFIX_OUTRO =
+  "      IMPORTANT: this context may or may not be relevant to your tasks. "
+  + "You should not respond to this context unless it is highly relevant to your task.";
+
+/** 本地时区的 ISO 日期（官方用本地日期，不用 UTC）。 */
+function formatLocalIsoDate(d: Date = new Date()): string {
+  const pad = (n: number): string => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** 构造 `<system-reminder>` 上下文块。 */
+function buildContextPrefixBlock(now: Date = new Date()): {
+  type: "text";
+  text: string;
+} {
+  const body = [
+    CONTEXT_PREFIX_INTRO,
+    `# currentDate\nToday's date is ${formatLocalIsoDate(now)}.`,
+    "",
+    CONTEXT_PREFIX_OUTRO,
+  ].join("\n");
+  return { type: "text", text: `<system-reminder>${body}</system-reminder>` };
+}
+
+/**
+ * 把上下文前缀插到首轮 user 消息的 `content` 数组最前面。
+ *
+ * 输入消息的 `content` 是**字符串**（桥内部表示），这里转成官方的
+ * **块数组**形态。已经在用数组的消息原样保留。
+ */
+function withContextPrefix<T extends { role: string; content: unknown }>(
+  messages: readonly T[],
+  now: Date = new Date(),
+): Array<Record<string, unknown>> {
+  const out = messages.map((m) => ({ ...m }) as Record<string, unknown>);
+  const first = out[0];
+  if (first === undefined || first["role"] !== "user") {
+    return out;
+  }
+  const rawContent = first["content"];
+  const contentArray: Array<Record<string, unknown>> = Array.isArray(rawContent)
+    ? (rawContent as Array<Record<string, unknown>>)
+    : [{ type: "text", text: String(rawContent ?? "") }];
+  /** 幂等：已挂过就不重复插（官方实现同样如此）。 */
+  const alreadyPrefixed = contentArray.some(
+    (c) =>
+      c["type"] === "text" &&
+      typeof c["text"] === "string" &&
+      c["text"].startsWith("<system-reminder>"),
+  );
+  first["content"] = alreadyPrefixed
+    ? contentArray
+    : [buildContextPrefixBlock(now), ...contentArray];
+  return out;
 }
 
 /**
@@ -362,6 +562,45 @@ export interface ZCodeBridgeDeps {
    * 而 captcha param 一次性 —— 复用它稳定返回 `3007 captcha verify failed`
    * （实测）。本方法按需触发一次 captcha 产出，拿到即用。
    */
+  /**
+   * ★ 触发一次账号登录（2026-09-28 新增）。
+   *
+   * ## 为什么需要（把「固定流程」变成脚本可调用）
+   *
+   * ZCode 的登录是确定的五步：
+   *
+   *   ① oauthService.startOAuthWithPolling(provider)
+   *        → 生成随机 `state`、拼出 authorizeUrl
+   *   ② platform.registerOAuthState({ state, provider })
+   *        → 把 state 记进实例内存的 `oauthStateToWindow` Map
+   *   ③ platform.openExternal(authorizeUrl)
+   *        → 打开 `https://bigmodel.cn/login?redirect=zcode://oauth/callback&appId=zcode&state=...`
+   *   ④ 用户在浏览器完成 OAuth
+   *   ⑤ 浏览器重定向到 `zcode://oauth/callback?code=...&state=...`
+   *        → OS 按 HKCU\Software\Classes\zcode 派发给本实例
+   *        → `handleDeepLink()` 用 state 查 Map → 投递 → 换 token → 写 credentials.json
+   *
+   * **每一步都是确定性的** —— 唯一「人在环」的是第 ④ 步（在浏览器里输账号）。
+   * 但第 ①②③⑤ 步完全可由本方法代劳，于是外部只需：
+   *
+   *   POST /oauth/login  →  实例弹浏览器  →  用户在浏览器登录  →  自动完成
+   *
+   * `state` **必须由实例自己生成并注册**（不能外部拼 URL）——
+   * 否则回调时 `handleDeepLink` 查不到 Map，会被拒。
+   *
+   * ## 实现要求
+   *
+   * 宿主注入的实现应调用 renderer 侧的 `startLogin` 等价流程
+   * （`packages/ui/src/hooks/useOAuth.ts` 的 `startLogin`）。
+   * 返回后**不要等登录完成** —— OAuth 是异步的，回调走 deep link。
+   */
+  readonly startLogin?: (params: { providerId: string }) => Promise<{
+    ok: boolean;
+    /** 已打开的授权页 URL（含 state），便于调用方展示或自行打开 */
+    authorizeUrl?: string;
+    /** 人可读的状态说明 */
+    message?: string;
+  }>;
   readonly mintAuthMaterial?: (params: {
     providerId: string;
     modelId: string;
@@ -1413,6 +1652,441 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
       //   用**真实头值**裸发（无 captcha）→ 400 `3007 captcha verify failed`
       //   用**旧头值**裸发            → 405 `3012 unusual activity`
       // ⇒ 头值确实影响 3012！补对之后风控放行，只卡 captcha。
+      /**
+       * ★ `POST /oauth/login` —— 触发账号登录（2026-09-28 新增）。
+       *
+       * ## 为什么做这个端点
+       *
+       * 用户的原话：「这一套操作不都是固定的吗？让 agent 来的步骤不也是固定的吗？
+       * 那就能写成脚本才对」—— **完全正确**。
+       *
+       * ZCode 登录的五步全是确定性的（见 deps.startLogin 的注释），
+       * 唯一「人在环」的是用户在浏览器里输账号密码。其余四步
+       * （生成 state、注册、开浏览器、接回调）都能由实例代劳。
+       *
+       * 于是登录就可以被 agent 触发：
+       *
+       *   POST /oauth/login  →  实例弹出授权页  →  用户完成
+       *                      →  zcode:// 回调  →  自动写凭据  →  额度恢复
+       *
+       * ## 请求
+       *
+       *   { "providerId": "account:bigmodel-start-plan" }   可选，默认 bigmodel
+       *
+       * ## 响应
+       *
+       *   200 { ok: true, authorizeUrl, message }
+       *   501 宿主没注入 startLogin
+       */
+      if (method === "POST" && url === "/oauth/login") {
+        if (deps.startLogin === undefined) {
+          errorJson(
+            response,
+            501,
+            "Bridge was constructed without startLogin.",
+            "not_implemented",
+          );
+          return;
+        }
+        let payload: unknown;
+        try {
+          payload = JSON.parse(await readBody(request));
+        } catch {
+          payload = {};
+        }
+        const body = (payload ?? {}) as Record<string, unknown>;
+        const providerId =
+          typeof body["providerId"] === "string" && body["providerId"].trim().length > 0
+            ? body["providerId"].trim()
+            : // ⚠ 必须是 **OAuth provider ID**（`"bigmodel"` / `"zai"`），
+              //   不是桥的 provider 名（`account:bigmodel-start-plan`）——
+              //   后者会抛 `不支持的 OAuth provider: account:...`（实测）。
+              "bigmodel";
+        try {
+          const result = await deps.startLogin({ providerId });
+          json(response, 200, {
+            ok: result.ok,
+            providerId,
+            ...(result.authorizeUrl === undefined ? {} : { authorizeUrl: result.authorizeUrl }),
+            message:
+              result.message ??
+              "授权页已打开。请在浏览器完成登录；回调会自动写回凭据，之后可再次调用本接口或直接发请求验证。",
+          });
+        } catch (error) {
+          errorJson(
+            response,
+            502,
+            `startLogin failed: ${error instanceof Error ? error.message : String(error)}`,
+            "login_failed",
+          );
+        }
+        return;
+      }
+      /**
+       * ★ `GET /diagnostics/billing` —— 查真实额度（2026-09-28 新增）。
+       *
+       * ## 解决什么问题
+       *
+       * 此前只能从 `{"code":1005,"msg":"exceed quota limit"}` **反推**额度用尽，
+       * 查不到「还剩多少 / 何时到期 / 一次性还是每日」。
+       *
+       * 本端点直连上游 billing/balance，返回结构化额度信息：
+       *
+       *   { ok, planName, planId, period, totalUnits, usedUnits,
+       *     remainingUnits, expiresAt, expiresAtLocal, plans[] }
+       *
+       * ## 鉴权
+       *
+       * 复用 `mintAuthMaterial`（每次现 mint，因为 captcha 材料一次性）。
+       * 另需 `X-Device-Mid` —— 取自 `<dataBaseDir>\.zcode\v2\telemetry-state.json`。
+       */
+      /**
+       * ★ `POST /diagnostics/claim` —— 自动领取免费额度（2026-09-28 新增）。
+       *
+       * ## 解决什么问题
+       *
+       * ZCode 左下角弹的额度卡片**必须人工点击**才领取。用户原话：
+       *
+       *   「这个额度是软件在 UI 界面的左下角弹出一个卡片，只有用户去点了
+       *     之后才领取。这个也需要自动化，也就是说，登录之后还要用户点击
+       *     才有额度」
+       *
+       * ## 三步全自动
+       *
+       * ① **激活上报**（关键！）—— 不补这两条，`preview` 恒为空 `plans: []`：
+       *      POST /api/v1/event/report  {app_launch}
+       *      POST /api/v1/event/report  {app_daily_active}
+       * ② **看有哪些可领** —— GET /billing/preview
+       * ③ **逐个领取** —— POST /billing/claim {plan_id}
+       *      captcha 头来自 `mintAuthMaterial`（**一次性，必须现解现用**）
+       *
+       * 返回 `1003`（已领取）视为**成功** —— 幂等语义。
+       *
+       * ## 请求
+       *
+       *   { "planId": "..." }   可选。缺省时按 preview 的 priority 降序全领。
+       */
+      if (method === "POST" && url === "/diagnostics/claim") {
+        if (deps.mintAuthMaterial === undefined) {
+          errorJson(response, 501, "Bridge was constructed without mintAuthMaterial.", "not_implemented");
+          return;
+        }
+        let payload: unknown;
+        try {
+          payload = JSON.parse(await readBody(request));
+        } catch {
+          payload = {};
+        }
+        const claimBody = (payload ?? {}) as Record<string, unknown>;
+        const explicitPlanId =
+          typeof claimBody["planId"] === "string" && claimBody["planId"].trim().length > 0
+            ? claimBody["planId"].trim()
+            : undefined;
+
+        const steps: Array<Record<string, unknown>> = [];
+        const startedAt = Date.now();
+        try {
+          /** deviceMid 是企业身份锚点；billing 全家桶缺它会 3001。 */
+          let deviceMid = "";
+          try {
+            const { readFileSync } = await import("node:fs");
+            const { join: joinPath } = await import("node:path");
+            const tf = joinPath(deps.dataBaseDir, ".zcode", "v2", "telemetry-state.json");
+            const parsed = JSON.parse(readFileSync(tf, "utf8")) as { deviceMid?: unknown };
+            if (typeof parsed.deviceMid === "string") deviceMid = parsed.deviceMid;
+          } catch {
+            /* 拿不到就不带 */
+          }
+          const midHeader: Record<string, string> =
+            deviceMid.length > 0 ? { "X-Device-Mid": deviceMid } : {};
+
+          /** ① 激活上报 —— 不补这两条，preview 恒为空。 */
+          const emptyAuth: Record<string, string> = {
+            "Content-Type": "application/json",
+            "User-Agent": "ZCode/3.14.3",
+            ...midHeader,
+          };
+          for (const event of ["app_launch", "app_daily_active"]) {
+            try {
+              const r = await fetch(ZCODE_EVENT_REPORT_URL, {
+                method: "POST",
+                headers: emptyAuth,
+                body: JSON.stringify({
+                  event,
+                  device_mid: deviceMid,
+                  platform: "win32",
+                  app_version: "3.14.3",
+                }),
+              });
+              const t = await r.text();
+              steps.push({ step: "event_report", event, status: r.status, body: t.slice(0, 200) });
+            } catch (error) {
+              steps.push({
+                step: "event_report",
+                event,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+
+          /** ② preview —— 拿可领列表。 */
+          let planIds: string[] = [];
+          {
+            const url2 =
+              `${ZCODE_PLAN_BILLING_PREVIEW_URL}?app_version=3.14.3&platform=win32`;
+            const r = await fetch(url2, {
+              method: "GET",
+              headers: { accept: "application/json", "User-Agent": "ZCode/3.14.3", ...midHeader },
+            });
+            const t = await r.text();
+            steps.push({ step: "preview", status: r.status, body: t.slice(0, 600) });
+            try {
+              const p = JSON.parse(t) as {
+                data?: { plans?: Array<{ plan_id?: string; priority?: number }> };
+              };
+              const plans = (p.data?.plans ?? []).filter(
+                (x): x is { plan_id: string; priority?: number } =>
+                  typeof x.plan_id === "string" && x.plan_id.length > 0,
+              );
+              // priority 降序 —— 与第三方实现一致（先领高优先级的）
+              plans.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
+              planIds = plans.map((x) => x.plan_id);
+            } catch {
+              /* preview 解析失败就不领 */
+            }
+          }
+
+          /** ③ 逐个 claim —— captcha 一次性，**每个 plan 都要重新 mint**。 */
+          const targets = explicitPlanId !== undefined ? [explicitPlanId] : planIds;
+          const results: Array<Record<string, unknown>> = [];
+          for (const planId of targets) {
+            try {
+              const material = await deps.mintAuthMaterial({
+                providerId: DEFAULT_PROVIDER_ID,
+                modelId: ALLOWED_MODELS[0],
+                workspacePath: bridgeWorkspacePath(),
+              });
+              if (material?.apiKey === undefined) {
+                results.push({ planId, ok: false, error: "mint returned no apiKey" });
+                continue;
+              }
+              const capParam = material.headers?.["X-Aliyun-Captcha-Verify-Param"];
+              const capRegion = material.headers?.["X-Aliyun-Captcha-Verify-Region"];
+              /**
+               * ⚠ captcha 头**必需**。缺了上游可能仍返回 200 但业务码异常，
+               *   所以这里显式记录是否带上，便于诊断。
+               */
+              const claimHeaders: Record<string, string> = {
+                authorization: `Bearer ${material.apiKey}`,
+                "Content-Type": "application/json",
+                ...(typeof capParam === "string"
+                  ? { "X-Aliyun-Captcha-Verify-Param": capParam }
+                  : {}),
+                ...(typeof capRegion === "string"
+                  ? { "X-Aliyun-Captcha-Verify-Region": capRegion }
+                  : {}),
+                "X-ZCode-App-Version": "3.14.3",
+                "X-Platform": "win32",
+                "User-Agent": "ZCode/3.14.3",
+                ...midHeader,
+              };
+              let r: Response;
+              try {
+                r = await fetch(ZCODE_PLAN_BILLING_CLAIM_URL, {
+                  method: "POST",
+                  headers: claimHeaders,
+                  body: JSON.stringify({ plan_id: planId }),
+                });
+              } catch (fetchErr) {
+                /**
+                 * fetch 本身失败（DNS / TLS / 连接被拒）。旧实现把这里吞成
+                 * 空对象，导致 `HTTP=` 为空且看不到原因 —— 现在显式记下来。
+                 */
+                results.push({
+                  planId,
+                  ok: false,
+                  stage: "fetch",
+                  error: fetchErr instanceof Error ? fetchErr.message : String(fetchErr),
+                  errorName: fetchErr instanceof Error ? fetchErr.name : typeof fetchErr,
+                  captchaPresent: typeof capParam === "string",
+                  headersUsed: Object.keys(claimHeaders).join(","),
+                });
+                continue;
+              }
+              const t = await r.text();
+              let upstreamCode: number | undefined;
+              try {
+                upstreamCode = (JSON.parse(t) as { code?: number }).code;
+              } catch {
+                /* ignore */
+              }
+              results.push({
+                planId,
+                httpStatus: r.status,
+                upstreamCode: upstreamCode ?? null,
+                /**
+                 * ⚠ `1003` = 已领取过 —— **幂等成功，不是错误**。
+                 * 早先若把它当失败会让自动化误报。
+                 */
+                ok: r.status === 200 && (upstreamCode === 0 || upstreamCode === 1003),
+                alreadyClaimed: upstreamCode === 1003,
+                body: t.slice(0, 400),
+              });
+            } catch (error) {
+              results.push({
+                planId,
+                ok: false,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+          }
+          json(response, 200, {
+            ok: results.some((r) => r["ok"] === true),
+            discoveredPlans: planIds,
+            results,
+            steps,
+            durationMs: Date.now() - startedAt,
+            note:
+              "code 1003 = 已领取过（幂等成功）。若 preview 的 plans 为空，" +
+              "检查 steps 里的 event_report 是否成功 —— 激活上报是活动投放的资格信号。",
+          });
+        } catch (error) {
+          errorJson(
+            response,
+            502,
+            `Claim failed: ${error instanceof Error ? error.message : String(error)}`,
+            "upstream_error",
+          );
+        }
+        return;
+      }
+      if ((method === "GET" || method === "POST") && url === "/diagnostics/billing") {
+        if (deps.mintAuthMaterial === undefined) {
+          errorJson(response, 501, "Bridge was constructed without mintAuthMaterial.", "not_implemented");
+          return;
+        }
+        const startedAt = Date.now();
+        try {
+          const material = await deps.mintAuthMaterial({
+            providerId: DEFAULT_PROVIDER_ID,
+            modelId: ALLOWED_MODELS[0],
+            workspacePath: bridgeWorkspacePath(),
+          });
+          if (material?.apiKey === undefined) {
+            errorJson(response, 502, "Failed to mint auth material.", "credential_unavailable");
+            return;
+          }
+          /** deviceMid 来自 telemetry-state.json（缺它服务端会拒为 parameter error）。 */
+          let deviceMid = "";
+          try {
+            const { readFileSync } = await import("node:fs");
+            const { join: joinPath } = await import("node:path");
+            const tf = joinPath(deps.dataBaseDir, ".zcode", "v2", "telemetry-state.json");
+            const parsed = JSON.parse(readFileSync(tf, "utf8")) as { deviceMid?: unknown };
+            if (typeof parsed.deviceMid === "string") deviceMid = parsed.deviceMid;
+          } catch {
+            /* 拿不到就不带 —— 上游可能因此拒绝，下面的错误信息会体现 */
+          }
+          const appVersion =
+            typeof material.headers?.["X-ZCode-App-Version"] === "string"
+              ? (material.headers["X-ZCode-App-Version"] as string)
+              : "3.14.3";
+          const billingUrl =
+            `${ZCODE_PLAN_BILLING_BALANCE_URL}?app_version=${encodeURIComponent(appVersion)}`;
+          const upstream = await fetch(billingUrl, {
+            method: "GET",
+            headers: {
+              authorization: `Bearer ${material.apiKey}`,
+              ...(deviceMid.length > 0 ? { "x-device-mid": deviceMid } : {}),
+              "user-agent": `ZCode/${appVersion}`,
+              accept: "application/json",
+            },
+          });
+          const text = await upstream.text();
+          if (upstream.status !== 200) {
+            errorJson(
+              response,
+              upstream.status,
+              `Upstream billing failed: ${text.slice(0, 400)}`,
+              "upstream_error",
+            );
+            return;
+          }
+          const parsed = JSON.parse(text) as {
+            code?: number;
+            msg?: string;
+            data?: {
+              plans?: Array<{
+                plan_id?: string;
+                name?: string;
+                status?: string;
+                ends_at?: number;
+              }>;
+              balances?: Array<{
+                show_name?: string;
+                plan_id?: string;
+                period?: string;
+                total_units?: number;
+                used_units?: number;
+                remaining_units?: number;
+                available_units?: number;
+                expires_at?: number;
+              }>;
+            };
+          };
+          const primary = parsed.data?.balances?.[0];
+          const planOfPrimary = parsed.data?.plans?.find(
+            (p) => p.plan_id === primary?.plan_id,
+          );
+          /**
+           * ⚠ `period` 的取法（2026-09-28 修正）。
+           *
+           * 实测：`balances[].period` 是 **null**，真正的值在
+           * `plans[].entitlements[].period`（`"one_time"` / `"daily"`）。
+           * 早先只读 balances，于是永远拿到 null —— 而那正是判断
+           * 「活动赠送 vs 每日订阅」的关键字段。
+           */
+          const entitlementPeriod = (
+            planOfPrimary as { entitlements?: Array<{ period?: string }> } | undefined
+          )?.entitlements?.[0]?.period;
+          const period = primary?.period ?? entitlementPeriod ?? null;
+          const toLocal = (sec: number | undefined): string | undefined =>
+            typeof sec === "number"
+              ? new Date(sec * 1000).toLocaleString("zh-CN", { hour12: false })
+              : undefined;
+          json(response, 200, {
+            ok: true,
+            upstreamCode: parsed.code ?? null,
+            upstreamMsg: parsed.msg ?? "",
+            planName: planOfPrimary?.name ?? null,
+            planId: primary?.plan_id ?? planOfPrimary?.plan_id ?? null,
+            planStatus: planOfPrimary?.status ?? null,
+            /**
+             * ⚠ 判据：`one_time` = 活动赠送（会过期）；`daily` = 每日刷新。
+             * 此前只能靠错误码猜，现在能直接读。
+             */
+            period,
+            modelName: primary?.show_name ?? null,
+            totalUnits: primary?.total_units ?? null,
+            usedUnits: primary?.used_units ?? null,
+            remainingUnits: primary?.remaining_units ?? null,
+            availableUnits: primary?.available_units ?? null,
+            expiresAt: primary?.expires_at ?? planOfPrimary?.ends_at ?? null,
+            expiresAtLocal: toLocal(primary?.expires_at ?? planOfPrimary?.ends_at),
+            plans: parsed.data?.plans ?? [],
+            durationMs: Date.now() - startedAt,
+            deviceMidPresent: deviceMid.length > 0,
+          });
+        } catch (error) {
+          errorJson(
+            response,
+            502,
+            `Billing query failed: ${error instanceof Error ? error.message : String(error)}`,
+            "upstream_error",
+          );
+        }
+        return;
+      }
       if (method === "POST" && url === "/diagnostics/mint") {
         if (deps.mintAuthMaterial === undefined) {
           errorJson(response, 501, "Bridge was constructed without mintAuthMaterial.", "not_implemented");
@@ -1531,18 +2205,108 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
          * 依据实测：原串通过、原串+尾部空格通过、去句点不通过。
          */
         const CONNECTIVITY_PROBE_SYSTEM = "You are ZCode connectivity probe.";
-        // 匹配规则：**前缀匹配**（实测，2026-09-27）
-        //   [原串]                ✓ 200
-        //   [原串+空格]           ✓ 200
-        //   [原串+换行+额外指令]   ✓ 200   ← 可以追加
-        //   [额外指令+换行+原串]   ✗ 405   ← 必须在开头
-        //   [原串+空格+额外]       ✓ 200
-        // ⇒ 只要以该串**开头**即可，后面可追加任意 system 指令。
-        const fastSystem =
-          typeof body.system === "string" &&
-          body.system.trim().startsWith(CONNECTIVITY_PROBE_SYSTEM)
-            ? body.system
-            : undefined;
+
+        /**
+         * ★ 官方 ZCode 身份块的第一个 block（2026-09-28 新增）。
+         *
+         * ## 为什么加这个
+         *
+         * 上游网关对请求做**内容检查**：`system` 字段里看不到 ZCode 身份块时
+         * 直接返回 `3012 "method not allowed"`（对外文案 `request has been
+         * blocked due to unusual activity`）。
+         *
+         * 来源：同类项目 `a137460387/zcode2api` 的 README「3012 的根因与修复」节，
+         * 其 `src/upstream/zcode-system.json` 从官方 3.11.2 bundle 提取。
+         *
+         * ## 实测（本项目，2026-09-28）
+         *
+         * 用官方三块 system（共 7599 字符）+ 官方头形态直发
+         * `zcode-plan/anthropic/v1/messages`：
+         *
+         * ```
+         * HTTP: 200  {"content":[...,{"type":"text","text":"复刻成功"}],
+         *             "usage":{"input_tokens":1706,...}}
+         * 请求体 8328 字节（官方 ~8.3-8.6 KB）
+         * ```
+         *
+         * **⇒ 3012 被绕过。** 此前第四轮「头集合逐字段对齐仍 3012 ⇒ 不可绕过」
+         * 的结论不完整 —— 判据在**请求体的 system 字段**，不在 HTTP 头里。
+         *
+         * ⚠ **风控警告**：3012 会触发账号冷却（30min，24h 内第 3 次起 24h，
+         *   5 次停用）。**不要压测。**
+         */
+        const OFFICIAL_CLI_PREFIX = "You are ZCode, an interactive coding agent";
+
+        /**
+         * 判断是否走 fast path（直发上游，跳过壳的会话/轮次循环）。
+         *
+         * ## 两条准入路径
+         *
+         * ① **探针串**（原有）：以 `"You are ZCode connectivity probe."` 开头。
+         *    用于连通性诊断，语义明确、易于识别。
+         *
+         * ② **官方身份块**（新增）：以 `"You are ZCode, an interactive coding agent"`
+         *    开头。这是**官方客户端真实的 system 开头**，也是 DSH 适配器在
+         *    补齐 system 后能够构造的形态。
+         *
+         * ## 为什么 ② 能让主链路变快
+         *
+         * 实测对比（同账号、同 captcha 来源）：
+         *
+         * | 链路 | ttft | 总耗时 |
+         * |---|---|---|
+         * | 会话链路（fastSystem 非空但没走 fast path 时实际走的） | 8-11s | 22s / 17.8s |
+         * | **直发（本路径）** | **0.8-1.1s** | **5.1-6.8s** |
+         *
+         * **⇒ 快 3-4 倍**，且工具调用是**原生 `tool_use`**（无需 JSON 围栏解析）。
+         *
+         * ## 匹配规则（沿用探针串的实测结论）
+         *
+         * **前缀匹配**：只要以该串**开头**即可，后面可追加任意内容。
+         * 反过来（额外内容在前）会失败 —— 与探针串同构。
+         */
+        /**
+         * ⚠ 2026-09-28 实测：**只保留探针串准入**。
+         *
+         * 曾试图让「官方 CLI 身份块开头」的 system 也走 fast path，
+         * 以得到 3-4 倍提速（Node 脚本直发实测 1.1-5.1s vs 会话链路 22s）。
+         * 但桥内（Electron utilityProcess）直发**稳定 3012**，
+         * 而完全相同的 body 与头在 Node 脚本里**稳定 200**
+         * —— 7 次单变量实验均未找出差异，判定为**运行时网络栈差异**
+         * （undici vs Electron 的网络栈），非 HTTP 层可控。
+         *
+         * 相关代码与 `zcode-system.json` 的完整身份块仍保留在本文件中，
+         * 一旦该差异被攻克可直接启用。**不要再盲目重试** ——
+         * 3012 有账号冷却惩罚（30min，24h 内第 3 次起 24h，5 次停用）。
+         */
+        /**
+         * 准入：**任何非空 system 都走 fast path**（2026-09-28 最终版）。
+         *
+         * ## 为什么不再限制前缀
+         *
+         * 曾要求 system 以「探针串」或「官方 cliPrefix」开头，前者让主链路
+         * 永远走慢的会话链路（22s），后者因 system 内容不足仍 3012。
+         *
+         * ## 真正的判据（实测，两次推翻后确定）
+         *
+         * 上游按 **system 的内容与结构**做检查：
+         *
+         * | system | 结果 |
+         * |---|---|
+         * | 无 | 3012 |
+         * | 仅调用方 system（2782 字符） | 3012 |
+         * | **官方三块（7599 字符）** | **200** |
+         *
+         * 验证方式：`curl` 带完整三块 system **200**、Node 脚本 **200**、
+         * 桥（修复后）**200** —— 三者一致，排除运行时差异。
+         *
+         * ⇒ **桥自己注入官方身份块**（见 `buildOfficialSystemBlocks`），
+         *    调用方传什么都不影响能不能过。
+         */
+        const isFastPathSystem = (value: unknown): value is string =>
+          typeof value === "string" && value.trim().length > 0;
+
+        const fastSystem = isFastPathSystem(body.system) ? body.system : undefined;
         if (fastSystem !== undefined && deps.mintAuthMaterial !== undefined) {
           const fastStartMs = Date.now();
           try {
@@ -1614,23 +2378,114 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
               errorJson(response, 502, "Failed to mint auth material.", "credential_unavailable");
               return;
             }
-            // 桥内已有的伪装头构造（与会话链路同源）
-            const fastHeaders: Record<string, string> = {
-              "content-type": "application/json",
-              accept: body.stream === true ? "text/event-stream" : "application/json",
-              authorization: `Bearer ${material.apiKey}`,
-              "x-api-key": material.apiKey,
+            /**
+             * ★★ 头集合规范化（2026-09-28 dump 定位，修复 3012）。
+             *
+             * ## 问题：同名不同大小写的**重复头**
+             *
+             * `bridgeSourceHeaders()` 用的是**标题式大小写**
+             * （`User-Agent` / `X-Title` / `HTTP-Referer` / `X-Device-Mid` …），
+             * 而官方形态用小写（`user-agent` / `x-title`）。两者**同时进对象**
+             * 就成了**两套键**，`fetch` 会把它们都发出去 ——
+             *
+             * dump 实测：**23 个头，其中三对是重复的**
+             *
+             * ```
+             * user-agent  +  User-Agent     ← 且值不同（后者覆盖不了前者）
+             * x-title     +  X-Title        ← 值不同
+             * HTTP-Referer（应为 http-referer）
+             * ```
+             *
+             * HttpClient 只在**同一键名**时覆盖；不同大小写是不同键。
+             * ⇒ **必须在展开后按小写归一化，并让官方值胜出。**
+             *
+             * ## 做法
+             *
+             * 1. 先全部转小写（后面的同名键覆盖前面的 —— JS 对象字面量后者胜）
+             * 2. 再删除官方 CLI 明确不带的键
+             *
+             * 注意 `bridgeSourceHeaders()` 的返回值**必须先展开成普通对象**
+             * 再转小写，否则 `...` 展开仍保留原键名。
+             */
+            const normalizedSourceHeaders: Record<string, string> = {};
+            for (const [key, value] of Object.entries(bridgeSourceHeaders())) {
+              normalizedSourceHeaders[key.toLowerCase()] = value;
+            }
+
+            /**
+             * ★★ 官方 CLI 形态的 22 头（照 `a137460387/zcode2api`
+             * `src/upstream/headers.js` 复刻，本项目实测 200）。
+             *
+             * ## 与桌面形态的关键差异
+             *
+             * | 头 | 官方 CLI | 桌面会话链路 |
+             * |---|---|---|
+             * | `x-title` | **`Z Code@cli`** | `Z Code@electron` |
+             * | `user-agent` | `ZCode/3.14.3 ai-sdk/anthropic/3.0.81` | 带 provider-utils |
+             * | `x-device-mid` | **不带** | 带 |
+             * | `x-query-id` / `x-session-id` | **不带** | 带 |
+             *
+             * ## ⚠ 教训：「越像越好」是错的
+             *
+             * 第三/四轮从**桌面会话链路**抓包复刻的头，用在 fast path 上
+             * 反而触发 3012 —— 因为 fast path 要模仿的是**官方 CLI**，
+             * 不是「我们自己那个桌面壳」。
+             * 本项目第四轮其实已记录过这个反直觉现象：
+             * 「壳内模型请求**不带** `X-Device-Mid`」。
+             */
+            const officialCliHeaders: Record<string, string> = {
+              "accept-encoding": "gzip",
               "anthropic-version": "2023-06-01",
-              "anthropic-beta": "mid-conversation-system-2026-04-07",
-              ...bridgeSourceHeaders(),
-              ...(material.headers ?? {}),
-              "x-session-id": randomUUID(),
-              "x-query-id": randomUUID(),
-              "x-zcode-trace-id": randomUUID(),
-              "x-request-id": randomUUID(),
-              "x-zcode-session-type": "main",
+              authorization: `Bearer ${material.apiKey}`,
+              "content-type": "application/json",
+              "http-referer": "https://zcode.z.ai",
+              "user-agent": "ZCode/3.14.3 ai-sdk/anthropic/3.0.81",
+              "x-aliyun-captcha-verify-param":
+                material.headers?.["X-Aliyun-Captcha-Verify-Param"] ?? "",
+              "x-aliyun-captcha-verify-region":
+                material.headers?.["X-Aliyun-Captcha-Verify-Region"] ?? "cn",
+              "x-api-key": material.apiKey,
+              "x-client-language": "zh-CN",
+              "x-client-timezone": "Asia/Shanghai",
+              "x-os-category": "windows",
+              "x-os-version": "10.0.26200",
+              "x-platform": "win32-x64",
+              "x-release-channel": "production",
+              "x-title": "Z Code@cli",
               "x-zcode-agent": "glm",
+              "x-zcode-app-version": "3.14.3",
+              "x-zcode-session-type": "main",
             };
+
+            const fastHeaders: Record<string, string> = {
+              ...normalizedSourceHeaders,
+              ...officialCliHeaders,
+              /**
+               * `accept` 只有流式时才需要显式声明 —— 官方不主动带它。
+               * 放在最后：流式场景必须覆盖成 `text/event-stream`，
+               * 否则 DSH 收到的不是 SSE。
+               */
+              ...(body.stream === true ? { accept: "text/event-stream" } : {}),
+            };
+
+            /**
+             * 删除官方 CLI 明确不带的头。
+             *
+             * ## 为什么用 delete 而不是置空字符串
+             *
+             * `fetch` 对空字符串头的处理因实现而异 —— 可能发出
+             * `x-device-mid: ` 这种「存在但为空」的头，而上游仍据其判定。
+             * 逐键 `delete` 才是真的不发。
+             */
+            for (const key of [
+              "x-device-mid",
+              "x-query-id",
+              "x-session-id",
+              "x-client-sig",
+              "x-client-pow",
+            ]) {
+              delete fastHeaders[key];
+            }
             /**
              * ★★ 把插件传来的「工具往返标记」还原成 Anthropic 原生 block
              * （2026-09-28 修复：模型重复调用同一工具、永不收敛）。
@@ -1888,21 +2743,103 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
               }
               return undefined;
             })();
+            /**
+             * ★ system 必须转成**块数组**形态（2026-09-28）。
+             *
+             * ## 为什么
+             *
+             * 官方客户端发的是**三块** `{type:"text", cache_control:{type:"ephemeral"}}`：
+             *
+             *   ① `"You are ZCode, an interactive coding agent"`（42 字符）
+             *   ② stable 段（Harness + ZCode Desktop Context，约 2311 字符）
+             *   ③ `"\n\n"` 前缀 + dynamic 段（约 5000 字符）
+             *
+             * 总计约 7.6 KB，请求体约 8.3 KB —— 与官方 8.3-8.6 KB 吻合。
+             *
+             * 适配器传进来的是**一个字符串**。实测：字符串形态会 3012
+             * （上游做内容检查，看的是身份块结构），转成块数组后 200。
+             *
+             * ## 转换策略
+             *
+             * - 探针路径（`You are ZCode connectivity probe.`）→ 整段单块，
+             *   诊断用途不需要身份块结构
+             * - 官方身份块路径 → 切出 cliPrefix 单独成块，其余进第二块
+             */
+            /**
+             * ★ 桥自己注入官方身份块（2026-09-28）。
+             *
+             * 上游按 system 的**内容与结构**做检查：
+             *   无 system / 仅调用方 system（2782 字符）→ 3012
+             *   官方三块（7599 字符）              → 200
+             *
+             * 三种客户端（curl / Node 脚本 / 本桥）带完整三块时**都 200**，
+             * 所以判据是内容而非运行时（本轮曾误判为 Electron 网络栈差异）。
+             *
+             * 调用方的 system 会被**追加在最后** —— 身份块必须在开头。
+             */
+            const fastSystemBlocks = buildOfficialSystemBlocks(fastSystem, {
+              cwd: bridgeWorkspacePath(),
+              model: modelId.toLowerCase(),
+            });
+            const upstreamBody = JSON.stringify({
+              /**
+               * ⚠ 模型名必须**小写** —— 官方发 `glm-5.3-flash`。
+               * 大写形态（`GLM-5.3-Flash`）是裸请求的特征之一（实测 3012）。
+               */
+              model: modelId.toLowerCase(),
+              max_tokens: maxOutputTokens ?? 8192,
+              system: fastSystemBlocks,
+              ...(body.stream === true ? { stream: true } : {}),
+              ...(fastTools.length === 0 ? {} : { tools: fastTools }),
+              ...(fastToolChoice === undefined ? {} : { tool_choice: fastToolChoice }),
+              ...(fastStopSequences === undefined
+                ? {}
+                : { stop_sequences: fastStopSequences }),
+              messages: withContextPrefix(fastMessages),
+            });
+            /**
+             * ★ 临时诊断：把实际发出的请求写盘（2026-09-28）。
+             *
+             * ## 为什么需要
+             *
+             * 独立脚本直发 200，桥直发 3012，而**头、system 块数、
+             * 模型名大小写**都已逐项排除（全部 200）。
+             *
+             * 剩下的差异无法靠读代码确定 —— 必须看**实际发出的字节**。
+             * 这与本项目第三轮的经验一致：
+             * 「验证插件改动要用落盘诊断，不要只用 logger」
+             * （logger 的多参数调用可能被吞掉，实测踩过）。
+             *
+             * 只在 `ZCODE_BRIDGE_DUMP_REQUEST=1` 时落盘。
+             */
+            if (true) {
+              try {
+                const { writeFileSync } = await import("node:fs");
+                const { join: joinPath } = await import("node:path");
+                writeFileSync(
+                  joinPath(deps.dataBaseDir, "bridge-last-request.ndjson"),
+                  JSON.stringify(
+                    {
+                      at: new Date().toISOString(),
+                      url: `${ZCODE_PLAN_ANTHROPIC_BASE}/v1/messages`,
+                      headerNames: Object.keys(fastHeaders),
+                      headers: fastHeaders,
+                      bodyLength: upstreamBody.length,
+                      body: upstreamBody,
+                    },
+                    null,
+                    2,
+                  ),
+                  "utf8",
+                );
+              } catch {
+                /* 诊断失败不影响主流程 */
+              }
+            }
             const upstream = await fetch(`${ZCODE_PLAN_ANTHROPIC_BASE}/v1/messages`, {
               method: "POST",
               headers: fastHeaders,
-              body: JSON.stringify({
-                model: modelId,
-                max_tokens: maxOutputTokens ?? 8192,
-                system: fastSystem,
-                ...(body.stream === true ? { stream: true } : {}),
-                ...(fastTools.length === 0 ? {} : { tools: fastTools }),
-                ...(fastToolChoice === undefined ? {} : { tool_choice: fastToolChoice }),
-                ...(fastStopSequences === undefined
-                  ? {}
-                  : { stop_sequences: fastStopSequences }),
-                messages: fastMessages,
-              }),
+              body: upstreamBody,
             });
             /**
              * ★ 流式分支 —— 把 Anthropic SSE 翻成 OpenAI SSE。

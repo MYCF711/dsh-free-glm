@@ -36,6 +36,14 @@ import { PROVIDER } from "./product.js";
 import { ModelVisibility } from "./model-visibility.js";
 import { probeBridge, resolveBridgeEndpoint, resolveLiveBridgeEndpoint } from "./bridge-endpoint.js";
 import {
+  fetchBilling,
+  requestClaim,
+  requestLogin,
+  type BillingData,
+  type ClaimData,
+} from "./bridge-ops.js";
+import { createQuotaGuard, type QuotaGuard } from "./quota-guard.js";
+import {
   installInstanceLifecycleHooks,
   killOwnedInstance,
   spawnZCodeInstance,
@@ -413,6 +421,15 @@ export const inject = ["llm"];
 
 /** 模块级持有适配器实例（便于将来加 RPC/诊断端点时取回）。 */
 let registeredAdapter: ZCodeBridgeAdapter | undefined;
+
+/**
+ * 模块级持有额度守卫（2026-09-28 新增）。
+ *
+ * 用途：让「登录命令」在登录完成后能**立刻补跑一次检索领取** ——
+ * 用户刚授权完，正是最该看一眼有没有新额度可领的时刻，
+ * 不必等 20 分钟后的定时周期。
+ */
+let registeredQuotaGuard: QuotaGuard | undefined;
 
 /** 取回已注册的适配器实例（未注册时 undefined）。 */
 export function getRegisteredZCodeBridgeAdapter(): ZCodeBridgeAdapter | undefined {
@@ -815,7 +832,281 @@ export async function apply(ctx: Context): Promise<void> {
   });
 
   registeredAdapter = adapter;
+
+  /**
+   * ★ 每日额度守卫（2026-09-28 新增）。
+   *
+   * ## 解决什么
+   *
+   * 用户诉求：「时刻检索每日随机派发的大额额度，自动领取」。
+   *
+   * ## 为什么「检索」是必要的（实测依据）
+   *
+   * 服务端不下推额度。ZCode 左下角那张卡片读的是 `GET /billing/preview`，
+   * 而它的内容**依赖客户端活跃信号**：
+   *
+   * ```
+   * 补 POST /event/report {app_launch, app_daily_active} 之前：
+   *   preview → {"code":0,"data":{"plans":[]}}            ← 空
+   * 补之后：
+   *   preview → {"plans":[{plan_id:"zcode-v3-start-plan-trust-0928",...}]}
+   * ```
+   *
+   * **⇒「随机派发」= 服务端按活跃信号决定给不给。**
+   * 所以「时刻检索」= 定期补活跃信号 + 查 preview + 有就领。
+   *
+   * ## 安全性（已实测）
+   *
+   * - **幂等**：已领时返回 `code:1003`，连调 3 次结果一致且**不消耗额度**
+   * - 间隔 20 分钟（一天 72 次），远低于第三方提到的 WAF 阈值
+   * - **串行执行**（递归 setTimeout），避免并发 mint 抢 captcha
+   *
+   * 关闭：`ZCODE_QUOTA_GUARD_DISABLED=1`
+   * 调间隔：`ZCODE_QUOTA_GUARD_INTERVAL_MS=600000`
+   */
+  const quotaGuard = createQuotaGuard({
+    log: {
+      info: (message: string) => ctx.logger?.info?.(message),
+      warn: (message: string) => ctx.logger?.warn?.(message),
+    },
+  });
+  ctx.effect(() => () => {
+    quotaGuard.stop();
+  });
+  registeredQuotaGuard = quotaGuard;
+
+  /**
+   * ★ 注册斜杠命令（2026-09-28 新增）—— 这才是「用户点一下」的正确载体。
+   *
+   * ## 为什么用命令而不是工具
+   *
+   * 命令**由用户发起**（聊天框打 `/zcode-login`），结果直接渲染、
+   * **不进模型上下文**（`dsh-commands` README 原文：「不会把命令或结果
+   * 变成模型消息」）。
+   *
+   * 这对登录尤其重要 —— 若做成工具：
+   * - 模型可能「假装已登录」（它只是调了个函数，并不知道浏览器里发生了什么）
+   * - 登录结果会污染对话上下文
+   *
+   * 而工具（`ctx.tools.register`）只在想让模型**自主**查额度时才需要，
+   * 本版先不做，避免模型乱调。
+   *
+   * ## ⚠ 用 `ctx.get('commands')` 而不是静态 `inject`
+   *
+   * 本项目踩过这个坑：静态 `inject` 会让插件在**缺少该服务**的 profile 里
+   * **永久 pending**（headless profile 可能没有 commands 服务）。
+   * 而 `ctx.get()` 拿不到时返回 undefined（**不抛错**），运行时空值检查即可。
+   *
+   * 参考实现：`dsh-kvmem-image-gate/lib/index.js:96-97` 就是这个写法。
+   */
+  registerSlashCommands(ctx);
+
   ctx.logger?.info?.(`[zcode-bridge] provider "${PROVIDER}" 已注册（端口从桥发现文件读取）`);
+}
+
+/** 命令处理器返回值的形状（与 `dsh-commands` 的 `CommandResult` 对齐）。 */
+type SlashCommandResult = { kind: "success"; text?: string } | { kind: "error"; text: string };
+
+/** 命令调用的上下文（只取我们需要的字段）。 */
+interface SlashCommandInvocation {
+  readonly rawInput?: string;
+  readonly signal?: AbortSignal;
+}
+
+/** `CommandRuntime` 的最小形状（避免 import 它的类型 —— 该包可能不在所有 profile 里）。 */
+interface MinimalCommandRuntime {
+  register(definition: {
+    name: string;
+    description: string;
+    input?: { hint: string };
+    handler: (invocation: SlashCommandInvocation) => SlashCommandResult | Promise<SlashCommandResult>;
+  }): () => void;
+}
+
+/** 把额度数字格式化成易读串。 */
+function formatUnits(value: number | null | undefined): string {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "未知";
+  if (value >= 100_000_000) return `${(value / 100_000_000).toFixed(2)} 亿`;
+  if (value >= 10_000) return `${(value / 10_000).toFixed(1)} 万`;
+  return String(value);
+}
+
+/**
+ * 查额度并渲染成人可读的多行文本。
+ *
+ * 抽出来是因为 `/zcode-quota` 命令与登录后的自动检索都要用。
+ */
+async function renderBilling(): Promise<SlashCommandResult> {
+  const result = await fetchBilling();
+  if (!result.ok) {
+    return { kind: "error", text: `查额度失败：${result.error ?? "未知原因"}` };
+  }
+  const b: BillingData | undefined = result.data;
+  const periodLabel =
+    b?.period === "one_time"
+      ? "活动赠送（会过期）"
+      : b?.period === "daily"
+        ? "每日刷新（订阅）"
+        : b?.period ?? "未知";
+  const lines = [
+    `套餐：${b?.planName ?? "（无活动）"}`,
+    `模型：${b?.modelName ?? "未知"}`,
+    `周期：${periodLabel}`,
+    `总额：${formatUnits(b?.totalUnits)}   已用：${formatUnits(b?.usedUnits)}`,
+    `剩余：${formatUnits(b?.remainingUnits)}`,
+    b?.expiresAtLocal !== null && b?.expiresAtLocal !== undefined
+      ? `到期：${b.expiresAtLocal}`
+      : "到期：未知",
+  ];
+  return { kind: "success", text: lines.join("\n") };
+}
+
+/**
+ * 注册三个命令：登录 / 查额度 / 领额度。
+ *
+ * 命令名规则（`dsh-commands` 契约）：**不带斜杠、小写**，
+ * 只允许字母数字 `_` `-`。用户实际输入时加 `/`。
+ */
+function registerSlashCommands(ctx: Context): void {
+  const commands = ctx.get("commands") as MinimalCommandRuntime | undefined;
+  if (commands === undefined) {
+    ctx.logger?.warn?.(
+      "[zcode-bridge] 当前 profile 没有 commands 服务，斜杠命令未注册（provider 功能不受影响）",
+    );
+    return;
+  }
+
+  /** 包装：任何异常都转成可读 error，不让 command/done 以异常结算。 */
+  const guard = async (
+    run: () => Promise<SlashCommandResult>,
+  ): Promise<SlashCommandResult> => {
+    try {
+      return await run();
+    } catch (error) {
+      return { kind: "error", text: error instanceof Error ? error.message : String(error) };
+    }
+  };
+
+  ctx.effect(() => {
+    /**
+     * `/zcode-login` —— 登录 ZCode。
+     *
+     * 语义（**重要，要在提示文案里说清**）：
+     * 返回成功 **只代表授权页已弹出**，登录要等用户在浏览器里点「授权」。
+     * 实例侧有 5 分钟轮询（`OAuth polling flow started`），授权完成后
+     * 凭据自动写回。
+     *
+     * 登录后**立刻补跑一次额度检索** —— 用户刚授权完，正是最该看
+     * 有没有新额度可领的时刻，不必等 20 分钟的定时周期。
+     */
+    const d1 = commands.register({
+      name: "zcode-login",
+      description: "登录 ZCode（弹出浏览器授权页；授权完成后凭据自动写回）",
+      handler: async () =>
+        await guard(async () => {
+          const result = await requestLogin();
+          if (!result.ok) {
+            return { kind: "error", text: `触发登录失败：${result.error ?? "未知原因"}` };
+          }
+          /**
+           * ⚠ **不要**在这里 `void runOnce()`（2026-09-28 实测踩过）。
+           *
+           * ## 症状
+           *
+           * 命令报 `UNKNOWN: This operation was aborted`，而同结构的
+           * `/zcode-quota`、`/zcode-claim` 都正常。
+           *
+           * ## 根因
+           *
+           * `runOnce()` 会跑完整的检索周期（2 次 `fetchBilling` +
+           * `requestClaim`，含 captcha mint，耗时 2-30 秒）。
+           * 而**命令 handler 返回后，headless 模式的 DSH 进程即退出** ——
+           * 那个 fire-and-forget 的 promise 被掐断，abort 冒泡成命令错误。
+           *
+           * ## 正确做法
+           *
+           * 登录后的补跑检索**由 quota-guard 自己的定时器负责**
+           * （`createQuotaGuard` 已在 `apply()` 里启动，首轮延迟 2 分钟）。
+           * 用户如果不想等，直接调 `/zcode-claim` 即可 —— 那是同步等待的。
+           *
+           * ## 教训（通用）
+           *
+           * **命令 handler 里不要留未 await 的后台 promise** ——
+           * 调用方（尤其是短命的 headless 进程）可能在它完成前就结束，
+           * 结果是「命令看起来失败了，但其实副作用可能只做了一半」。
+           */
+          return {
+            kind: "success",
+            text: [
+              "已请求 ZCode 弹出授权页，请在浏览器里完成登录并点「授权」。",
+              "",
+              "授权完成后凭据会自动写回，无需其他操作。",
+              "之后可用 /zcode-quota 查看额度、/zcode-claim 领取派发额度。",
+              "",
+              "（登录状态由 5 分钟轮询自动确认；本命令返回不代表已登录）",
+            ].join("\n"),
+          };
+        }),
+    });
+
+    /** `/zcode-quota` —— 查额度。 */
+    const d2 = commands.register({
+      name: "zcode-quota",
+      description: "查看 ZCode 免费额度（剩余量 / 到期时间 / 一次性还是每日）",
+      handler: async () => await guard(renderBilling),
+    });
+
+    /**
+     * `/zcode-claim` —— 领取派发额度（手动兜底）。
+     *
+     * 定时任务已在 `createQuotaGuard` 里自动跑；本命令用于
+     * 「不想等，现在就试一次」。
+     */
+    const d3 = commands.register({
+      name: "zcode-claim",
+      description: "立刻检索并领取 ZCode 派发的额度（定时任务之外的兜底手段）",
+      handler: async () =>
+        await guard(async () => {
+          const result = await requestClaim();
+          if (!result.ok) {
+            return { kind: "error", text: `领取失败：${result.error ?? "未知原因"}` };
+          }
+          const data: ClaimData | undefined = result.data;
+          const discovered = data?.discoveredPlans ?? [];
+          const newlyClaimed = (data?.results ?? []).filter(
+            (r) => r.ok === true && r.alreadyClaimed !== true,
+          );
+          const lines = [
+            discovered.length === 0
+              ? "未发现可领的派发额度（服务端当前没有投放）。"
+              : `发现 ${discovered.length} 个 plan：${discovered.join(", ")}`,
+            newlyClaimed.length > 0
+              ? `★ 新领取成功：${newlyClaimed.map((r) => r.planId ?? "?").join(", ")}`
+              : "全部已领取过（幂等，无新增）。",
+          ];
+          // 领完补一次额度展示，让用户看到最新余额
+          const after = await fetchBilling();
+          if (after.ok && after.data !== undefined) {
+            lines.push(
+              "",
+              `当前剩余：${formatUnits(after.data.remainingUnits)}`,
+              `套餐：${after.data.planName ?? "无"}（${after.data.expiresAtLocal ?? "?"} 到期）`,
+            );
+          }
+          return { kind: "success", text: lines.join("\n") };
+        }),
+    });
+
+    return () => {
+      d1();
+      d2();
+      d3();
+    };
+  });
+
+  ctx.logger?.info?.(
+    "[zcode-bridge] 已注册斜杠命令：/zcode-login /zcode-quota /zcode-claim",
+  );
 }
 
 /**
