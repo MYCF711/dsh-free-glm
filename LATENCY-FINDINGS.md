@@ -2367,198 +2367,308 @@ text       「…autoglm 全局命令尚未注册。按技能流程，先完成�
 
 ---
 
-## 二十九、优化边界的穷尽（v0.4.1，2026-09-27 第七轮，全部实测）
+## 三十一、★ 3012 的真正根因：system 身份块（2026-09-28，两次推翻后的最终结论）
 
-### 29.1 目标
+### 结论
 
-「**彻底稳定**原生速度」—— 即把延迟的不确定性消掉。
+**3012 的判据是请求体的 `system` 字段内容，不是 HTTP 头、不是运行时。**
 
-### 29.2 瓶颈的精确定位（分段计时，v0.4.0 起可观测）
+实测对照（同账号、同 captcha 来源）：
 
-快速路径的 `ttft`（首字节前）呈**离散跳变**，`gen`（生成）高度稳定：
-
-```
-total= 2831ms  ttft= 1483ms  gen= 1348ms  deltas= 71
-total= 7059ms  ttft= 4906ms  gen= 2153ms  deltas= 42
-total=10062ms  ttft= 8997ms  gen= 1065ms  deltas= 71
-total=14157ms  ttft=12080ms  gen= 2077ms  deltas=111
-total=27198ms  ttft=23618ms  gen= 3580ms  deltas=187
-```
-
-`ttft` 实测档位：**1.5 / 4.3 / 4.9 / 8.8 / 9.0 / 9.3 / 12.1 / 23.6 秒**
-`gen` 始终 **1-5 秒**（与生成量线性，约 46 事件/秒）
-
-**⇒ 慢在「上游排队」，不在桥、不在生成。**
-
-### 29.3 逐项优化假设的实测结果
-
-| # | 假设 | 实测 | 结论 |
-|---|---|---|---|
-| 1 | 材料可缓存复用 | 复用 → **400 Bad Request** | ❌ 一次性凭据 |
-| 2 | mint 太慢 | 中位 **312ms**（201-397） | ❌ 已健康 |
-| 3 | 输入 token 多 | 25→7003 token（280 倍），耗时 4.0-7.7s | ❌ 非主因 |
-| 4 | 工具表大 | tools 0→50，耗时 5.8-5.9s | ❌ 非主因 |
-| 5 | 上下文历史长 | 216→1468 token，无正相关 | ❌ 非主因 |
-| 6 | 桥串行化 | 快速路径直连，无并发上限 | ❌ 非主因 |
-| 7 | **并发竞速** | **中位 14.8s vs 9.6s（更差）** | ❌ **上游惩罚并发** |
-| 8 | 复制新实例隔离 | **devtools 固定端口冲突**（bind 0x2740） | ❌ 无法复制 |
-
-**第 7 项尤其重要** —— 裸测时竞速 3 路是 3.6/4.0/5.1 秒（看似有效），
-但**在真实 DSH 会话里反而更慢**：
-
-```
-A 竞速关闭: 16.3 / 9.5 / 9.6 / 9.6s   中位 9.6s
-B 竞速 3 路: 9.3 / 8.9 / 14.8 / 17.2s 中位 14.8s
-```
-
-差异原因：裸测是「3 个独立相同请求」，真实会话是「DSH 多步循环」——
-竞速把**每一步**放大 3 倍，总并发过高触发上游排队惩罚。
-
-**⇒ 竞速代码保留但默认关闭**（`ZCODE_BRIDGE_RACE=N`，N≥2 才启用）。
-
-### 29.4 「彻底稳定」的可达定义（诚实版）
-
-| 维度 | 状态 |
+| system 内容 | 结果 |
 |---|---|
-| **功能稳定** | ✅ 4/4、6/6 全成功（多轮验收） |
-| **延迟档位** | ⚠️ 稳定在 **9-10 秒**（p50），p95 约 **17 秒** |
-| **能否压到 3-5 秒** | ❌ **客户端做不到** —— 上游排队不可控 |
+| 无 system | **3012** |
+| 仅调用方 system（2782 字符） | **3012** |
+| 官方三块身份块（7599 字符） | **200** |
 
-**实测验收（v0.4.1，无竞速）**：
+**三种客户端带完整三块时都 200**：
+```
+curl  + 三块  →  200
+Node  + 三块  →  200（重复 4 次）
+桥    + 三块  →  200（修复后）
+```
+
+### 官方身份块的结构（逐字，勿"优化"）
 
 ```
-[1] 17.7s  [2] 9.0s  [3] 10.1s  [4] 9.9s     中位 10.1s
+block[0] = "You are ZCode, an interactive coding agent"          (42 字符)
+block[1] = stableSections[0] + "\n\n" + stableSections[1]        (2311 字符)
+block[2] = "\n\n" + beforeEnv + "\n\n" + environment + "\n\n" + afterEnv  (~5000 字符)
+每块都带 cache_control: {type:"ephemeral"}
 ```
 
-### 29.5 本版新增能力（v0.4.0 / v0.4.1）
+**`environment` 段的关键**：官方源码注释声明
+「**cwd is never "unknown" in real traffic**」→ cwd 必须给真值。
 
-| 能力 | 说明 |
-|---|---|
-| 分段计时 | `ttftMs` / `genMs` / `deltaCount` / `mintMs` / `materialFromCache` 落日志 |
-| 材料缓存（默认关） | `ZCODE_BRIDGE_MATERIAL_CACHE=1` 启用；**已知会 400**，仅实验 |
-| 并发去重 | 同一瞬间的重复 mint 合并（对"一次性凭据"语义兼容） |
-| 并发竞速（默认关） | `ZCODE_BRIDGE_RACE=N`；**实测更慢**，仅实验 |
-| `-DataDir` 参数 | `start-headless.ps1` 支持换数据目录（复制实例测试用） |
-| A/B 开关 | `ZCODE_BRIDGE_NO_PROBE=1` 强制回落会话链路 |
+**首轮 user 的 `content` 必须是数组**，且前挂：
+```
+<system-reminder>As you answer the user's questions, you can use the following context:
+# currentDate
+Today's date is YYYY-MM-DD.
 
-### 29.6 给后来者的结论
+      IMPORTANT: this context may or may not be relevant to your tasks. ...</system-reminder>
+```
+（`outro` 前有 **6 个空格**；日期用**本地时区**）
 
-**优化空间已穷尽。** 剩下的延迟是上游排队，客户端唯一能做的是
-「不建 task、不跑 turn、真流式」—— 这三件**已全部做到**。
+### 资产位置（本项目）
 
-**不要再试**：材料缓存、并发竞速、复制实例（前两个会更差，第三个起不来）。
+```
+D:\DSH-WEB\ZCode-official\packages\desktop\src\host\zcode-official-identity.ts
+```
+含全部原文常量 + `buildOfficialSystemBlocks()`。
 
+**来源**：同类项目 `a137460387/zcode2api` 的
+`src/upstream/zcode-system.json`（从官方 3.11.2 bundle 反解）。
+
+### ★ 本轮我犯的错（值得记录）
+
+**第四轮我曾判定「3012 不可绕过」** —— 依据是「把 25 个头逐字段对齐仍 3012」。
+
+**这个推理有缺陷**：我验证了「头全对齐」失败，就跳到「所以不可绕过」，
+**没有试「请求体形态」这个变量**。
+
+**中途我还犯了第二个错**：桥直发失败时，看到 Node 脚本成功，
+就判定「Electron 网络栈差异」—— **后来 curl 实测 200，推翻了这个判断**。
+
+**教训**：
+- 「排除一个变量」≠「排除这一类变量」。头不行不代表 body 也不行。
+- **优先用能直接观测的手段**（curl 最小复现）而不是层层推理。
+
+### HTTP 头的正确形态（次要，但不是无关）
+
+官方 CLI 是 **22 个头**，与桌面会话形态**不同**：
+
+| 头 | 官方 CLI | 桌面会话 |
+|---|---|---|
+| `x-title` | `Z Code@cli` | `Z Code@electron` |
+| `user-agent` | `ZCode/3.14.3 ai-sdk/anthropic/3.0.81` | 带 provider-utils |
+| `x-device-mid` | **不带** | 带 |
+| `x-query-id` / `x-session-id` | **不带** | 带 |
+
+**⚠ 头名大小写必须统一** —— `bridgeSourceHeaders()` 用标题式
+（`User-Agent`），官方用小写（`user-agent`），两者同时存在会**发出两份**。
+
+### 风控警告（务必遵守）
+
+**3012 有账号冷却惩罚**：30min，24h 内第 3 次起 24h，5 次停用。
+**不要为了调试反复触发。** 本项目为此浪费过大量配额。
 
 ---
 
-## 三十、★★★ 死循环根因：工具往返历史必须以原生 block 回传（v0.5.x）
+## 三十二、★ 性能实测：ttft 是硬伤（2026-09-28）
 
-### 30.1 症状（用户截图）
-
-「打开 bilibili 网页」任务里模型**反复调用同一工具、永不收敛**：
+### 30 次样本的 ttft 分布
 
 ```
-tool_call  {"tool":"pwsh","arguments":{}}      ← 参数为空！
-tool_call  {"tool":"pwsh","arguments":{}}
-tool_call  {"tool":"pwsh","arguments":{}}
-深度求索中，用时 2 分 15 秒 …（继续）
+最小 1.4s   中位 4.5s   最大 14.4s   平均 5.3s
+
+档位分布：4s 档 15 次、7s 档 7 次、2s 档 2 次、其余零星
 ```
 
-### 30.2 诊断路径
-
-**第一步：确认桥侧没问题。** 直连打桥，按 `index` 累加流式分片：
+### 耗时分解（实测）
 
 ```
-[index=0]
-  id   = call_7f31e77c4a884548b8a48e49
-  name = pwsh
-  args = {"command":"Get-ChildItem -Path 'D:\\zcode-glm5.3f' ...","description":"..."}
-  args 长度 = 179   能否 JSON.parse: 是
+ttft        4.2-4.7s（稳定，与输出量无关）
+genMs       ∝ deltaCount（约 50 delta/s）
+mint        0.2-2.6s（captcha，壳 renderer 产出）
 ```
 
-⇒ **桥发出的 `tool_calls` 完全正确。**
-
-**第二步：确认 DSH 侧也没问题。** 真实会话里：
-
+**样本**：
 ```
-tool_call  pwsh({"command":"Get-Date","description":"获取当前系统时间"})   ← input 完整
-tool_result  2026年9月28日 7:26:19
-tool_call  pwsh({"command":"Get-Date","description":"Get current date and time"})  ← 又调
-tool_result  2026年9月28日 7:26:30
-tool_call  pwsh({"command":"Get-Date"})  × 5 次 …
-耗时 58.9 秒
+durationMs  ttftMs  genMs   deltaCount
+  2211      1591     620        71      ← 短回答 2.2s
+10027      4430    5597       174
+42424      4462   37962      1604
+62685      4155   58530      2910      ← 极长回答 62.7s
 ```
 
-⇒ **工具调用与结果都正常，问题是「调完不收敛」。**
+**⇒ 结论**：
+- **ttft 中位 4.5s** —— 这是与官方 API（~0.3-0.8s）的主要差距
+- 生成速率正常（50 delta/s）
+- **短回答可到 2.2s**，长回答必然慢（受输出量驱动）
 
-**第三步：定位到历史回传格式。** `{"tool":"pwsh","arguments":{}}`
-**不是 DSH 原生形状**（DSH 用 `input`）—— 那是插件 `tool-bridge.ts` 的**提示词桥遗留格式**。
+**⇒ 「达到 API 速度」在免费通道上不可达** —— ttft 的 4s 是上游固有成本。
 
-### 30.3 根因
+### DSH 端到端的真实构成
 
-旧实现把工具往返**降级成纯文本**塞进 user 消息：
+DSH 一次任务 = **N 次桥调用**（每轮 agent 循环一次）。
+实测：31.7s / 2 次调用 = 15.8s 每次（含工具执行与上下文组装）。
 
-```
-```json
-{"tool":"pwsh","arguments":{...}}
-```
-[tool-result pwsh] <结果>
-```
+**⇒ DSH 慢不等于桥慢**；要看单次桥调用，别看端到端总时长。
 
-**模型看到的只是「一段提及 pwsh 的文字」** —— 看不到「这是我的调用、这是它的结果」
-的**结构化配对**，于是无法判断「上次调用已完成」→ 只能再调一次。
+---
 
-更糟的是 `arguments:{}` 这个示范会让模型模仿出**空参数**调用。
+## 三十三、★ 性能真相：ttft 是唯一瓶颈，mint 与池化都不是（2026-09-28 实测修正）
 
-### 30.4 修法
+### 先纠正一个错误判断
 
-走 Anthropic 原生形状（快速路径本就直连 Anthropic 协议）：
+本轮中期曾据日志得出「mint 占 71-89% 耗时，池化能消除长尾」——
+**这是错的**。原因：那份日志样本取自 `mintMs` 字段**修正之前**的记录，
+而修正前的 `mintMs` 被写成 `durationMs - ttftMs`（即生成时间），
+与 `genMs` 完全重复。**拿旧字段值当现状，得出了错误结论。**
 
-```
-assistant: { content: [..., {type:"tool_use", id, name, input}] }
-user:      { content: [{type:"tool_result", tool_use_id, content}] }
-```
-
-`tool_use_id` **严格配对**是模型判断闭环的唯一依据。
-
-**承载方式**：用带长度前缀的 NUL 标记跨层传递（避免与正文冲突、避免无转义切分）：
+### 修正后的真实分段（修正 `mintMs` 日志后，连测 11 次）
 
 ```
-\u0000TOOL_USE\u0000<len>\n<payload>
-\u0000TOOL_RESULT\u0000<len>\n<payload>
+total 10.9s  mint 489ms  ttft  9.6s  gen 1.3s
+total 12.8s  mint 320ms  ttft 11.3s  gen 1.5s
+total 10.3s  mint 407ms  ttft  8.8s  gen 1.4s
+total  3.7s  mint 280ms  ttft  2.4s  gen 1.3s
+total 10.7s  mint 449ms  ttft  9.0s  gen 1.6s
+total  2.0s  mint 408ms  ttft  1.4s  gen 0.7s
+total  3.1s  mint 237ms  ttft  2.1s  gen 1.0s
+total  2.0s  mint 277ms  ttft  1.2s  gen 0.8s
+total 11.5s  mint 404ms  ttft 10.3s  gen 1.2s
+total  2.8s  mint 419ms  ttft  1.9s  gen 0.9s
+total  2.6s  mint 608ms  ttft  1.8s  gen 0.9s
 ```
 
-### 30.5 实测对比
+**⇒ `mint` 稳定在 237-608ms（占 3-13%），不是瓶颈。**
+**⇒ `ttft` 是 1.2-11.3s 的大幅波动，这才是全部长尾来源。**
 
-| | 修复前 | 修复后 |
+### ttft 波动与请求节奏无关（已排除）
+
+| 测试 | 结果 |
+|---|---|
+| 连续 3 次（间隔 3s） | 2.1s / 3.1s / 2.0s —— 都快 |
+| 间隔 30s 后 3 次 | **11.5s** / 2.9s / 2.7s —— 第 1 次慢，后两次快 |
+
+**⇒ 没有「排队惩罚」规律，就是上游随机调度。**
+
+**⇒ 桥的常态是 2-3 秒**（11 次里 6 次落在这个区间）。
+
+### 与第三方实现（TriDefender/zcode-api）的严谨 A/B
+
+同负载（同问题、间隔 300ms、交替发送）：
+
+| 场景 | TriDefender | 我们的桥 |
 |---|---|---|
-| 同任务 | 6 次重复调用、58.9s 不收敛 | **1 次调用、16.3s、正确回答** |
-| 参数 | `{}` 空 | 完整合法 JSON |
+| **固定开销**（max_tokens=20，各 10 次） | 2.37s | **2.25s** ← 我们略快 |
+| 短请求（max_tokens=100，15 轮） | 中位 4.69s | **中位 4.19s** ← 我们略快 |
+| 长文本（约 500 字） | 9.71s（102 tok/s） | 20.73s（31 tok/s） |
+| **可靠性** | **长文本 1/2 失败**（`Captcha config unavailable`） | **30/30 零失败** |
 
-**多步任务回归**：
+**长文本那 2.1 倍差距样本仅 2 次**，且随后单测直发 500 字耗 31.4s
+—— **属上游波动，非结构性差异**。
+
+### 对「是否该采用第三方实现」的结论
+
+**不值得替换。** 它的两个真优势与我们的应对：
+
+| 它的优势 | 数据 | 我们的状态 |
+|---|---|---|
+| 内存小 | 120 MB vs 我们 1277 MB | ✅ 插件自管理实例，**用户视角无感**（杀光后 15 秒自愈） |
+| 无依赖 | 不需 Electron | ✅ 同上（装完即用） |
+| captcha 池化 | 省 0.3-0.5s/请求 | ⚠️ **收益经实测有限**，不值得改核心路径 |
+| 3012 绕过 | 32/32 零 3012 | ✅ **我们已用 system 身份块解决**（curl/Node/桥三者都验证过 200） |
+
+**⇒ 没有值得移植的东西。**
+
+### 一个必须记录的坑：`mintMs` 日志字段曾算错
+
+修正前：
+```ts
+mintMs: Date.now() - fastStartMs - (firstUpstreamEventMs ?? 0)
+```
+这算的是「首个上游事件之后的时间」= **生成时间**，与相邻的 `genMs` 完全重复，
+**真正的 mint 耗时被覆盖**（日志里表现为 `"genMs":58530,"mintMs":58530`）。
+
+真实值在同一函数的更早处已算好（`const mintMs = Date.now() - fastStartMs`），
+修正为直接引用它。
+
+**教训**：字段名相同不代表语义相同。看到 `genMs === mintMs` 应当立刻怀疑
+其中一个算错了 —— 否则会基于错误数据做出错误的优化决策（本项目已发生一次）。
+
+---
+
+## 三十四、★ OAuth token 端点故障分析（2026-09-28）
+
+### 现象
 
 ```
-tool_call  pwsh 列出 .md 文件      → tool_result 41 个
-tool_call  pwsh 统计行数            → tool_result 15255
-text       「共 41 个 .md，合计 15,255 行」+ 分类表格
-turn_end   completed                （2 调用 / 2 结果 / 1 回答，完全配对）
+授权成功（回调 completed:true）→ POST /api/v1/oauth/token → HTTP 500
+                                     {"code":2007,"msg":"http error","logid":"..."}
 ```
 
-### 30.6 附录：子代理复核发现的另外 9 条缺陷
+**三次尝试完全一致**：11:00:05 / 11:14:32 / 13:47:40
+（每次都是**新 code**、参数完整：`provider`/`code`/`code_length`/`redirect_uri`/`state`）
 
-| # | 缺陷 | 严重度 | 修复 |
-|---|---|---|---|
-| 1 | **配对游标跨消息错位**（重开本 bug） | 高 | `pendingToolIds` 按消息重置 + 精确配对 |
-| 2 | 工具名分片拼成 `get__weather` | 中 | 改判据（全量重发 vs 续写） |
-| 3 | `releaseLock` 不关上游连接（白扣额度） | 高 | 补 `reader.cancel()` |
-| 4 | 标记无转义切分（正文含 NUL 可伪造 tool_result） | 中 | 改长度前缀 |
-| 5 | 竞速 controller 提前删除（落败请求漏杀） | 中 | 外层统一 abort |
-| 6 | 超时对流式无效（不传 signal 可无限挂起） | 中 | `AbortSignal.any` + extraSignal |
-| 7 | `tool_choice` 只认 `"none"` | 中 | 全量映射 + `stop_sequences` 透传 |
-| 8 | 流式 `finish_reason` 兜底不足 | 中 | 加 `blockToToolIndex.size` 判据 |
-| 9 | 诊断同步 IO + 路径与桥不一致 | 低 | 异步+节流 + 复用 `resolveDataBaseDir()` |
-| 10 | `readBody` 超限不清空、不可诊断 | 低 | `settled` 标记 + 上限可配 + 报实际大小 |
+### 决定性实验：用假 code 直测（排除参数问题）
 
-**第 1 条尤其关键** —— 它是本 bug 的**边界条件重现路径**：任一轮 tool-result 数少于
-tool-call 数（多工具并行时取消、部分失败、历史截断）就会让后续**所有配对整体错位**。
+```bash
+curl -X POST https://zcode.z.ai/api/v1/oauth/token \
+  -H 'Content-Type: application/json' \
+  -d '{"provider":"bigmodel","code":"TEST_INVALID...","codeLength":43,...}'
+# → 500 {"code":2007,"msg":"http error"}
+```
 
+**三种变体全 500**：假 code / 带 `app_version` / 换 `provider:zai`。
+
+**⇒ 端点对任何输入都返回 500/2007 —— 不是「code 无效」，是端点自身故障。**
+
+### `code:2007` 的官方定义
+
+| 来源 | 原文 |
+|---|---|
+| `zh-CN.ts:5700` | `"zcode.error.providerBusiness.2007": "上游服务暂时不可用，请稍后重试。"` |
+| `chatErrorAttributionEvidence.ts:48` | `"2007": "server_error"` |
+| `providerBusinessError.ts:14` | `\| 上游 HTTP 异常 \| 2007 \| 500 \| 可重试；刷新配额，勿本地扣额度 \|` |
+
+**⇒ 官方自己定义为「上游服务暂时不可用，可重试」。**
+
+### 历史对照：09-26 是成功的
+
+```
+2026-09-26.log:
+  [02:49:09] [oauthService][trace:OAuth polling flow completed] {"provider":"zai"}
+  [02:51:11] [oauthService][trace:OAuth polling flow completed] {"provider":"bigmodel"}
+  [14:15:57] [oauthService][trace:OAuth polling flow completed] {"provider":"bigmodel"}
+```
+
+**而当前 JWT 的 `iat` = `1790403356` = 2026-09-26 14:15:56** ——
+**与那次成功登录的时间戳逐秒吻合。**
+
+**⇒ 服务端在 09-26 之后出问题；我们的凭据正是那次成功签发的。**
+
+### ★ 关键结论：我们**不需要**重新登录
+
+解析现有 JWT（从桥的 mint 端点取）：
+
+```json
+{"user_id":"15951790100986814","token_version":0,"sub":"15951790100986814","iat":1790403356}
+```
+
+**没有 `exp` 字段 ⇒ 不过期。**
+
+实测：用它调 `billing/balance` → `code:0`，plan 正常返回（已稳定使用 **48 小时**）。
+
+### 官方自己也绕不过这个端点
+
+`packages/services/src/model-provider/bigmodelStartPlanZcodeJwt.ts:23-25` 注释原文：
+
+> zcode JWT 必须在 BigModel OAuth callback 阶段用授权码 body 落盘。
+> Start Plan 查询余额/运行时只消费已保存的 JWT 或 provider 副本，
+> **不再用 BigModel access_token 构造 provider+access_token body 临时兑换，
+> 避免 /oauth/token 400。**
+
+**⇒ 官方曾尝试「用 access_token 直接兑换」的替代路径，并因不稳定而废弃。**
+
+### 影响范围
+
+| 场景 | 是否受影响 |
+|---|---|
+| 用现有凭据调模型 | ❌ 不受影响（JWT 有效） |
+| 查额度 / 领额度 | ❌ 不受影响 |
+| **更换账号** | ✅ **受影响 —— 现在换号也登不进来** |
+| 凭据过期后重新登录 | ✅ 受影响（但当前无 exp，暂不涉及） |
+
+**⇒ 若目标是「换新账号拿 5 天 daily 试用窗口」，需等服务端 `oauth/token` 恢复。**
+
+### 排查方法学（可复用）
+
+1. **用假输入直测端点** —— 能区分「参数错」与「端点故障」。
+   本项目此前三次失败都怀疑参数，直测假 code 后立刻定性。
+2. **查官方错误码定义** —— `2007` 在开源版 i18n 里就有答案，
+   比看 HTTP 状态码信息量大得多。
+3. **找成功的历史记录** —— 日志里的 `OAuth polling flow completed` +
+   JWT 的 `iat` 时间戳能对齐，从而确定「端点何时开始坏」。
