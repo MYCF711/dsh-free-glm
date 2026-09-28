@@ -1,0 +1,916 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>ZCode Bridge 卡片搭建器</title>
+<style>
+  :root{--bg:#0f1115;--panel:#16181d;--canvas:#1c1f26;--item:#22262e;--hover:#2a2f39;
+    --stroke:rgba(255,255,255,.10);--stroke2:rgba(255,255,255,.18);
+    --text:#f9fafb;--dim:#adb2b8;--faint:#7c8188;
+    --accent:#4a9eff;--accent2:#2b6cb0;--ok:#3fb950;--danger:#f85149;
+    --r-sm:6px;--r-md:10px;--r-lg:14px;}
+  :root[data-light]{--bg:#f4f5f7;--panel:#fff;--canvas:#eceef1;--item:#fff;--hover:#f7f8fa;
+    --stroke:rgba(0,0,0,.09);--stroke2:rgba(0,0,0,.16);--text:#0f1115;--dim:#61666b;--faint:#8b9096;}
+  *{box-sizing:border-box}
+  body{margin:0;height:100vh;overflow:hidden;font:13px/1.5 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+    background:var(--bg);color:var(--text);display:grid;grid-template-columns:200px 1fr 250px;
+    grid-template-rows:44px 1fr;grid-template-areas:"h h h" "l c p"}
+  .head{grid-area:h;display:flex;align-items:center;gap:8px;padding:0 12px;border-bottom:1px solid var(--stroke);background:var(--panel)}
+  .head h1{font-size:13px;margin:0;font-weight:600}
+  .head .sp{flex:1}
+  button{font:inherit;font-size:12px;padding:5px 11px;border-radius:var(--r-sm);border:1px solid var(--stroke2);
+    background:transparent;color:inherit;cursor:pointer;white-space:nowrap}
+  button:hover{background:var(--hover)}
+  button.pri{background:var(--accent2);border-color:var(--accent2);color:#fff}
+  button.pri:hover{background:var(--accent);border-color:var(--accent)}
+  button.tiny{padding:2px 7px;font-size:11px}
+  button.dz{color:var(--danger);border-color:color-mix(in srgb,var(--danger) 40%,transparent)}
+
+  .lib{grid-area:l;border-right:1px solid var(--stroke);background:var(--panel);overflow-y:auto;padding:8px}
+  .lib h2{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);margin:10px 0 6px;font-weight:600}
+  .li{padding:7px 9px;border-radius:var(--r-sm);border:1px solid var(--stroke);background:var(--item);
+    margin-bottom:5px;cursor:grab;display:flex;align-items:center;gap:7px;font-size:12px;user-select:none}
+  .li:hover{background:var(--hover);border-color:var(--stroke2)}
+  .li:active{cursor:grabbing}
+  .li .ic{width:14px;text-align:center;opacity:.7}
+
+  .cw{grid-area:c;overflow-y:auto;padding:22px;display:flex;flex-direction:column;align-items:center;gap:14px;background:var(--canvas)}
+  .hint{color:var(--faint);font-size:12px;max-width:620px;text-align:center;line-height:1.7}
+  .card{width:100%;max-width:720px;background:var(--item);border:1px solid var(--stroke);
+    border-radius:var(--r-lg);padding:16px;display:flex;flex-direction:column;gap:10px}
+  .ch{display:flex;align-items:center;gap:8px}
+  .ct{font-size:16px;font-weight:600;margin:0}
+  .cs{font-size:11px;color:var(--faint);font-family:ui-monospace,monospace}
+  .ch .sp{flex:1}
+
+  .drop{display:flex;flex-direction:column;gap:6px;min-height:36px}
+  .drop>.empty{border:1px dashed var(--stroke2);border-radius:var(--r-md);padding:16px;text-align:center;color:var(--faint);font-size:12px}
+  .drop.over>.empty{border-color:var(--accent);color:var(--accent)}
+
+  /* padding 用 0：容器的 padding 区会让点击命中容器而不是里面的按钮（Bug 1）。
+     视觉留白改由 .hd 的负偏移 + 元素自身 margin 提供，命中区与视觉区一致。 */
+  .el{position:relative;display:flex;align-items:center;gap:6px;padding:0;border-radius:var(--r-md);
+    border:1px solid transparent;cursor:pointer}
+  .el:hover{border-color:var(--stroke2)}
+  /* 容器内的子元素：让它们能稳定接收点击（撑满自己的盒子，不被容器 padding 抢走） */
+  .drop>.el,.rowbox>.el,.colbox>.el{flex:0 0 auto;min-height:26px}
+  .el.sel{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 9%,transparent)}
+  .el:hover .hd,.el.sel .hd{opacity:1}
+  /* ★ pointer-events:none 很重要 —— 手柄只是视觉提示，若它能接收点击，
+     点在按钮左上角时会命中手柄而不是按钮，选中就会漂到别的元素上。 */
+  .el .hd{position:absolute;left:-2px;top:-2px;bottom:-2px;width:14px;display:flex;align-items:center;
+    justify-content:center;opacity:0;color:var(--faint);font-size:10px;cursor:grab;pointer-events:none}
+  /* ★ 删除按钮必须始终占据可点击的盒子（display:none 会让它 0×0，
+     真实浏览器里 getBoundingClientRect 全 0、永远点不到）。
+     改成常驻但默认透明，hover/选中时显形 —— 命中区始终在，点得着。
+     ★ 显形条件要同时满足两点，否则会出现「一排红叉」的视觉污染：
+       1) 用 `>` 而不是后代选择器 —— 否则容器被选中时，里面每个子元素的 × 一起冒出来
+       2) hover 要用 `:has(> .del)` 精确判定「鼠标就在本元素这一层」——
+          否则 hover 子元素时，外层容器的 × 也会亮（CSS :hover 会沿祖先链冒泡）
+     浏览器不支持 :has() 时自动退回「选中态显形 + hover 显形」（仍然可用）。 */
+  .el .del{position:absolute;right:-7px;top:-7px;width:17px;height:17px;border-radius:50%;padding:0;
+    display:flex;align-items:center;justify-content:center;font-size:11px;line-height:1;
+    background:var(--danger);border:none;color:#fff;cursor:pointer;z-index:3;
+    opacity:0;visibility:hidden;transition:opacity .12s}
+  .el.sel>.del{opacity:1;visibility:visible}
+  .el:hover>.del{opacity:1;visibility:visible}
+  @supports selector(:has(> *)){
+    .el:hover:not(:has(.el:hover))>.del{opacity:1;visibility:visible}
+    .el:hover:has(.el:hover)>.del{opacity:0;visibility:hidden}
+  }
+  .el.dg{opacity:.4}
+  .el.bf::before,.el.af::after{content:'';position:absolute;left:0;right:0;height:2px;background:var(--accent);z-index:5}
+  .el.bf::before{top:-4px}
+  .el.af::after{bottom:-4px}
+  .el.hot{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 14%,transparent)}
+
+  .r-b{padding:5px 12px;border-radius:var(--r-sm);border:1px solid var(--stroke2);background:transparent;
+    color:inherit;font-size:13px;cursor:default}
+  .r-b.pri{background:var(--accent2);border-color:var(--accent2);color:#fff}
+  .r-b.ton{background:var(--ok);border-color:var(--ok);color:#fff}
+  .r-b.toff{background:transparent;color:var(--dim)}
+  .r-seg{display:inline-flex;gap:2px;padding:3px;border-radius:var(--r-md);background:rgba(128,128,128,.16);font-size:12px}
+  .r-seg span{padding:4px 12px;border-radius:8px;cursor:pointer}
+  .r-seg span.on{background:var(--item);font-weight:500;box-shadow:0 1px 2px rgba(0,0,0,.15)}
+  .tabbar{display:flex;gap:0;border-bottom:1px solid var(--stroke);width:100%}
+  .tabbar span{padding:5px 2px 7px;margin-right:16px;font-size:13px;color:var(--dim);
+    border-bottom:2px solid transparent;cursor:pointer}
+  .tabbar span.on{color:var(--text);font-weight:600;border-bottom-color:var(--accent)}
+  /**
+   * Tab 内容面板（新增）。
+   *
+   * `display:flex;flex-direction:column` 让它像 col 一样堆叠内容；
+   * 最小高度让空面板也可见、可拖入（否则 0 高度时无法把组件拖进去）。
+   * 隐藏由内联 style 的 display:none 控制，不在这里做。
+   */
+  .r-panel{display:flex;flex-direction:column;gap:6px;width:100%;min-height:34px;
+    padding:8px 0;border-radius:var(--r-sm)}
+  .r-panel:empty,.r-panel>*{min-width:0}
+  .r-sw{width:36px;height:20px;border-radius:999px;padding:2px;background:rgba(128,128,128,.3);
+    display:flex;align-items:center}
+  .r-sw.on{background:var(--accent2);justify-content:flex-end}
+  .r-sw i{width:16px;height:16px;border-radius:50%;background:#fff;display:block}
+  .r-in{padding:4px 8px;border-radius:var(--r-sm);border:1px solid var(--stroke2);background:transparent;
+    color:inherit;font-size:13px}
+  .r-lb{font-size:13px;font-weight:500}
+  .r-ds{font-size:12px;color:var(--dim)}
+  .r-tx{font-size:13px}
+  .r-sec{font-size:14px;font-weight:600}
+  .r-kv{display:flex;justify-content:space-between;align-items:baseline;width:100%;font-size:13px}
+  .r-kv .k{color:var(--dim)}
+  .r-kv .v{font-variant-numeric:tabular-nums}
+  .r-li{display:flex;align-items:center;gap:10px;width:100%;padding:6px 0}
+  .r-li .m{display:flex;flex-direction:column;gap:1px;min-width:0;flex:1}
+  .r-li .m .n{font-size:14px}
+  .r-li .m .s{font-size:12px;color:var(--dim)}
+  .r-dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:none}
+  .r-dot.ok{background:var(--ok)}.r-dot.wn{background:#d29922}.r-dot.of{background:var(--faint)}
+  .r-pb{min-height:30px;padding:5px 12px;border-radius:16px;border:1px solid var(--stroke2);
+    background:transparent;color:inherit;font-size:12px;cursor:default;white-space:nowrap}
+  .r-acc{display:flex;align-items:center;gap:9px;padding:7px 9px;border-radius:var(--r-sm);
+    border:1px solid var(--stroke);background:var(--panel);font-size:12px;width:100%}
+  .r-acc .n{font-weight:500;min-width:70px}
+  .r-acc .bd{padding:1px 7px;border-radius:99px;font-size:11px;border:1px solid}
+  .r-acc .bd.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 45%,transparent)}
+  .r-acc .bd.wn{color:#d29922;border-color:color-mix(in srgb,#d29922 45%,transparent)}
+  .r-acc .bd.of{color:var(--faint);border-color:var(--stroke2)}
+  .r-acc .sp2{flex:1}
+  .r-acc .tk{font-variant-numeric:tabular-nums;color:var(--dim)}
+  .r-dvd{height:1px;background:var(--stroke);width:100%}
+  /* ★ 容器可命中区放大（2026-09-28 用户反馈「容器太小，拖不进去」）。
+     原来 min-height:32px + padding:2px —— 虚线框内实际只有约 28px 高，
+     鼠标要精确落在那一条窄带里才判「放进容器」，稍微偏一点就落到
+     「根级插入位」，表现就是「只能插在容器上方或下方」。
+     现在：min-height 提到 56px（约两个按钮高），padding 提到 8px，
+     并给空容器一个大号占位区，让「瞄准」不再是精细操作。 */
+  .rowbox{display:flex;flex-wrap:wrap;align-items:center;gap:8px;min-height:56px;padding:8px;
+    border:1px dashed rgba(128,128,128,.45);border-radius:var(--r-sm);width:100%}
+  .colbox{display:flex;flex-direction:column;gap:6px;width:100%;min-height:56px;padding:8px;
+    border:1px dashed rgba(128,128,128,.3);border-radius:var(--r-sm)}
+  /* 空容器/容器尾部的空白也要能接住拖放，且不能盖住子元素。
+     ★ 空容器时占位符撑满整个容器（flex:1），保证容器内**任何位置**都能接住；
+     有子元素时它缩到 26px，只是尾部的一小条缓冲。 */
+  .rowbox>.ph,.colbox>.ph{flex:1 1 auto;min-height:26px;display:flex;align-items:center;
+    justify-content:center;font-size:12px;color:var(--faint)}
+  /* 拖拽进行中时，给所有容器一个显眼的提示边框 —— 让用户看清"可以放这里" */
+  .rowbox.over,.colbox.over{border-color:var(--accent);border-style:solid;
+    background:color-mix(in srgb,var(--accent) 12%,transparent)}
+  body.dragging .rowbox,body.dragging .colbox{
+    border-color:color-mix(in srgb,var(--accent) 45%,transparent);
+    background:color-mix(in srgb,var(--accent) 5%,transparent)}
+  body.dragging .r-panel{outline:1px dashed color-mix(in srgb,var(--accent) 45%,transparent);
+    outline-offset:2px}
+  .ph{font-size:12px;color:var(--faint);padding:2px 6px}
+
+  .props{grid-area:p;border-left:1px solid var(--stroke);background:var(--panel);overflow-y:auto;padding:8px}
+  .props h2{font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--faint);margin:8px 0 6px;font-weight:600}
+  .pf{margin-bottom:9px}
+  .pf label{display:block;font-size:11px;color:var(--dim);margin-bottom:3px}
+  .pf input,.pf select,.pf textarea{width:100%;padding:4px 7px;border-radius:var(--r-sm);font:inherit;font-size:12px;
+    border:1px solid var(--stroke2);background:var(--item);color:inherit}
+  .pf textarea{height:52px;resize:vertical;font-family:ui-monospace,monospace}
+  .none{color:var(--faint);font-size:12px;text-align:center;padding:20px 0}
+
+  .md{position:fixed;inset:0;background:rgba(0,0,0,.55);display:none;align-items:center;justify-content:center;z-index:99}
+  .md.open{display:flex}
+  .md .bx{width:min(720px,92vw);max-height:86vh;overflow:auto;background:var(--panel);
+    border:1px solid var(--stroke2);border-radius:var(--r-lg);padding:16px;display:flex;flex-direction:column;gap:10px}
+  .md h2{margin:0;font-size:14px}
+  .md textarea{width:100%;height:280px;font-family:ui-monospace,Consolas,monospace;font-size:12px;padding:9px;
+    border-radius:var(--r-sm);border:1px solid var(--stroke2);background:var(--item);color:inherit;resize:vertical}
+  .md .rw{display:flex;gap:8px;justify-content:flex-end}
+</style>
+</head>
+<body>
+
+<div class="head">
+  <h1>卡片搭建器</h1>
+  <span style="color:var(--faint);font-size:11px">拖进来 · 点选中 · 右栏改 · 容器可嵌套 · Tab 可点着切</span>
+  <span class="sp"></span>
+  <button id="bLight">切浅色</button>
+  <button id="bPrev" class="pri">预览</button>
+  <button id="bExp">导出给我</button>
+</div>
+
+<div class="lib">
+  <h2>操作</h2>
+  <div class="li" data-k="btn"><span class="ic">▭</span>按钮</div>
+  <div class="li" data-k="toggle"><span class="ic">◉</span>开关按钮</div>
+  <h2>切换</h2>
+  <div class="li" data-k="tabbar"><span class="ic">▁</span>下划线 Tab</div>
+  <div class="li" data-k="tabpanel"><span class="ic">▢</span>Tab 内容面板</div>
+  <div class="li" data-k="segmented"><span class="ic">⊞</span>分段切换</div>
+  <h2>容器（可嵌套）</h2>
+  <div class="li" data-k="row"><span class="ic">☰</span>横排（一行多个）</div>
+  <div class="li" data-k="col"><span class="ic">▤</span>竖排容器</div>
+  <h2>文本</h2>
+  <div class="li" data-k="label"><span class="ic">T</span>字段标题</div>
+  <div class="li" data-k="desc"><span class="ic">t</span>说明文字</div>
+  <div class="li" data-k="section"><span class="ic">H</span>区块标题</div>
+  <div class="li" data-k="kv"><span class="ic">=</span>键值行</div>
+  <h2>其它</h2>
+  <div class="li" data-k="switch"><span class="ic">◉</span>开关</div>
+  <div class="li" data-k="input"><span class="ic">▭</span>输入框</div>
+  <div class="li" data-k="listitem"><span class="ic">▤</span>列表行</div>
+  <div class="li" data-k="statedot"><span class="ic">●</span>状态点</div>
+  <div class="li" data-k="accountrow"><span class="ic">▤</span>账号行</div>
+  <div class="li" data-k="divider"><span class="ic">—</span>分隔线</div>
+</div>
+
+<div class="cw">
+  <div class="hint">
+    这是 ZCode Bridge 卡片在 DSH 设置页里的样子。<br>
+    <b>把左侧组件拖进来</b>；拖进「横排容器」就是一行多个；<b>Tab 可以直接点着切</b>。
+  </div>
+  <div class="card">
+    <div class="ch">
+      <h2 class="ct" contenteditable="true" id="ctitle">ZCode Bridge (GLM free)</h2>
+      <span class="cs">zcode-bridge</span>
+      <span class="sp"></span>
+      <button class="r-b">编辑</button>
+    </div>
+    <div class="drop" id="root"></div>
+  </div>
+</div>
+
+<div class="props">
+  <h2>属性</h2>
+  <div class="none" id="pnone">未选中</div>
+  <div id="pf"></div>
+</div>
+
+<div class="md" id="modal">
+  <div class="bx">
+    <h2>导出 —— 把这个发我</h2>
+    <textarea id="out" readonly></textarea>
+    <div class="rw"><button id="bCopy">复制</button><button id="bClose">关闭</button></div>
+  </div>
+</div>
+
+<script>
+let seq = 0, els = [], selId = null, tabState = {};
+
+const DEF = {
+  btn:{text:"按钮",variant:"default"}, toggle:{text:"持续领取",on:true},
+  tabbar:{items:["模型","账号管理"],active:0,bind:"t1"},
+  /**
+   * 面板默认 idx=0。`bind` 在**拖入时由编辑器自动设成所属 tabbar 的 id**
+   * （见 `dropOn` 里的自动配套逻辑），所以这里的默认值只是兜底。
+   */
+  tabpanel:{bind:"t1",idx:0,children:[]},
+  segmented:{items:["模型","账号管理"],active:0},
+  row:{gap:8,children:[]}, col:{gap:6,children:[]},
+  label:{text:"字段标题"}, desc:{text:"说明文字"}, section:{text:"区块标题"},
+  kv:{k:"剩余额度",v:"3.0M / 5.0M"},
+  switch:{on:true,label:""}, input:{placeholder:"输入…",width:120},
+  listitem:{name:"GLM-5.3",sub:"检测于 今天",action:"重新检测"},
+  statedot:{tone:"ok",text:"已登录"},
+  accountrow:{name:"mylzscy4",status:"正常",tone:"ok",tokens:"3.0M"},
+  divider:{}
+};
+const FIELDS = {
+  btn:[{k:"text",t:"文字",ty:"text"},{k:"variant",t:"样式",ty:"sel",o:["default","primary"]}],
+  toggle:[{k:"text",t:"文字",ty:"text"},{k:"on",t:"默认开启",ty:"bool"}],
+  tabbar:[{k:"items",t:"Tab 项（逗号分隔）",ty:"list"},{k:"active",t:"默认激活",ty:"num"},
+          {k:"bind",t:"绑定名（与面板一致）",ty:"text"}],
+  tabpanel:[{k:"bind",t:"绑定名（与 Tab 一致）",ty:"text"},{k:"idx",t:"第几项（从 0 起）",ty:"num"}],
+  segmented:[{k:"items",t:"选项（逗号分隔）",ty:"list"},{k:"active",t:"默认选中",ty:"num"}],
+  row:[{k:"gap",t:"间距 px",ty:"num"}], col:[{k:"gap",t:"间距 px",ty:"num"}],
+  label:[{k:"text",t:"文字",ty:"text"}], desc:[{k:"text",t:"文字",ty:"area"}],
+  section:[{k:"text",t:"文字",ty:"text"}],
+  kv:[{k:"k",t:"左（标签）",ty:"text"},{k:"v",t:"右（数值）",ty:"text"}],
+  switch:[{k:"on",t:"开启",ty:"bool"},{k:"label",t:"标签",ty:"text"}],
+  input:[{k:"placeholder",t:"占位符",ty:"text"},{k:"width",t:"宽度 px",ty:"num"}],
+  listitem:[{k:"name",t:"主标题",ty:"text"},{k:"sub",t:"副信息",ty:"text"},{k:"action",t:"右侧按钮",ty:"text"}],
+  statedot:[{k:"text",t:"文字",ty:"text"},{k:"tone",t:"颜色",ty:"sel",o:["ok","wn","of"]}],
+  accountrow:[{k:"name",t:"账号名",ty:"text"},{k:"status",t:"状态",ty:"text"},
+              {k:"tone",t:"状态色",ty:"sel",o:["ok","wn","of"]},{k:"tokens",t:"token",ty:"text"}],
+  divider:[]
+};
+/**
+ * 可容纳子元素的组件。
+ *
+ * ⚠ `tabpanel` 也在这里 —— 它是容器，用户要把「模型」面板的内容
+ * 拖进去。漏加它的后果：拖进去的组件成了它的**兄弟**而不是子元素，
+ * 于是不受显隐控制、切换 tab 时永远显示。
+ */
+const CONTAINERS = new Set(["row","col","tabpanel"]);
+
+function esc(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+
+function renderEl(el){
+  const p = el.props, id = el.id;
+  /* ★ 修正（Bug 1 真正根因）：容器里装的必须是「带 .el 外壳的子元素」，
+     之前直接 map(renderEl) 只渲染了叶子内容，子元素根本没有 .el 外壳
+     → 子元素永远不可能被选中，点它只会命中容器的 .el。 */
+  const kids = (p.children||[]).map(shell).join("");
+  switch(el.kind){
+    case "btn": return `<button class="r-b ${p.variant==="primary"?"pri":""}" data-eid="${id}">${esc(p.text)}</button>`;
+    case "toggle": return `<button class="r-b ${p.on?"ton":"toff"}" data-eid="${id}">${esc(p.text)}</button>`;
+    case "tabbar": {
+      /**
+       * ★ 新增 `bind`（2026-09-28）—— 让 tab 能驱动 `tabpanel`。
+       *
+       * `bind` 为空时退回用自身 id 作键，行为与之前完全一致
+       * （不影响已有卡片）。
+       */
+      const key = p.bind || id;
+      const cur = tabState["tab:"+key] ?? p.active ?? 0;
+      return `<span class="tabbar" data-eid="${id}" data-bind="${esc(key)}">${p.items.map((s,i)=>
+        `<span class="${i===cur?"on":""}" data-tab="${id}" data-idx="${i}" data-tabkey="${esc(key)}">${
+          esc(s)}</span>`).join("")}</span>`;
+    }
+    /**
+     * ★★★ Tab 内容面板（新增）—— 让「切换 tab 时下面的内容跟着换」真正生效。
+     *
+     * ## 之前为什么点了没反应
+     *
+     * `tabbar` 只渲染它自己（下划线会动），但**没有任何机制去控制下面的
+     * 内容区** —— 两者是完全独立的组件。所以点 tab 只换下划线，
+     * 下面的内容当然纹丝不动。
+     *
+     * ## 怎么联动
+     *
+     * 引入 `tabpanel` 组件，它带一个 `bind` 属性（面板 id）。
+     * 同一个 `bind` 名下可以有**多个** tabpanel，各自有一个 `idx`：
+     *
+     *     tabbar   ──bind="t1"──>  tabState["tab:t1"] = 0|1|...
+     *     tabpanel ──bind="t1", idx=0──>  只在 tabState["tab:t1"]===0 时显示
+     *     tabpanel ──bind="t1", idx=1──>  只在 tabState["tab:t1"]===1 时显示
+     *
+     * 因为 `renderEl` 每次 `draw()` 都会重跑，所以只要 tabState 变了，
+     * 面板的显隐会**自动**跟着更新 —— 不需要额外的事件订阅。
+     *
+     * ## 与 tabbar 的关系
+     *
+     * `tabbar` 的切换逻辑**不用改**：它本来就把 idx 写进了
+     * `tabState["tab:"+id]`。这里只是让面板去**读**那个状态。
+     * 但为了让 tab 能驱动面板，tabbar 需要知道自己绑给谁 ——
+     * 用 `bind` 属性表达，见下面 `data-bind` 的写入。
+     */
+    case "tabpanel": {
+      const bind = p.bind || "default";
+      const cur = tabState["tab:"+bind] ?? 0;
+      const show = cur === (p.idx ?? 0);
+      /* 隐藏用 display:none —— 保留 DOM 但不占布局，切换时不会跳动 */
+      const style = show ? "" : "display:none";
+      /**
+       * ★ 空面板要**标明自己属于哪个 Tab**（2026-09-28 用户反馈）。
+       *
+       * 拖一个 Tab 进来会自动生成两个空面板，但它们长得一模一样 ——
+       * 用户看不出哪个对应「模型」、哪个对应「账号管理」，
+       * 也就不知道该往哪个里拖内容。
+       *
+       * 这里从 `bind` 指向的 tabbar 上查出该 idx 对应的文字，
+       * 显示成「模型面板 · 把内容拖进来」。
+       *
+       * ⚠ 绑不到时要**明确说出来**（见下）—— 否则用户只知道"面板空了"，
+       *   却不知道原因在哪，会以为是编辑器坏了。
+       */
+      const owner = findEl(bind);
+      const ownerItems = owner && Array.isArray(owner.props?.items) ? owner.props.items : [];
+      const label = ownerItems[p.idx ?? 0];
+      let hint;
+      if (label){
+        hint = `${label} 面板 · 把内容拖进来`;
+      } else if (!owner){
+        /* 绑定目标不存在 —— 说明 bind 改了但没对应 tabbar，或 tabbar 被删了 */
+        hint = `未绑定到 Tab（bind=${p.bind || "空"}）· 在右侧把「绑定名」改成某个 Tab 的 id`;
+      } else {
+        /* 绑到了 tabbar，但该 idx 超出它的项数 */
+        hint = `第 ${(p.idx ?? 0) + 1} 个面板（该 Tab 只有 ${ownerItems.length} 项）`;
+      }
+      return `<span class="r-panel" data-eid="${id}" style="${style}">${
+        kids || `<span class="ph">${esc(hint)}</span>`}</span>`;
+    }
+    case "segmented": {
+      const cur = tabState["seg:"+id] ?? p.active ?? 0;
+      return `<span class="r-seg" data-eid="${id}">${p.items.map((s,i)=>
+        `<span class="${i===cur?"on":""}" data-tab="${id}" data-idx="${i}" data-seg="1">${esc(s)}</span>`).join("")}</span>`;
+    }
+    case "row": return `<span class="rowbox" data-container="1" data-eid="${id}" style="gap:${p.gap}px">${
+      kids || `<span class="ph">拖按钮进来（一行多个）</span>`}</span>`;
+    case "col": return `<span class="colbox" data-container="1" data-eid="${id}" style="gap:${p.gap}px">${
+      kids || `<span class="ph">拖组件进来</span>`}</span>`;
+    case "label": return `<span class="r-lb" data-eid="${id}">${esc(p.text)}</span>`;
+    case "desc": return `<span class="r-ds" data-eid="${id}">${esc(p.text)}</span>`;
+    case "section": return `<span class="r-sec" data-eid="${id}">${esc(p.text)}</span>`;
+    case "kv": return `<span class="r-kv" data-eid="${id}"><span class="k">${esc(p.k)}</span><span class="v">${esc(p.v)}</span></span>`;
+    case "switch": return `<span data-eid="${id}" style="display:inline-flex;align-items:center;gap:7px">
+        <span class="r-sw ${p.on?"on":""}"><i></i></span>${p.label?`<span class="r-lb">${esc(p.label)}</span>`:""}</span>`;
+    case "input": return `<input class="r-in" data-eid="${id}" style="width:${p.width}px" placeholder="${esc(p.placeholder)}" readonly>`;
+    case "listitem": return `<span class="r-li" data-eid="${id}">
+        <span class="m"><span class="n">${esc(p.name)}</span><span class="s">${esc(p.sub)}</span></span>
+        <span class="r-pb">${esc(p.action)}</span></span>`;
+    case "statedot": return `<span data-eid="${id}" style="display:inline-flex;align-items:center;gap:6px">
+        <span class="r-dot ${p.tone}"></span><span class="r-tx">${esc(p.text)}</span></span>`;
+    case "accountrow": return `<span class="r-acc" data-eid="${id}">
+        <span class="n">${esc(p.name)}</span><span class="bd ${p.tone}">${esc(p.status)}</span>
+        <span class="sp2"></span><span class="tk">${esc(p.tokens)}</span></span>`;
+    case "divider": return `<span class="r-dvd" data-eid="${id}"></span>`;
+    default: return `<span class="r-tx" data-eid="${id}">?</span>`;
+  }
+}
+
+function shell(el){
+  return `<div class="el${el.id===selId?" sel":""}" data-id="${el.id}">
+    <span class="hd">⠿</span>${renderEl(el)}<button class="del" data-del="${el.id}">×</button></div>`;
+}
+
+function draw(){
+  const root = document.getElementById("root");
+  root.innerHTML = els.length ? els.map(shell).join("") : `<div class="empty">拖组件到这里</div>`;
+  drawProps();
+}
+
+function findEl(id, list){
+  list = list || els;
+  for (const e of list){
+    if (e.id === id) return e;
+    if (e.props.children){ const r = findEl(id, e.props.children); if (r) return r; }
+  }
+  return null;
+}
+function removeEl(id, list){
+  list = list || els;
+  for (let i=0;i<list.length;i++){
+    if (list[i].id===id){ list.splice(i,1); return true; }
+    if (list[i].props.children && removeEl(id, list[i].props.children)) return true;
+  }
+  return false;
+}
+
+function drawProps(){
+  const none = document.getElementById("pnone"), box = document.getElementById("pf");
+  const el = selId ? findEl(selId) : null;
+  if (!el){ none.style.display="block"; box.innerHTML=""; return; }
+  none.style.display="none";
+  const fs = FIELDS[el.kind] || [];
+  box.innerHTML = `<div style="font-size:11px;color:var(--faint);margin-bottom:7px">
+      类型：<b style="color:var(--text)">${el.kind}</b>${CONTAINERS.has(el.kind)?"（容器，可拖入）":""}</div>`
+    + fs.map(f=>{
+        const v = el.props[f.k];
+        if (f.ty==="bool") return `<div class="pf"><label>${f.t}</label><input type="checkbox" data-k="${f.k}" ${v?"checked":""}></div>`;
+        if (f.ty==="sel")  return `<div class="pf"><label>${f.t}</label><select data-k="${f.k}">${f.o.map(o=>`<option ${o===v?"selected":""}>${o}</option>`).join("")}</select></div>`;
+        if (f.ty==="area") return `<div class="pf"><label>${f.t}</label><textarea data-k="${f.k}">${esc(v)}</textarea></div>`;
+        if (f.ty==="num")  return `<div class="pf"><label>${f.t}</label><input type="number" data-k="${f.k}" value="${Number(v)||0}"></div>`;
+        if (f.ty==="list") return `<div class="pf"><label>${f.t}</label><input type="text" data-k="${f.k}" value="${esc((v||[]).join(", "))}"></div>`;
+        return `<div class="pf"><label>${f.t}</label><input type="text" data-k="${f.k}" value="${esc(v)}"></div>`;
+      }).join("")
+    + `<div class="pf"><button class="tiny dz" id="bDelSel" style="width:100%">删除此组件</button></div>`;
+  box.querySelectorAll("[data-k]").forEach(inp=>{
+    inp.addEventListener("input", ()=>{
+      const k = inp.dataset.k, f = fs.find(x=>x.k===k);
+      let v = inp.type==="checkbox" ? inp.checked : inp.value;
+      if (f.ty==="num") v = Number(v);
+      if (f.ty==="list") v = String(v).split(",").map(s=>s.trim()).filter(Boolean);
+      el.props[k] = v;
+      draw();
+    });
+  });
+  const d = document.getElementById("bDelSel");
+  if (d) d.addEventListener("click", ()=>{ removeEl(selId); selId=null; draw(); });
+}
+
+/* 旧版 clearMarks 已删除（重复定义） */
+
+const rootBox = document.getElementById("root");
+
+/* ═══ 自绘拖拽（pointer 事件）— 比 HTML5 DnD 可靠，嵌套/按钮都不出问题 ═══
+   落点计算改成「遍历所有真实矩形」而不是 elementFromPoint，
+   因为 elementFromPoint 会被 ghost / 容器 padding / 子元素遮挡欺骗（Bug 1 根因之一）。 */
+let dragKind = null, dragId = null, ghost = null, dropTarget = null, dropPos = null;
+/* 本次按下是否真的移动过 —— 决定 pointerup 时是「拖放」还是「只是点了一下」 */
+let isDragging = false, downX = 0, downY = 0;
+/* 被拖的元素是否本来就在某个容器里 —— 决定落在容器上时是「放进容器」还是「排序」 */
+let dragFromContainer = false;
+const DRAG_THRESHOLD = 4;
+
+function clearMarks(){
+  document.querySelectorAll(".el").forEach(n=>n.classList.remove("bf","af","dg","hot"));
+  document.querySelectorAll(".rowbox,.colbox").forEach(n=>n.classList.remove("over"));
+  document.getElementById("root").classList.remove("over");
+  /* 拖拽结束 —— 撤掉容器高亮（与 ensureGhost 里的 add 配对） */
+  document.body.classList.remove("dragging");
+}
+
+/** 布局矩形：忽略 body 直系浮层（ghost），并用与元素同样的裁剪规则判断包含 */
+function rectHit(n, x, y, pad){
+  const r = n.getBoundingClientRect();
+  if (!r || (!r.width && !r.height)) return false;
+  pad = pad || 0;
+  /* ★ 半分像素的宽容：容器与其子元素在边界像素上会重叠，
+     用严格 >= / <= 时「按钮最外那一像素」只落在容器里，
+     点上去就会选中容器（用户感知就是「按钮边上点不中」）。
+     给 ±0.5px 宽容后，边界像素会同时命中两者，
+     再由「面积最小 / 更深」的规则选出按钮。 */
+  const eps = 0.5 + pad;
+  return x >= r.left - eps && x <= r.right + eps && y >= r.top - eps && y <= r.bottom + eps;
+}
+function isFloating(n){
+  /* ghost / modal 这类 fixed 浮层不参与命中 */
+  return n === ghost || (n.classList && (n.classList.contains("md") || n.classList.contains("ghost")));
+}
+
+/** 收集所有候选：容器优先（最内层容器优先），其次根级元素之间的插入位 */
+function hitTest(x, y){
+  /* ① 最内层的容器（row/col）—— 逐个判断，取嵌套最深者。
+        ★ 只有「从左边组件栏拖进来的新组件」才优先落进容器。
+          拖动画布上已有的元素时，若它本来就是根级元素，落在容器上应该理解为
+          「插到这个容器前面/后面」（排序），而不是被吸进容器里 ——
+          否则把根级元素拖到最上面（那里正好是第一个 row 容器）会让它凭空消失。 */
+  const allowContainer = !dragId || dragFromContainer;
+  if (allowContainer){
+    const boxes = Array.from(document.querySelectorAll('[data-container="1"]')).filter(n => !isFloating(n));
+    let best = null, bestDepth = -1;
+    /**
+     * ★ 容器命中给**更大的宽容**（2026-09-28 用户反馈「拖不进去」）。
+     *
+     * 原来用 `rectHit(b, x, y)`（±0.5px），等于要求鼠标精确落在
+     * 虚线框内。用户稍微偏几像素就落到下面的「根级插入位」，
+     * 表现就是「只能插在容器上方或下方」。
+     *
+     * 现在给 **12px 的外扩**：手指/鼠标在容器边缘附近晃动时
+     * 仍然算「要放进这个容器」。这与「容器的意图」一致 ——
+     * 用户瞄准容器时，落在边框上当然是想放进去。
+     *
+     * ⚠ 外扩会不会误伤「把根级元素拖到容器上方做排序」？
+     *   不会：那个场景走的是 `dragId && !dragFromContainer` 分支
+     *   （`allowContainer === false`），根本不进这里。
+     */
+    const CONTAINER_PAD = 12;
+    for (const b of boxes){
+      if (!rectHit(b, x, y, CONTAINER_PAD)) continue;
+      const d = depthOf(b);
+      if (d > bestDepth){ best = b; bestDepth = d; }
+    }
+    /* 目标元素自己被拖动时，不能放进自己肚子里 */
+    if (best){
+      const inner = best.closest(".el");
+      if (!(dragId && inner && inner.dataset.id === dragId)) {
+        return { target: best.dataset.eid || "__root__", pos: -1 };
+      }
+    }
+  }
+
+  /* ② 根级元素之间的插入位（按垂直中线） */
+  const tops = Array.from(rootBox.children).filter(n => n.classList && n.classList.contains("el") && !isFloating(n));
+  for (let i = 0; i < tops.length; i++){
+    const n = tops[i];
+    if (dragId && n.dataset.id === dragId) continue;
+    if (!rectHit(n, x, y)) continue;
+    const r = n.getBoundingClientRect();
+    const before = y < r.top + r.height / 2;
+    return { target: "__root__", pos: i + (before ? 0 : 1), sh: n, before };
+  }
+
+  /* ③ 容器内的竖直插入位（col 容器里拖到两个子元素之间） */
+  const cols = Array.from(document.querySelectorAll('.colbox')).filter(n => !isFloating(n));
+  for (const c of cols){
+    if (!rectHit(c, x, y, 3)) continue;
+    const owner = c.closest(".el");
+    if (!owner) continue;
+    const kids = Array.from(c.children).filter(n => n.classList && n.classList.contains("el"));
+    let at = kids.length;
+    for (let i = 0; i < kids.length; i++){
+      if (dragId && kids[i].dataset.id === dragId) continue;
+      const r = kids[i].getBoundingClientRect();
+      if (y < r.top + r.height / 2){ at = i; break; }
+    }
+    return { target: owner.dataset.id, pos: at };
+  }
+
+  /* ④ 画布空白 → 根末尾 */
+  const rootR = rootBox.getBoundingClientRect();
+  if (y >= rootR.bottom - 4 && x >= rootR.left && x <= rootR.right) {
+    return { target: "__root__", pos: topCount() };
+  }
+  return { target: "__root__", pos: null, empty: true };
+}
+function depthOf(n){ let d = 0; while (n && n.parentElement){ d++; n = n.parentElement; } return d; }
+function topCount(){
+  return Array.from(rootBox.children).filter(n => n.classList && n.classList.contains("el")).length;
+}
+
+function startDrag(e, kind, id){
+  dragKind = kind; dragId = id || null;
+  isDragging = false;
+  downX = e.clientX; downY = e.clientY;
+  ghost = null;
+  /* 记下「这个元素原本在不在容器里」：在容器里 → 可以再拖进别的容器；
+     在根上 → 落在容器上只当排序，避免把根级元素误吞进容器 */
+  if (id){
+    const sh = document.querySelector('.el[data-id="' + id + '"]');
+    dragFromContainer = !!(sh && sh.parentElement && sh.parentElement.closest('[data-container="1"]'));
+  } else {
+    dragFromContainer = true;   /* 从左栏新增的组件：总是可以放进容器 */
+  }
+  /* 抬起前不建 ghost，避免「点一下就闪一个浮标」 */
+  document.addEventListener("pointermove", onMove);
+  document.addEventListener("pointerup", onUp);
+  document.addEventListener("pointercancel", onUp);
+}
+function ensureGhost(){
+  if (ghost) return;
+  /**
+   * ★ 拖拽真正开始时，给 body 打标记（2026-09-28）。
+   *
+   * 用途：CSS 里 `body.dragging .rowbox` 等高亮规则只在**真的在拖**时生效 ——
+   * 让用户一眼看到「哪些区域可以放」。空闲时不留任何视觉噪音。
+   *
+   * 放在 `ensureGhost()` 里而不是 `startDrag()` 里，是因为
+   * `startDrag` 在 pointerdown 就调用了（那时还没超过 4px 阈值），
+   * 而 `ensureGhost` 只在确认要拖之后才被调用。
+   */
+  document.body.classList.add("dragging");
+  ghost = document.createElement("div");
+  ghost.className = "ghost";
+  ghost.textContent = dragKind ? "新增 " + dragKind : "移动";
+  Object.assign(ghost.style, {
+    position:"fixed", zIndex:"9999", pointerEvents:"none",
+    padding:"3px 9px", borderRadius:"6px", fontSize:"11px",
+    background:"var(--accent2)", color:"#fff", opacity:".9",
+    transform:"translate(-50%,-50%)"
+  });
+  document.body.appendChild(ghost);
+}
+function moveGhost(e){
+  if (ghost) { ghost.style.left = e.clientX + "px"; ghost.style.top = e.clientY + "px"; }
+}
+function onMove(e){
+  /* 超过阈值才算「拖」，否则当作点击，让 click 事件正常走选中逻辑 */
+  if (!isDragging){
+    if (Math.abs(e.clientX - downX) < DRAG_THRESHOLD && Math.abs(e.clientY - downY) < DRAG_THRESHOLD) return;
+    isDragging = true;
+    ensureGhost();
+  }
+  if (e.cancelable) e.preventDefault();
+  moveGhost(e);
+  clearMarks();
+  const h = hitTest(e.clientX, e.clientY);
+  dropTarget = h.target;
+  dropPos = h.pos;
+  if (h.sh && h.target === "__root__" && !h.empty){
+    h.sh.classList.add(h.before ? "bf" : "af");
+    return;
+  }
+  if (h.target && h.target !== "__root__"){
+    const box = document.querySelector(`[data-eid="${h.target}"]`);
+    if (box) box.classList.add("over");
+    return;
+  }
+  if (!h.empty) document.getElementById("root").classList.add("over");
+}
+function onUp(e){
+  document.removeEventListener("pointermove", onMove);
+  document.removeEventListener("pointerup", onUp);
+  document.removeEventListener("pointercancel", onUp);
+  if (ghost){ ghost.remove(); ghost = null; }
+
+  /* 没移动过 → 当作一次普通点击，不产生任何结构改动 */
+  if (!isDragging){
+    clearMarks();
+    /* 顺手把「按下的那个」做成悬停高亮，避免看起来毫无反应 */
+    const n = e.target && e.target.closest ? e.target.closest(".el") : null;
+    dragKind = null; dragId = null; dropTarget = null; dropPos = null;
+    if (n && n.classList) n.classList.add("hot");
+    setTimeout(()=>{ if (n && n.classList) n.classList.remove("hot"); }, 240);
+    return;
+  }
+
+  if (dragId){
+    const src = findEl(dragId);
+    if (src){
+      removeEl(dragId);
+      const cc = (dropTarget && dropTarget !== "__root__") ? findEl(dropTarget) : null;
+      if (cc && cc.props.children){
+        cc.props.children.push(src);
+      } else {
+        const at = (dropPos==null||dropPos<0) ? els.length : Math.max(0, Math.min(els.length, dropPos));
+        els.splice(at,0,src);
+      }
+      selId = src.id;
+    }
+  } else if (dragKind){
+    const n = { id:"e"+(++seq), kind:dragKind, props: clone(DEF[dragKind]||{}) };
+    const cc = (dropTarget && dropTarget !== "__root__") ? findEl(dropTarget) : null;
+    if (cc && cc.props.children){
+      cc.props.children.push(n);
+    } else {
+      const at = (dropPos==null||dropPos<0) ? els.length : Math.max(0, Math.min(els.length, dropPos));
+      els.splice(at,0,n);
+      /**
+       * ★★★ 新增 Tab 时**自动配套创建内容面板**（2026-09-28 用户要求）。
+       *
+       * ## 为什么必须自动做
+       *
+       * 用户原话：「tab 肯定是需要一个绑定的容器，设置成默认的」。
+       *
+       * 一个裸的 `tabbar` 是**不可用**的 —— 它只有下划线，
+       * 点了下面什么都不换。要让它能用，必须再有 N 个 `tabpanel`
+       * （N = tab 项数），各自设 `bind` 和 `idx`。
+       *
+       * 让用户手动拖 N 个面板、再逐个改属性，是**把实现细节暴露成操作负担**。
+       * 既然「tab 必然需要面板」是领域事实，就该由编辑器自动满足。
+       *
+       * ## 做法
+       *
+       * 按 tab 项数建同数量的面板，紧跟在该 tabbar 之后插入，
+       * 全部共用同一个 `bind`（值 = tabbar 的 id）。这样初始状态
+       * 就是「点第一个 tab，显示第一个面板」。
+       */
+      if (dragKind === "tabbar"){
+        const items = Array.isArray(n.props.items) ? n.props.items : [];
+        const count = Math.max(1, items.length);
+        n.props.bind = n.id;                       // 面板按这个键找状态
+        for (let i = 0; i < count; i += 1){
+          els.splice(at + 1 + i, 0, {
+            id: "e"+(++seq),
+            kind: "tabpanel",
+            props: clone(DEF.tabpanel),
+          });
+          // 面板的 bind 要指向这个 tabbar
+          const panel = els[at + 1 + i];
+          panel.props.bind = n.id;
+          panel.props.idx = i;
+        }
+      }
+    }
+    selId = n.id;
+  }
+  isDragging = false;
+  dragKind=null; dragId=null; dropTarget=null; dropPos=null;
+  clearMarks(); draw();
+}
+
+/** 深拷贝：structuredClone 在部分老环境/桩里没有 */
+function clone(o){
+  if (typeof structuredClone === "function"){
+    try { return structuredClone(o); } catch(_){}
+  }
+  return JSON.parse(JSON.stringify(o));
+}
+
+/* 左栏：按下即准备好拖拽（超过阈值才真的开始拖，短按不会误触发） */
+document.querySelectorAll(".li").forEach(li=>{
+  li.addEventListener("pointerdown", e=>{
+    if (e.button !== 0) return;
+    e.preventDefault();
+    startDrag(e, li.dataset.k, null);
+  });
+});
+
+/* 画布：从任意 .el 上开始拖（含按钮）—— 短按不动就是「选中」，拖出去才是「拖放」 */
+rootBox.addEventListener("pointerdown", e=>{
+  if (e.button !== 0) return;
+  /* 删除按钮不参与拖拽 */
+  if (e.target.closest("[data-del]")) return;
+  const sh = e.target.closest(".el");
+  if (!sh) return;
+  /* Tab / 分段切换的内部 span 交给 click 处理，不启动拖拽（它们本来就不该被拖） */
+  if (e.target.closest("[data-tab]")) return;
+  e.preventDefault();
+  startDrag(e, null, sh.dataset.id);
+});
+
+rootBox.addEventListener("click", e=>{
+  /* ★ Bug 1 关键修复。
+     之前选中用 `closest(".el")` 从**点击坐标**往外找 —— 点在容器 padding / 容器
+     被子元素撑开的空白上时，命中的是容器而**不是**按钮，所以「横排里的按钮点不到」。
+     现在改成两段判定，缺一不可：
+       ① 点击坐标（clientX/Y）+ 所有 .el 的真实矩形 → 找出**最内层**被点中的元素
+       ② 若坐标信息不可用（键盘触发 / 无坐标），退回 DOM 树：e.target 沿 e.target 自己
+          往外找最内层 .el
+     两者都拿到「最内层」，再按 chain 规则上浮。 */
+
+  /* 删除按钮优先 */
+  const del = e.target.closest("[data-del]");
+  if (del){ removeEl(del.dataset.del); if (selId===del.dataset.del) selId=null; draw(); return; }
+
+  /* Tab / 分段切换 */
+  const t = e.target.closest("[data-tab]");
+  if (t){
+    const id = t.dataset.tab, idx = Number(t.dataset.idx);
+    const isSeg = t.hasAttribute("data-seg");
+    /**
+     * ★ 状态键（2026-09-28 修正）。
+     *
+     * 之前统一用**组件 id** 作键（`tab:<id>`），但 `tabpanel` 要读的是
+     * **tabbar 的 bind**，两者对不上 ⇒ 面板永远读不到最新状态、
+     * 表现为「点了 tab 下面不换」。
+     *
+     * 现在 tabbar 的每个 tab 项都带 `data-tabkey`（= bind || 自身 id），
+     * 写状态时用它；没有该属性时（分段切换）退回用 id。
+     */
+    const key = t.dataset.tabkey || id;
+    tabState[(isSeg?"seg:":"tab:") + key] = idx;
+    const el = findEl(id);
+    if (el) el.props.active = idx;
+    draw();
+    return;
+  }
+
+  /* ① 坐标命中：所有 .el 的真实矩形，取面积最小（=最内层）的那个。
+        注意必须有真实布局（width/height > 0），否则会误命中 0×0 的元素。
+        容器子元素比容器小，面积最小者天然就是「最内层」——
+        但边界像素可能同时落在两者里，这时也选更内层的（面积小者）。
+        等面积时用 DOM 深度决胜，保证结果稳定可预期。 */
+  let hitEl = null, hitArea = Infinity, hitDepth = -1;
+  const hasCoords = typeof e.clientX === "number" && typeof e.clientY === "number"
+                    && (e.clientX !== 0 || e.clientY !== 0);
+  if (hasCoords){
+    document.querySelectorAll(".el").forEach(n=>{
+      const r = n.getBoundingClientRect();
+      if (!r || (!r.width && !r.height)) return;      /* 无布局元素直接跳过 */
+      if (!rectHit(n, e.clientX, e.clientY)) return;
+      const area = r.width * r.height;
+      const dep = depthOf(n);
+      if (area < hitArea || (area === hitArea && dep > hitDepth)){
+        hitArea = area; hitEl = n; hitDepth = dep;
+      }
+    });
+  }
+  /* ② 树命中兜底：从 e.target 沿 DOM 找最内层 .el */
+  if (!hitEl){
+    hitEl = e.target && e.target.closest ? e.target.closest(".el") : null;
+  }
+  if (!hitEl){ selId = null; draw(); return; }
+
+  /* 从命中的元素往外收集 chain */
+  const chain = [];
+  let n = hitEl;
+  while (n){
+    chain.push(n.dataset.id);
+    n = n.parentElement ? n.parentElement.closest(".el") : null;
+  }
+  if (chain.length === 0){ selId = null; draw(); return; }
+
+  const inner = chain[0];
+  /* 若最内层已选中，再点就选它外面那层（可以一路点出去） */
+  selId = (selId === inner && chain.length > 1) ? chain[1] : inner;
+  draw();
+});
+
+document.getElementById("bLight").addEventListener("click", e=>{
+  const r = document.documentElement;
+  const was = r.hasAttribute("data-light");
+  if (was) r.removeAttribute("data-light"); else r.setAttribute("data-light","");
+  e.target.textContent = was ? "切浅色" : "切深色";
+});
+document.getElementById("bPrev").addEventListener("click", ()=>{
+  const keep = selId; selId = null; draw();
+  const card = document.querySelector(".card");
+  card.style.transition = "transform .18s ease";
+  card.style.transform = "scale(1.02)";
+  setTimeout(()=>{ card.style.transform=""; }, 180);
+  setTimeout(()=>{ selId = keep; draw(); }, 1500);
+});
+document.getElementById("bExp").addEventListener("click", ()=>{
+  /* ★ 必须带上 id：下游拿到 JSON 才能唯一定位元素（之前 strip 把 id 丢了） */
+  const strip = e=>({ id:e.id, kind:e.kind, props:{...(e.props), ...(e.props.children?{children:e.props.children.map(strip)}:{})} });
+  document.getElementById("out").value = "// 把这个发我\n" + JSON.stringify({
+    cardTitle: document.getElementById("ctitle").textContent.trim(),
+    elements: els.map(strip)
+  }, null, 2);
+  document.getElementById("modal").classList.add("open");
+});
+document.getElementById("bClose").addEventListener("click", ()=>document.getElementById("modal").classList.remove("open"));
+document.getElementById("bCopy").addEventListener("click", async e=>{
+  const t = document.getElementById("out"); t.select();
+  try{ await navigator.clipboard.writeText(t.value); }catch(_){ document.execCommand("copy"); }
+  e.target.textContent="已复制 ✓"; setTimeout(()=>{ e.target.textContent="复制"; },1500);
+});
+
+/**
+ * 初始示例卡片 —— 直接演示「Tab + 配套面板」的正确结构。
+ *
+ * ⚠ 这里**手动**写出两个 tabpanel（而不是靠 `dropOn` 的自动配套），
+ * 因为初始数据不走拖放路径。两者的 `bind` 都指向那个 tabbar 的 id，
+ * `idx` 分别是 0 / 1 —— 与拖入时自动生成的结构完全一致。
+ */
+{
+  const tabId = "e"+(++seq);
+  els = [
+    { id:"e"+(++seq), kind:"row", props:{ gap:8, children:[
+        { id:"e"+(++seq), kind:"btn", props:{ text:"添加账号", variant:"default" } },
+        { id:"e"+(++seq), kind:"btn", props:{ text:"签到", variant:"default" } },
+        { id:"e"+(++seq), kind:"toggle", props:{ text:"持续领取", on:true } }
+    ]}},
+    { id: tabId, kind:"tabbar", props:{ items:["模型","账号管理"], active:0, bind: tabId } },
+    /* ── 面板 0：模型 ── */
+    { id:"e"+(++seq), kind:"tabpanel", props:{ bind: tabId, idx:0, children:[
+        { id:"e"+(++seq), kind:"kv", props:{ k:"剩余额度", v:"3.0M / 5.0M" } },
+        { id:"e"+(++seq), kind:"listitem", props:{ name:"GLM-5.3", sub:"检测于 今天", action:"重新检测" } },
+        { id:"e"+(++seq), kind:"listitem", props:{ name:"GLM-5.3-Flash", sub:"检测于 今天", action:"重新检测" } }
+    ]}},
+    /* ── 面板 1：账号管理 ── */
+    { id:"e"+(++seq), kind:"tabpanel", props:{ bind: tabId, idx:1, children:[
+        { id:"e"+(++seq), kind:"accountrow", props:{ name:"mylzscy4", status:"正常", tone:"ok", tokens:"3.0M" } },
+        { id:"e"+(++seq), kind:"accountrow", props:{ name:"159517901", status:"已过期", tone:"of", tokens:"0" } }
+    ]}}
+  ];
+}
+draw();
+</script>
+</body>
+</html>
