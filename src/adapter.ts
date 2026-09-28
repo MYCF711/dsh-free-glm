@@ -1244,6 +1244,46 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
       // 桥会把 max_tokens 钳到 [1, 32000]。
       body.max_tokens = options.maxTokens;
     }
+    /**
+     * ★★★ 采样参数与扩展思考透传（2026-09-28）。
+     *
+     * ## 为什么加这个
+     *
+     * 桥侧原先**只映射了** `max_tokens` / `tools` / `tool_choice` / `stop`，
+     * `temperature` / `top_p` / `thinking` **从未被转发**。
+     * 实测证据：`/diagnostics/direct` 回显的
+     *
+     *     sent.bodyFields = ["model","max_tokens","system","messages"]
+     *
+     * —— 只有四个字段。
+     *
+     * ## 为什么这影响「能力」而非仅「风格」
+     *
+     * GLM-5.3 **默认开启扩展思考**（Anthropic 协议的 `thinking` 块）。
+     * ZCode 原生就是带思考跑的，这正是它「显得聪明」的主要来源。
+     * 桥不转发 `thinking` ⇒ DSH 侧全程**无思考链**。
+     *
+     * 但**默认不开**：思考会显著拉长 ttft（实测 ttft 2.4-3.5s 是主要
+     * 延迟成本，思考会让它翻倍）。由调用方显式决定，不擅自开启。
+     *
+     * ## 读取来源
+     *
+     * DSH 的 `GenerateOptions` 里 `temperature` / `topP` 是标准字段；
+     * `thinking` 不在契约里，用 `unknown` 兜底读 —— 桥侧同样是
+     * 「有就转发、没有就算了」的宽松策略。
+     */
+    const opts = options as unknown as Record<string, unknown>;
+    if (typeof opts["temperature"] === "number" && Number.isFinite(opts["temperature"])) {
+      const t = opts["temperature"] as number;
+      if (t >= 0 && t <= 1) body.temperature = t;
+    }
+    if (typeof opts["topP"] === "number" && Number.isFinite(opts["topP"])) {
+      const p = opts["topP"] as number;
+      if (p > 0 && p <= 1) body.top_p = p;
+    }
+    if (opts["thinking"] !== null && typeof opts["thinking"] === "object") {
+      body.thinking = opts["thinking"];
+    }
 
     // 3. 发请求（带超时 + 取消传播）。
     const abortController = new AbortController();

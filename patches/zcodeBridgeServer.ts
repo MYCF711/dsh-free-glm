@@ -1209,6 +1209,103 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
   const fastMaterialInflight = new Map<string, Promise<FastMaterial>>();
 
   /**
+   * ★★★ 上游请求串行化闸门（2026-09-28）。
+   *
+   * ## 为什么需要 —— `code:1005 exceed quota limit`
+   *
+   * 一次探测请求（`/diagnostics/direct`）拿到了**完整**的上游拒绝体：
+   *
+   *     HTTP 429
+   *     {"code":1005,"msg":"exceed quota limit","logid":"20260928090239648f8812b7e58c09c433"}
+   *
+   * 而**token 额度还剩 2,994,737 / 3,000,000** —— 所以 `1005` 不是 token
+   * 配额，是**并发/速率配额**。
+   *
+   * 与全量日志的统计吻合：`bridge.fast_path.completed` 共 155 次，
+   * **200 有 143 次、429 只有 1 次**。⇒ 它是**并发撞车**触发的，
+   * 不是稳定拒绝。DSH 的多步 agent 循环里，一个 turn 结束时
+   * 下一个 turn 可能在上一个响应**尚未完全拆流**前就发出，
+   * 两个请求重叠 → 撞上并发上限。
+   *
+   * ## 做法
+   *
+   * 全局串行：同一时刻只允许**一个** fast path 请求在飞。
+   *
+   * ## 代价（诚实说明）
+   *
+   * 这把并发压成 1。真正需要并行多请求的场景会**排队变慢**。
+   * 但：
+   *   · DSH 的 agent 循环本身是**顺序**的（一轮一个请求），不受影响
+   *   · 撞上 429 的代价（重试 + 用户看到失败）远大于排队的代价
+   *   · 这是**可关**的：`ZCODE_BRIDGE_SERIALIZE=0` 关闭
+   *
+   * ## 为什么不用「有限并发」（如 2）
+   *
+   * 没有实测数据支撑并发上限到底是几 —— 猜 2 可能仍然撞墙。
+   * 串行是**确定性**的：它要么完全不撞，要么说明问题不在并发。
+   * 先拿到「串行下 429 归零」这个事实，再谈放宽。
+   */
+  const FAST_PATH_SERIALIZE = process.env["ZCODE_BRIDGE_SERIALIZE"] !== "0";
+  /** 串行闸门的尾指针 —— 每个新请求接在上一个之后。 */
+  let fastPathTail: Promise<void> = Promise.resolve();
+  /** 当前排队中的请求数（仅用于诊断）。 */
+  let fastPathQueueDepth = 0;
+
+  /** 串行执行 `task()`；闸门关闭时直接执行。 */
+  async function runSerialized<T>(task: () => Promise<T>): Promise<T> {
+    if (!FAST_PATH_SERIALIZE) return task();
+    fastPathQueueDepth += 1;
+    const previous = fastPathTail;
+    let release!: () => void;
+    fastPathTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    try {
+      await previous;
+      return await task();
+    } finally {
+      fastPathQueueDepth -= 1;
+      release();
+    }
+  }
+
+  /**
+   * ★★ 429 退避重试（2026-09-28）。
+   *
+   * 串行化已经消除了「同一时刻两个请求」，但仍可能有**短窗口内的连续请求**
+   * 触发上游的速率窗口。对这类**明确可重试**的状态做一次短退避重试：
+   *
+   * - `429` —— 限流
+   * - `503` / `502` —— 上游临时故障
+   *
+   * **不重试** `3012`（风控，重试会加重账号冷却惩罚）与 `4xx` 业务错误
+   * （重试无意义，只会浪费额度）。
+   *
+   * ## 为什么只重试一次
+   *
+   * 上游限流窗口通常是秒级。重试一次覆盖绝大多数瞬时撞车；
+   * 重试两次以上会在真正被限流时把延迟放大到用户无法接受。
+   */
+  const FAST_RETRY_MAX = 1;
+  const FAST_RETRY_BASE_MS = 900;
+
+  /**
+   * 判断上游响应是否值得重试。
+   *
+   * 注意要**读正文**：429 的语义藏在 `{"code":1005}` 里，
+   * 只看 HTTP 状态码分不清「限流（可重试）」与「违规（不可重试）」。
+   */
+  async function isRetryableUpstream(status: number, text: string): Promise<boolean> {
+    if (status === 429) return true;
+    if (status === 502 || status === 503) return true;
+    // 3012 是风控 —— 明确不可重试（有账号冷却惩罚）
+    if (status === 200 || status === 3012) return false;
+    // 正文里带限流码的（部分情况下上游用 200 包裹错误）
+    if (text.includes('"code":1005') || text.includes("exceed quota limit")) return true;
+    return false;
+  }
+
+  /**
    * 带并发上限的调度。
    *
    * ## 返回的两个时长分别是什么
@@ -2607,6 +2704,56 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
             : undefined;
 
         /**
+         * ★★★ 采样参数透传（2026-09-28 深挖「能力不一致」时发现）。
+         *
+         * ## 问题
+         *
+         * `/diagnostics/direct` 回显的 `sent.bodyFields` 只有四个：
+         *
+         *     ["model","max_tokens","system","messages"]
+         *
+         * 也就是说调用方传的 **`temperature` / `top_p` / `top_k` /
+         * `thinking` / `stop_sequences` 全被静默丢弃**。旧实现只在 fast path
+         * 里映射了 `max_tokens` / `tools` / `tool_choice` / `stop`，
+         * 而 `temperature` 这类**从来没有映射过**。
+         *
+         * ## 为什么这会改变「能力」而不只是「风格」
+         *
+         * GLM-5.3 默认开启扩展思考。**思考的触发与深度由采样参数影响**：
+         * 上游在 `temperature=1`（默认）时不加干预，一旦显式传低温度，
+         * 思考链会显著缩短甚至不产生 —— 表现出来就是「变笨」。
+         * DSH 侧若传 `temperature=0`（很多 agent 框架的默认），
+         * 到桥上被丢掉反而**是帮了忙**；但一旦我们想主动调优，
+         * 就必须先能传得进去 —— 否则所有调参都是空转。
+         *
+         * ## 做法
+         *
+         * 原样透传，**不设默认值、不做钳制**（除了范围合法性检查）：
+         * 上游对不认识的字段是忽略而非报错，所以透传是安全的下界。
+         */
+        const passthroughSampling = ((): Record<string, unknown> => {
+          const out: Record<string, unknown> = {};
+          const num = (key: string, min: number, max: number): void => {
+            const raw = body[key];
+            if (typeof raw !== "number" || !Number.isFinite(raw)) return;
+            if (raw < min || raw > max) return;
+            out[key] = raw;
+          };
+          num("temperature", 0, 1);
+          num("top_p", 0, 1);
+          // top_k 在 Anthropic 协议里是整数，上限 500
+          const topK = body["top_k"];
+          if (typeof topK === "number" && Number.isInteger(topK) && topK >= 1 && topK <= 500) {
+            out["top_k"] = topK;
+          }
+          // metadata 原样透传（上游用它做归因，不影响生成）
+          if (body["metadata"] !== null && typeof body["metadata"] === "object") {
+            out["metadata"] = body["metadata"];
+          }
+          return out;
+        })();
+
+        /**
          * ★★★ 【快速路径】直连上游，**不建 task、不跑 turn 循环**。
          *
          * ## 发现经过（2026-09-27，子代理 + 本人复现）
@@ -3259,6 +3406,25 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
                 ? {}
                 : { stop_sequences: fastStopSequences }),
               messages: withContextPrefix(fastMessages),
+              /**
+               * ★ 采样参数（2026-09-28）—— 旧实现把它们全丢了。
+               * 见 `passthroughSampling()` 的说明。
+               */
+              ...passthroughSampling,
+              /**
+               * ★ 扩展思考（2026-09-28）。
+               *
+               * Anthropic 协议的 `thinking: {type:"enabled", budget_tokens:N}`。
+               * GLM-5.3 在 ZCode 里默认开思考，这正是「ZCode 里聪明」的
+               * 主要来源之一。DSH 适配器不传这个字段，桥旧实现也不转发
+               * ⇒ DSH 侧全程**无思考**。
+               *
+               * 只有调用方**显式**传 `thinking` 时才带上 —— 不擅自开启，
+               * 因为思考会显著增加 ttft（实测 2.4-3.5s，是主要延迟来源）。
+               */
+              ...(body["thinking"] !== null && typeof body["thinking"] === "object"
+                ? { thinking: body["thinking"] }
+                : {}),
             });
             /**
              * ★ 临时诊断：把实际发出的请求写盘（2026-09-28）。
@@ -3299,11 +3465,106 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
                 /* 诊断失败不影响主流程 */
               }
             }
-            const upstream = await fetch(`${ZCODE_PLAN_ANTHROPIC_BASE}/v1/messages`, {
-              method: "POST",
-              headers: fastHeaders,
-              body: upstreamBody,
-            });
+            /**
+             * ★★ 串行化 + 429 重试（2026-09-28，第二轮修正）。
+             *
+             * ## 实测暴露的三个问题（逐轮修正）
+             *
+             * ① 上游限流的确切语义：
+             *
+             *      HTTP 429 {"code":3009,"msg":"model concurrency limit exceeded"}
+             *      HTTP 429 {"code":1005,"msg":"exceed quota limit"}
+             *
+             *    都是**并发**配额，不是 token 配额（还剩 299.4 万）。
+             *
+             * ② 重试复用同一份 captcha ⇒ 必然失败。
+             *    captcha 一次性，首次尝试已消费掉它。已修（重试前重新 mint）。
+             *
+             * ③ **mint 不能被串行化**（本轮发现）。
+             *
+             *    第一版把 mint 和 fetch 一起放进闸门 ⇒ `mintMs` 从
+             *    200-500ms 暴涨到 **2500-3100ms**。
+             *
+             *    因为 mint 走的是**壳内 renderer 的 RPC**，本身要 200-800ms，
+             *    被串行后变成「排在 5 个人后面再 mint」⇒ 累加。
+             *
+             * ## 正确切分
+             *
+             * ```
+             * mint            ← 闸门外，可并发（它只是取凭据，不占上游并发）
+             *   ↓
+             * fetch 上游       ← 闸门内，严格串行（这才是占并发配额的动作）
+             * ```
+             *
+             * 材料是**本次请求专用**的，在闸门外 mint 好后带进闸门；
+             * 只有重试路径需要重新 mint（那时已经在闸门外的循环里）。
+             *
+             * ## 关于材料「排队期间过期」
+             *
+             * 上一轮担心排队会让 captcha 失效（TTL 约 120 秒）。
+             * 实测：6 个请求排队总时长约 30 秒，**未出现 3007**。
+             * 所以这个担心不成立 —— 排队时间远小于 captcha 寿命。
+             */
+            const sendUpstream = async (): Promise<Response> => {
+              let last: Response | undefined;
+              let attemptHeaders = fastHeaders;
+              for (let attempt = 0; attempt <= FAST_RETRY_MAX; attempt += 1) {
+                const headers = attemptHeaders;
+                const res = await runSerialized(async () =>
+                  fetch(`${ZCODE_PLAN_ANTHROPIC_BASE}/v1/messages`, {
+                    method: "POST",
+                    headers,
+                    body: upstreamBody,
+                  }),
+                );
+                if (res.status !== 429 && res.status !== 502 && res.status !== 503) {
+                  return res;
+                }
+                // 只在确实可重试、且还有重试次数时继续
+                const peek = await res.clone().text();
+                if (attempt >= FAST_RETRY_MAX || !(await isRetryableUpstream(res.status, peek))) {
+                  return res;
+                }
+                log("bridge.fast_path.retry", {
+                  modelId,
+                  status: res.status,
+                  attempt: attempt + 1,
+                  body: peek.slice(0, 200),
+                });
+                await new Promise((resolve) =>
+                  setTimeout(resolve, FAST_RETRY_BASE_MS * (attempt + 1)),
+                );
+                /**
+                 * ★ 重试前重新 mint（一次性 captcha 不能复用）。
+                 * 这一步在闸门外执行 —— 见上面 ③ 的说明。
+                 */
+                try {
+                  const refreshed = await deps.mintAuthMaterial({
+                    providerId,
+                    modelId,
+                    workspacePath,
+                  });
+                  if (refreshed?.apiKey !== undefined) {
+                    const refreshedKey = injectedJwt ?? refreshed.apiKey;
+                    attemptHeaders = {
+                      ...fastHeaders,
+                      authorization: `Bearer ${refreshedKey}`,
+                      "x-api-key": refreshedKey,
+                      "x-aliyun-captcha-verify-param":
+                        refreshed.headers?.["X-Aliyun-Captcha-Verify-Param"] ?? "",
+                      "x-aliyun-captcha-verify-region":
+                        refreshed.headers?.["X-Aliyun-Captcha-Verify-Region"] ?? "cn",
+                    };
+                  }
+                } catch (error) {
+                  const message = error instanceof Error ? error.message : String(error);
+                  log("bridge.fast_path.retry.mint_failed", { modelId, attempt, error: message });
+                }
+                last = res;
+              }
+              return last as Response;
+            };
+            const upstream = await sendUpstream();
             /**
              * ★ 流式分支 —— 把 Anthropic SSE 翻成 OpenAI SSE。
              *
