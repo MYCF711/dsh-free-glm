@@ -82,6 +82,67 @@ export interface QuotaGuardTick {
   readonly summary: string;
 }
 
+/**
+ * ★ 落盘诊断（2026-09-28 新增）。
+ *
+ * ## 为什么不用 logger
+ *
+ * 本项目方法论明确记录过：
+ * 「**验证插件改动要用落盘诊断，不要只用 logger**」——
+ * host logger 的多参数调用可能被吞掉，诊断代码看起来跑了但日志里什么都没有。
+ *
+ * 而且 quota-guard 跑在 **DSH 进程**里，它的日志与**壳的日志**是两套；
+ * 排查时很容易只盯着其中一套，得出「没在跑」的错误结论。
+ *
+ * ## 落盘位置
+ *
+ * 与桥的发现文件同目录（`<dataBaseDir>/.zcode/v2/`），
+ * 便于与桥的日志对照：
+ *
+ *   quota-guard.ndjson    每轮一行（追加）
+ *
+ * 用**追加**而不是覆盖 —— 需要看到「历史几轮」才能判断定时器是否持续运行。
+ */
+async function writeGuardDiag(entry: Record<string, unknown>): Promise<void> {
+  try {
+    const { appendFile, mkdir } = await import("node:fs/promises");
+    const { join } = await import("node:path");
+    const { homedir } = await import("node:os");
+    const { readFileSync, existsSync } = await import("node:fs");
+    /** 与 bridge-endpoint 同源的 dataBaseDir 探测。 */
+    let base = process.env["ZCODE_DATA_BASE_DIR"]?.trim() ?? "";
+    if (base.length === 0) {
+      const candidates = [
+        join(homedir(), ".zcode"),
+        join(homedir(), "AppData", "Roaming", ".zcode"),
+      ];
+      for (const cand of candidates) {
+        if (existsSync(join(cand, "v2"))) { base = cand; break; }
+      }
+    }
+    if (base.length === 0) base = join(homedir(), ".zcode");
+    const dir = join(base, ".zcode", "v2");
+    if (!existsSync(dir)) {
+      const altDir = join(base, "v2");
+      if (!existsSync(altDir)) return;
+      await appendFile(
+        join(altDir, "quota-guard.ndjson"),
+        JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n",
+        "utf8",
+      );
+      return;
+    }
+    await mkdir(dir, { recursive: true });
+    await appendFile(
+      join(dir, "quota-guard.ndjson"),
+      JSON.stringify({ at: new Date().toISOString(), ...entry }) + "\n",
+      "utf8",
+    );
+  } catch {
+    /* 诊断失败不影响主流程 */
+  }
+}
+
 /** 把大数字格式化成易读字符串。 */
 function formatUnits(value: number | null | undefined): string {
   if (typeof value !== "number" || !Number.isFinite(value)) return "未知";
@@ -255,6 +316,14 @@ export function createQuotaGuard(options: QuotaGuardOptions): QuotaGuard {
       } else {
         consecutiveFailures += 1;
       }
+      void writeGuardDiag({
+        event: "tick",
+        summary: result.summary,
+        claimed: result.claimed,
+        remaining: result.billing?.remainingUnits ?? null,
+        planName: result.billing?.planName ?? null,
+        period: result.billing?.period ?? null,
+      });
       options.log.info(`[quota-guard] ${result.summary}`);
       return result;
     } catch (error) {
@@ -269,6 +338,12 @@ export function createQuotaGuard(options: QuotaGuardOptions): QuotaGuard {
 
   if (!disabled) {
     schedule(firstDelayMs);
+    void writeGuardDiag({
+      event: "started",
+      intervalMs,
+      cooldownMs,
+      firstDelayMs,
+    });
     options.log.info(
       `[quota-guard] 已启动（每 ${Math.round(intervalMs / 60000)} 分钟检索派发额度，`
       + `失败冷却 ${Math.round(cooldownMs / 60000)} 分钟）`,

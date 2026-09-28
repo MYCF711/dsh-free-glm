@@ -897,6 +897,36 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
    *
    * 这样发出去的请求在来源特征上与壳内真实请求**逐字段一致**。
    */
+  /**
+   * ★ 外部注入的 JWT（2026-09-28 新增）。
+   *
+   * ## 为什么需要
+   *
+   * 「换账号」的完整链路是：
+   *   ① 用新账号走 CLI 登录（`/oauth/cli-login`）→ 拿到新 JWT
+   *   ② **把新 JWT 交给桥使用**
+   *
+   * 而 ② 此前缺失 —— 桥只会用壳凭据库里的 JWT
+   * （来自 `mintAuthMaterial`），无法接受外部传入的。
+   *
+   * ## 为什么不需要写凭据库
+   *
+   * 实测：**只要有一个有效 JWT 就能调 API**
+   * （`billing/balance` 与 `zcode-plan/anthropic/v1/messages` 都只认它）。
+   *
+   * 所以不必把 JWT 写进 `credentials.json`（那是 AES-GCM 加密的、
+   * 且格式未公开）—— 直接在桥内覆盖即可。
+   *
+   * ## 覆盖语义
+   *
+   * 设置后，fast path 会**优先使用它**而不是 mint 出来的；
+   * 传空字符串则清除覆盖，回退到壳凭据。
+   *
+   * ⚠ 它只影响**桥自己的请求**，不改动壳的状态 ——
+   *   所以对「壳内会话链路」无影响（那是另一条路径）。
+   */
+  let injectedJwt: string | undefined;
+
   function bridgeSourceHeaders(): Record<string, string> {
     const locale = (() => {
       try {
@@ -1895,6 +1925,65 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
         return;
       }
 
+      /**
+       * ★ `POST /oauth/use-token` —— 把外部拿到的 JWT 交给桥使用（2026-09-28）。
+       *
+       * ## 用途
+       *
+       * `/oauth/cli-login` 拿到 token 后，用本端点注入桥即可立即生效，
+       * **不需要写凭据库**（实测：有效 JWT 就能调 API）。
+       *
+       * 这是「换账号」链路缺失的最后一步：
+       *
+       * ```
+       * ① POST /oauth/cli-login   → { token: "<新账号的 JWT>" }
+       * ② POST /oauth/use-token   { token: "<同一个 JWT>" }   ← 本端点
+       * ③ 之后所有请求都用新账号
+       * ```
+       *
+       * ## 请求
+       *
+       *   { "token": "<jwt>" }   传空字符串则清除注入，回退到壳凭据
+       */
+      if (method === "POST" && url === "/oauth/use-token") {
+        let injectBody: Record<string, unknown> = {};
+        try {
+          injectBody = JSON.parse(await readBody(request)) as Record<string, unknown>;
+        } catch {
+          injectBody = {};
+        }
+        const raw = typeof injectBody["token"] === "string" ? injectBody["token"].trim() : "";
+        if (raw.length === 0) {
+          injectedJwt = undefined;
+          json(response, 200, { ok: true, cleared: true, message: "已清除注入，回退到壳凭据。" });
+          return;
+        }
+        /** 粗校验：JWT 是三段点分结构。 */
+        if (raw.split(".").length !== 3) {
+          errorJson(response, 400, "不是合法的 JWT（应为三段点分结构）。", "bad_request");
+          return;
+        }
+        injectedJwt = raw;
+        /** 解析 payload 便于确认账号（不校验签名，仅展示）。 */
+        let payload: unknown = null;
+        try {
+          const seg = raw.split(".")[1] ?? "";
+          const pad = seg.replace(/-/g, "+").replace(/_/g, "/");
+          const padded = pad + "=".repeat((4 - (pad.length % 4)) % 4);
+          payload = JSON.parse(Buffer.from(padded, "base64").toString("utf8"));
+        } catch {
+          payload = null;
+        }
+        json(response, 200, {
+          ok: true,
+          injected: true,
+          tokenLength: raw.length,
+          payload,
+          message: "已注入。之后桥的请求将使用该凭据。",
+        });
+        return;
+      }
+
       if (method === "POST" && url === "/oauth/login") {
         if (deps.startLogin === undefined) {
           errorJson(
@@ -2650,10 +2739,18 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
              * 本项目第四轮其实已记录过这个反直觉现象：
              * 「壳内模型请求**不带** `X-Device-Mid`」。
              */
+            /**
+             * 优先使用外部注入的 JWT（若有），否则用 mint 出来的 apiKey。
+             *
+             * 见 `/oauth/use-token` 的说明：换账号时把新 JWT 注入即可，
+             * 无需写凭据库。
+             */
+            const effectiveApiKey = injectedJwt ?? material.apiKey;
+
             const officialCliHeaders: Record<string, string> = {
               "accept-encoding": "gzip",
               "anthropic-version": "2023-06-01",
-              authorization: `Bearer ${material.apiKey}`,
+              authorization: `Bearer ${effectiveApiKey}`,
               "content-type": "application/json",
               "http-referer": "https://zcode.z.ai",
               "user-agent": "ZCode/3.14.3 ai-sdk/anthropic/3.0.81",
@@ -2661,7 +2758,7 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
                 material.headers?.["X-Aliyun-Captcha-Verify-Param"] ?? "",
               "x-aliyun-captcha-verify-region":
                 material.headers?.["X-Aliyun-Captcha-Verify-Region"] ?? "cn",
-              "x-api-key": material.apiKey,
+              "x-api-key": effectiveApiKey,
               "x-client-language": "zh-CN",
               "x-client-timezone": "Asia/Shanghai",
               "x-os-category": "windows",
