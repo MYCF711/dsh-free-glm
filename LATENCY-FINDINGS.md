@@ -2672,3 +2672,87 @@ curl -X POST https://zcode.z.ai/api/v1/oauth/token \
    比看 HTTP 状态码信息量大得多。
 3. **找成功的历史记录** —— 日志里的 `OAuth polling flow completed` +
    JWT 的 `iat` 时间戳能对齐，从而确定「端点何时开始坏」。
+
+---
+
+## 三十五、★ 「每日免费额度」的最终定论（2026-09-28 实测）
+
+### 结论
+
+**它是「新账号登录 ZCode 3.x 后的 5 个自然日试用窗口」，不是可领取/可购买的东西。**
+
+| 项 | 值 |
+|---|---|
+| plan_id | `zcode-v3-start-plan` |
+| period | `daily` |
+| 额度 | GLM-5.3 **3M/日** + GLM-5.3-Flash **5M/日** |
+| 获得方式 | **登录后自动开始计时**（无激活动作） |
+| 期限 | 5 个自然日，到期永久结束 |
+| 补发手段 | **无**（无 claim / activate / reset） |
+
+### 三重独立证据
+
+**① `GET /api/v1/client/configs`（匿名）** 下发静态定义：
+```json
+"startPlanPreview": {
+  "planId": "zcode-v3-start-plan",
+  "entitlements": [
+    {"grantUnits": 3000000, "period": "daily", "showName": "GLM-5.3"},
+    {"grantUnits": 5000000, "period": "daily", "showName": "GLM-5.3-Flash"}
+  ]
+}
+```
+数值与历史记录里旧账号的 daily 额度**逐字一致**。
+
+**② 官方 UI 文案（`packages/ui/src/i18n/locales/zh-CN.ts`）**：
+```
+"startPlan.highlight.trial.value": "5 个自然日"
+"startPlan.highlight.trial.description": "登录 ZCode 3.x 后开始计时。"
+"startPlan.highlight.quota.value": "3M tokens/日"
+"startPlan.eligibleNewUser": "新用户体验"
+"startPlan.status.expired": "体验套餐已过期"
+```
+
+**③ 闭源 asar 扫描（只读分段，未解包）**：
+`billing/subscribe`、`billing/order`、`plan/subscribe`、`billing/plans`、`billing/daily`
+**全部 NOT FOUND** —— 不存在任何「订阅/下单/领取 daily」的端点。
+
+### 三条死路（已实测排除，不要再投入）
+
+| 路径 | 判定 | 依据 |
+|---|---|---|
+| 官网订阅换 daily | ❌ | 付费商品全是「每周积分」，**无 daily 周期产品** |
+| 找 activate / eligibility 端点 | ❌ | 开源版源码 + 闭源 asar 均无 |
+| `coding-plan/reset` 刷新 | ❌ | 从 asar 提取的 schema 是 `available_five_hour_resets` / `available_week_resets` —— **付费 Coding Plan 的 5h/周重置，无 daily 维度** |
+
+### 本轮新增的实测（排除「设备维度」假设）
+
+曾假设试用窗口按**设备**判定（因为 plan_id 前缀相同：`zcode-v3-start-plan`
+vs `zcode-v3-start-plan-trust-0928`）。
+
+**实测否定**：
+
+```
+真机 device_mid  → plan: zcode-v3-start-plan-trust-0928, period: one_time
+随机 device_mid  → plan: zcode-v3-start-plan-trust-0928, period: one_time   ← 完全相同
+```
+
+**⇒ plan 按【账号】判定，换设备标识无效。**
+
+### preview 印证
+
+```
+GET /billing/preview →
+{"plans": [{"plan_id":"zcode-v3-start-plan-trust-0928","period":"one_time"}]}
+```
+**只有活动赠送，没有 `zcode-v3-start-plan`** ⇒ 试用窗口确实已耗尽，
+且预览里也没有可领取的入口。
+
+### 唯一可行的现实路径
+
+1. **换一个全新账号**登录 ZCode 3.x（自动获得 5 天窗口）
+2. 或继续用现有池（本机 `ZCode Trust Build`）
+
+**⚠ 而 ① 需要完成一次 OAuth 授权** —— 由于 `/oauth/token` 端点故障
+（详见第三十四节），须走新增的 `/oauth/cli-login` 路径
+（服务端中介，绕开故障端点）；拿到 token 后用 `/oauth/use-token` 注入桥。
