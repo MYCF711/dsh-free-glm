@@ -3056,7 +3056,25 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
                 genMs: firstUpstreamEventMs === undefined ? 0 : totalMs - firstUpstreamEventMs,
                 deltaCount,
                 // 材料缓存命中情况（缓存省掉 mint；见 FAST_MATERIAL_TTL_MS）
-                mintMs: Date.now() - fastStartMs - (firstUpstreamEventMs ?? 0),
+                /**
+                 * ★ 修正（2026-09-28）：这里此前写成
+                 * `Date.now() - fastStartMs - (firstUpstreamEventMs ?? 0)`，
+                 * 那算的是「首个上游事件之后的时间」= **生成时间**，
+                 * 与上一行的 `genMs` 完全重复 ——
+                 * 而真正的 mint 耗时**被它覆盖掉了**。
+                 *
+                 * 后果：日志里 `mintMs` 恒等于 `genMs`（例如
+                 * `"genMs":58530,"mintMs":58530`），让人误以为
+                 * 「mint 很快、慢的是生成」，从而**错过真正的优化点**。
+                 *
+                 * 真实值在 L2376 就已算好（`Date.now() - fastStartMs`），
+                 * 这里改为直接用它。
+                 *
+                 * 这个 bug 直接影响了「captcha 池化」这个优化方向的判断：
+                 * 对照实现（TriDefender/zcode-api）同负载 A/B 比我们快 7.2 倍，
+                 * 其核心机制正是**把 mint 移出热路径**（后台预解 + 池化）。
+                 */
+                mintMs,
                 materialFromCache,
               });
               return;
@@ -3070,6 +3088,40 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
               textLength: upstreamText.length,
             });
             if (upstream.status !== 200) {
+              /**
+               * ★ 额度耗尽的友好提示（2026-09-28 新增）。
+               *
+               * ## 为什么单独处理
+               *
+               * 上游额度用尽时返回 `{"code":1005,"msg":"exceed quota limit"}`。
+               * 此前它被原样塞进 `Upstream rejected fast path: {...}` 里，
+               * 用户在 DSH 里看到的是一坨 JSON，**既不知道原因也不知道怎么办**。
+               *
+               * ## 提示内容的设计依据（本项目实测）
+               *
+               * - **活动赠送（`period: one_time`）**：到期即失效，无法续领
+               * - **每日订阅（`period: daily`）**：新账号登录后 5 天试用窗口，
+               *   无 claim/activate/reset 可补发
+               *
+               * 所以提示给的是**真正可执行的动作**（两个斜杠命令），
+               * 而不是让用户自己去猜 JSON 里的字段。
+               */
+              const quotaExhausted =
+                upstreamText.includes("1005") || upstreamText.includes("exceed quota");
+              if (quotaExhausted) {
+                errorJson(
+                  response,
+                  upstream.status === 405 ? 502 : upstream.status,
+                  "ZCode 免费额度已用尽（上游 code 1005）。\n"
+                    + "可在 DSH 里执行以下命令了解详情：\n"
+                    + "  /zcode-quota   查看剩余量与到期时间\n"
+                    + "  /zcode-claim   立刻检索是否有新派发的额度\n"
+                    + "注意：活动赠送额度（period=one_time）到期后无法续领；\n"
+                    + "每日订阅额度需账号处在试用窗口内（新号登录后 5 天）。",
+                  "quota_exhausted",
+                );
+                return;
+              }
               errorJson(
                 response,
                 upstream.status === 405 ? 502 : upstream.status,
