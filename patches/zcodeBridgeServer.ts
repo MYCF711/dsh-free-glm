@@ -1251,6 +1251,59 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
   /** 当前排队中的请求数（仅用于诊断）。 */
   let fastPathQueueDepth = 0;
 
+  /**
+   * ★★★ 按模型自适应的「最小请求间隔」（2026-09-28）。
+   *
+   * ## 为什么需要（实测驱动）
+   *
+   * 串行化只保证「同一时刻只有一个请求」，但**不保证请求之间有间隔**。
+   * 实测：一次并发 6 连测里，串行闸门放行得很快（每个请求 1-3 秒），
+   * 相邻两次上游调用间隔可能只有几十毫秒 —— 而 GLM-5.3 的并发窗口
+   * 显然比这长，于是连续撞 `3009`。
+   *
+   * ## 数据依据
+   *
+   * ```
+   * GLM-5.3-Flash  605 次 200   0 次限流
+   * GLM-5.3         74 次 200  21 次重试  6 次最终 429
+   * ```
+   *
+   * 两个模型的配额**明显不同**，所以间隔也要**按模型分别设**：
+   *
+   * - Flash：无需额外间隔（`0`）—— 它从未撞过，强加间隔是纯粹的性能损失
+   * - GLM-5.3：需要间隔。起步 **350ms**（保守估计，可按实测调整）
+   *
+   * ## 为什么是「上次请求完成后 + 间隔」而不是固定节拍
+   *
+   * 请求本身耗时 1-9 秒，若按固定节拍会与请求时长打架。
+   * 记「上一次**发车**时刻」，下次发车前确保距那时至少 `gapMs`。
+   *
+   * ## 可调
+   *
+   * `ZCODE_BRIDGE_MODEL_GAP_MS` 覆盖全局值（诊断用）。
+   */
+  const MODEL_GAP_MS: Record<string, number> = {
+    "glm-5.3": 350,
+    "glm-5.3-flash": 0,
+  };
+  /** 每个模型上次发车时刻。 */
+  const lastDispatchAt = new Map<string, number>();
+
+  /** 等够这个模型的最小间隔。 */
+  async function waitModelGap(modelKey: string): Promise<void> {
+    const gap = Number(process.env["ZCODE_BRIDGE_MODEL_GAP_MS"] ?? "") || MODEL_GAP_MS[modelKey] || 0;
+    if (gap <= 0) return;
+    const last = lastDispatchAt.get(modelKey);
+    if (last === undefined) return;
+    const wait = gap - (Date.now() - last);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+  }
+
+  /** 记下本次发车时刻。 */
+  function markDispatch(modelKey: string): void {
+    lastDispatchAt.set(modelKey, Date.now());
+  }
+
   /** 串行执行 `task()`；闸门关闭时直接执行。 */
   async function runSerialized<T>(task: () => Promise<T>): Promise<T> {
     if (!FAST_PATH_SERIALIZE) return task();
@@ -1272,22 +1325,34 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
   /**
    * ★★ 429 退避重试（2026-09-28）。
    *
-   * 串行化已经消除了「同一时刻两个请求」，但仍可能有**短窗口内的连续请求**
-   * 触发上游的速率窗口。对这类**明确可重试**的状态做一次短退避重试：
+   * ## 实测数据（决定这组参数的全部依据）
    *
-   * - `429` —— 限流
-   * - `503` / `502` —— 上游临时故障
+   * 全天统计 `fast_path.completed` 与 `fast_path.retry`：
    *
-   * **不重试** `3012`（风控，重试会加重账号冷却惩罚）与 `4xx` 业务错误
-   * （重试无意义，只会浪费额度）。
+   * ```
+   * GLM-5.3-Flash  605 次 200   0 次限流     ← 从未撞过
+   * GLM-5.3         74 次 200  21 次重试   6 次最终 429
+   * ```
    *
-   * ## 为什么只重试一次
+   * ⇒ **`GLM-5.3` 有独立且更严格的并发配额**（`code:3009 model
+   *   concurrency limit exceeded`）。Flash 档位宽松得多。
    *
-   * 上游限流窗口通常是秒级。重试一次覆盖绝大多数瞬时撞车；
-   * 重试两次以上会在真正被限流时把延迟放大到用户无法接受。
+   * 这解释了为什么「换成 GLM-5.3 更快」不完全成立：
+   * 它的**单次延迟**确实更低（实测中位 3.1s vs 5.8s），
+   * 但**并发容量**小得多，密集请求下会把时间花在重试上。
+   *
+   * ## 参数选择
+   *
+   * - 退避起点从 900ms 提到 **1500ms**：实测 900ms 的重试**仍然撞 429**
+   *   （10 次 retry 记录里重试后依旧失败），说明窗口比 900ms 长。
+   * - 重试次数从 1 提到 **2**：给窗口足够时间过去。
+   *   总最坏等待 ≈ 1500 + 3000 = 4.5s —— 仍在用户可接受范围。
+   *
+   * **不重试** `3012`（风控，重试会加重账号冷却惩罚）与其它 `4xx`
+   * 业务错误（重试无意义）。
    */
-  const FAST_RETRY_MAX = 1;
-  const FAST_RETRY_BASE_MS = 900;
+  const FAST_RETRY_MAX = 2;
+  const FAST_RETRY_BASE_MS = 1500;
 
   /**
    * 判断上游响应是否值得重试。
@@ -3339,6 +3404,47 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
               return { type: "auto" };
             })();
             /**
+             * ★★★ 给 tools 打缓存断点（2026-09-28，子代理 P0-2）。
+             *
+             * ## 问题（实测）
+             *
+             * dump 出来的实际请求里：
+             *
+             *     system blocks:  len=42 cc=True / len=2856 cc=True / len=2836 cc=True
+             *     tools[0] keys:  name, description, input_schema   ← 无 cache_control
+             *
+             * **24 个工具、19492 字节，一个 `cache_control` 都没有。**
+             * 而 system 三块全带。
+             *
+             * ## 为什么这是显著的成本
+             *
+             * Anthropic 的 prompt caching 是**前缀式**的：在某个位置打一个
+             * `cache_control` 断点，**该断点之前的所有内容**（含 system +
+             * 前面的 tools）都进缓存。
+             *
+             * 所以只需要在**最后一个 tool** 上打一个断点，就能覆盖
+             * 「system + 全部 tools」这一整段 —— 不必逐个打。
+             *
+             * 不打的话，这 ≈5K token 的工具 schema 要**每次请求全量重算**。
+             * DSH 的多步 agent 循环每步发一次请求 ⇒ 放大 5-10 倍。
+             *
+             * ## 一个旁证（子代理提供，属推测）
+             *
+             * `mintMs` 稳定在 200-700ms，而 `ttftMs` 波动可从 1.3s 飙到 25s。
+             * 差值全在上游首字节 —— 冷缓存 prefill 正是这一段的主成本。
+             * ⚠ 这条是**推测**，没做 A/B 坐实；但加 cache_control 本身
+             * 是官方客户端的既有做法（官方 dump 里 tools 是带 cc 的），
+             * 按「对齐官方」的原则就该加。
+             */
+            const cacheableTools =
+              fastTools.length === 0
+                ? fastTools
+                : fastTools.map((tool, index) =>
+                    index === fastTools.length - 1
+                      ? { ...tool, cache_control: { type: "ephemeral" as const } }
+                      : tool,
+                  );
+            /**
              * `stop_sequences` 透传（2026-09-28 补）。
              *
              * OpenAI 的 `stop`（string 或 string[]）对应 Anthropic 的 `stop_sequences`（string[]）。
@@ -3400,7 +3506,7 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
               max_tokens: maxOutputTokens ?? 8192,
               system: fastSystemBlocks,
               ...(body.stream === true ? { stream: true } : {}),
-              ...(fastTools.length === 0 ? {} : { tools: fastTools }),
+              ...(cacheableTools.length === 0 ? {} : { tools: cacheableTools }),
               ...(fastToolChoice === undefined ? {} : { tool_choice: fastToolChoice }),
               ...(fastStopSequences === undefined
                 ? {}
@@ -3508,15 +3614,22 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
             const sendUpstream = async (): Promise<Response> => {
               let last: Response | undefined;
               let attemptHeaders = fastHeaders;
+              /**
+               * 用于按模型控制最小间隔的键（必须小写，与 `MODEL_GAP_MS` 对齐）。
+               * 见 `waitModelGap()` 的说明。
+               */
+              const modelKey = modelId.toLowerCase();
               for (let attempt = 0; attempt <= FAST_RETRY_MAX; attempt += 1) {
                 const headers = attemptHeaders;
-                const res = await runSerialized(async () =>
-                  fetch(`${ZCODE_PLAN_ANTHROPIC_BASE}/v1/messages`, {
+                const res = await runSerialized(async () => {
+                  await waitModelGap(modelKey);
+                  markDispatch(modelKey);
+                  return fetch(`${ZCODE_PLAN_ANTHROPIC_BASE}/v1/messages`, {
                     method: "POST",
                     headers,
                     body: upstreamBody,
-                  }),
-                );
+                  });
+                });
                 if (res.status !== 429 && res.status !== 502 && res.status !== 503) {
                   return res;
                 }

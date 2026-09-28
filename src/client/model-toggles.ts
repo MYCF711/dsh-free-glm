@@ -94,7 +94,7 @@ const STYLES = `
   gap: 12px; padding: 7px 10px; border-radius: 6px;
   transition: background-color .12s ease;
 }
-.zcb-row:hover { background: var(--dsw-alias-bg-layout-secondary, rgba(127,127,127,.08)); }
+.zcb-row:hover { background: var(--dsw-alias-bg-layer-2, rgba(127,127,127,.08)); }
 .zcb-row[data-busy="true"] { opacity: .55; }
 .zcb-info { display: flex; align-items: baseline; gap: 8px; min-width: 0; }
 .zcb-name {
@@ -107,25 +107,45 @@ const STYLES = `
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 /* 拨动开关：原点式（一个圆点在一个胶囊里滑动） */
+/*
+ * 拨动开关 —— 逐值对齐 DSH 官方实现（dsh-client-ui-primitives/lib/Switch.module.css）。
+ *
+ * 对齐的 4 处（此前与官方不一致）：
+ *   ① 尺寸 34×18 → 36×20，thumb 14 → 16，padding 2
+ *   ② 关态底色 border-l2 → border-l3（官方用更深一档）
+ *   ③ 圆角 9px → 999px，并补 corner-shape: round
+ *      ⚠ 缺 corner-shape:round 会被 DSH 全局的 superellipse(1.5) 覆盖，
+ *        胶囊会变成"方角超椭圆"—— 官方注释专门说明了这一点
+ *   ④ 开态改用 [aria-checked='true'] 属性选择器（原用 :checked）
+ *      官方注释原话：「外观键与 aria-checked 绑定，而不是并行 class，
+ *      这样视觉状态不可能与辅助技术读到的状态不一致」
+ */
 .zcb-switch {
+  box-sizing: border-box;
   appearance: none; -webkit-appearance: none;
   position: relative; flex: 0 0 auto;
-  width: 34px; height: 18px; margin: 0; border-radius: 9px; cursor: pointer;
-  background: var(--dsw-alias-border-default, rgba(127,127,127,.45));
-  transition: background-color .15s ease;
+  width: 36px; height: 20px; padding: 2px; margin: 0;
+  border: 0; border-radius: 999px; corner-shape: round;
+  background: var(--dsw-alias-border-l3, rgba(127,127,127,.5));
+  cursor: pointer;
+  transition: background-color .12s ease;
 }
 .zcb-switch::after {
-  content: ""; position: absolute; top: 2px; left: 2px;
-  width: 14px; height: 14px; border-radius: 50%;
-  background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.25);
-  transition: transform .15s ease;
+  content: ""; display: block;
+  width: 16px; height: 16px; border-radius: 50%; corner-shape: round;
+  background: var(--dsw-alias-label-primary-foreground, #fff);
+  transition: transform 120ms ease;
 }
-.zcb-switch:checked { background: var(--dsw-alias-brand-primary, #2f6fed); }
-.zcb-switch:checked::after { transform: translateX(16px); }
-.zcb-switch:disabled { cursor: default; }
-.zcb-switch:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary, #2f6fed); outline-offset: 2px; }
+.zcb-switch[aria-checked="true"] { background: var(--dsw-alias-brand-primary, #2f6fed); }
+.zcb-switch[aria-checked="true"]::after { transform: translateX(16px); }
+.zcb-switch:disabled { cursor: default; opacity: .5; }
+.zcb-switch:focus-visible {
+  outline: var(--dsw-focus-ring-width, 2px) solid
+           var(--dsw-focus-ring-color, var(--dsw-alias-state-business-primary, #2f6fed));
+  outline-offset: 2px;
+}
 .zcb-error {
-  font-size: 12px; color: var(--dsw-alias-label-error, #d93025);
+  font-size: 12px; color: var(--dsw-alias-state-error-primary, #d93025);
   padding: 4px 10px;
 }
 .zcb-empty {
@@ -199,25 +219,35 @@ export function renderModelToggles(
       info.appendChild(id);
     }
 
-    const toggle = document.createElement("input");
-    toggle.type = "checkbox";
+    /**
+     * 开关 —— 用 button[role=switch] 而非 input[type=checkbox]，
+     * 与 DSH 官方 Switch 一致：
+     *   · 外观键是 aria-checked（属性选择器），不依赖 :checked 伪类
+     *   · 视觉状态与辅助技术读到的状态强绑定，不可能分叉
+     */
+    const toggle = document.createElement("button");
+    toggle.type = "button";
     toggle.className = "zcb-switch";
     toggle.setAttribute("role", "switch");
-    toggle.checked = !deps.isDisabled(model.id);
+    toggle.setAttribute("aria-checked", String(!deps.isDisabled(model.id)));
     toggle.setAttribute(
       "aria-label",
       `${model.name || model.id} 是否在模型选择中显示`,
     );
 
-    toggle.addEventListener("change", () => {
-      const next = !toggle.checked; // 关闭 = 取消勾选
+    toggle.addEventListener("click", () => {
+      const next = toggle.getAttribute("aria-checked") === "true"; // 当前开 → 要关
       row.dataset.busy = "true";
       toggle.disabled = true;
       void deps
         .setDisabled(model.id, next)
         .catch((error: unknown) => {
           // 写失败要把 UI 拨回去 —— 否则界面显示的状态与真实状态不一致。
-          toggle.checked = !next;
+          // ⚠ 外观键是 `aria-checked`（属性），不是 `checked`（属性）。
+          //   元素是 `<button role="switch">`，没有 `checked` 属性 ——
+          //   写 `toggle.checked` 在类型上就过不了（TS2339），
+          //   运行时是静默给 DOM 挂一个无效 expando，UI 根本不会回弹。
+          toggle.setAttribute("aria-checked", String(!next));
           const message = error instanceof Error ? error.message : String(error);
           ctx.logger?.warn?.(`[zcode-bridge] 切换模型可见性失败: ${message}`);
           const err = document.createElement("div");

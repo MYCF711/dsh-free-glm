@@ -141,6 +141,18 @@ export interface ZCodeBridgeAdapterOptions {
 const DEFAULT_REQUEST_TIMEOUT_MS = 240_000;
 
 /**
+ * ★★★ 可见输出的最小 token 预算（2026-09-28）。
+ *
+ * GLM-5.3 在 start-plan 通道上**默认开思考**，思考与可见输出共享
+ * `max_tokens`。实测：一次 512 token 的请求被思考链吃光
+ * （`reasoning_content` 1588 字符、`content` 0 字符、
+ * `finish_reason: "length"`）⇒ 用户看到**空回复**。
+ *
+ * 这个常量是发给桥的 `max_tokens` 下界。详见 `run()` 里的说明。
+ */
+const MIN_VISIBLE_BUDGET = 4096;
+
+/**
  * 文本分片粒度。
  *
  * 桥的回复动辄上千字符，一次性 yield 会让界面从空白直接跳到全文。
@@ -881,6 +893,35 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
       this.onFirstText = undefined;
     }
 
+    /**
+     * ★★★ 空回复的**预防**（2026-09-28 实测驱动）—— 见下方 `run()` 里的
+     * 预算下限逻辑。这里只做**事后记录**，便于诊断真实发生率。
+     *
+     * 现象（直接复现拿到）：
+     *
+     * ```
+     * finish_reason:        "length"
+     * content 长度:          0
+     * reasoning_content:    1588 字符
+     * usage: {"completion_tokens":512}
+     * ```
+     *
+     * ⇒ **输出预算被思考链整段吃掉**，可见内容一个字符都没有。
+     * GLM-5.3 在 start-plan 通道上**默认开思考**（不传 `thinking` 也返回
+     * `reasoning_content`），思考与可见输出共享 `max_tokens`。
+     */
+    if (
+      (finishReason === "length" || finishReason === "max_tokens") &&
+      content.trim().length === 0 &&
+      accumulatedToolCalls.length === 0
+    ) {
+      this.logger?.warn?.(
+        "[zcode-bridge] 空回复：思考链吃满输出预算" +
+          `（completion_tokens=${usage?.completion_tokens ?? "?"}）` +
+          " —— 预算下限逻辑应已阻止此情况，若频繁出现请检查 MIN_VISIBLE_BUDGET",
+      );
+    }
+
     // 合成与整包 JSON **同形**的 payload —— 后续解析逻辑一行都不用改。
     // 工具调用用**累加后**的结果（不是最后一个分片）。
     // ⚠ 变量名不能叫 `toolCalls` —— 上面（L419）已有同名 `let toolCalls`，
@@ -1243,6 +1284,54 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     if (options.maxTokens !== undefined && options.maxTokens > 0) {
       // 桥会把 max_tokens 钳到 [1, 32000]。
       body.max_tokens = options.maxTokens;
+    }
+    /**
+     * ★★★ 输出预算下限（2026-09-28，实测驱动）。
+     *
+     * ## 问题
+     *
+     * 基准测试里出现「HTTP 200 但可见内容为空」的回复。直接复现：
+     *
+     * ```
+     * finish_reason:        "length"
+     * content 长度:          0
+     * reasoning_content:    1588 字符
+     * usage: {"completion_tokens":512}
+     * ```
+     *
+     * ⇒ **512 token 的预算被思考链整段吃掉**，可见输出为零。
+     *
+     * ## 为什么 GLM-5.3 特别容易触发
+     *
+     * 实测确认：**不传 `thinking` 字段，上游照样返回 `reasoning_content`**
+     * —— GLM-5.3 在 start-plan 通道上**默认启用扩展思考**。
+     * 思考与可见输出**共享同一个 `max_tokens` 预算**。
+     *
+     * 于是调用方传 512 / 1024 这类偏小值时，稍复杂的问题就只够思考、
+     * 不够回答。表现出来就像「模型变笨了」，其实是**被截断**。
+     *
+     * ## 做法
+     *
+     * 把下界抬到 `MIN_VISIBLE_BUDGET`。这个值要能容纳：
+     *   思考链（实测 1588 字符 ≈ 1600 token，中文）+ 可见答案 + 余量
+     *
+     * 取 **4096**：给思考 1.6K、可见输出 2K+，对短问答绰绰有余，
+     * 又不会因预算虚高而被桥钳到上限。
+     *
+     * ## 为什么不干脆设很大
+     *
+     * `max_tokens` 是**上限而非预留** —— 不产生额外费用（按实际
+     * `completion_tokens` 计费）。但设得过大有另一风险：模型真的
+     * 长篇输出时会更晚停，浪费用户时间。4096 是「够用且不失控」的平衡点。
+     *
+     * ## 可关
+     *
+     * `ZCODE_BRIDGE_NO_BUDGET_FLOOR=1` 时不做抬升（诊断对照用）。
+     */
+    const requestedTokens = typeof body.max_tokens === "number" ? body.max_tokens : undefined;
+    if (process.env["ZCODE_BRIDGE_NO_BUDGET_FLOOR"] !== "1") {
+      const floor = Math.max(requestedTokens ?? 0, MIN_VISIBLE_BUDGET);
+      body.max_tokens = floor;
     }
     /**
      * ★★★ 采样参数与扩展思考透传（2026-09-28）。

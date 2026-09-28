@@ -173,6 +173,8 @@ export function buildOfficialSystemBlocks(
 ): Array<{ type: "text"; text: string; cache_control: { type: "ephemeral" } }> {
   const ephemeral = { type: "ephemeral" as const };
   const stable = OFFICIAL_STABLE_SECTIONS.join("\n\n");
+  /** environment 段（见 `buildEnvironmentSection` 的说明）。 */
+  const environmentSection = buildEnvironmentSection(options);
 
   /**
    * ★★ 只发「准入必需」的两块 —— 砍掉 5KB 行为指令（2026-09-28 实测）。
@@ -223,9 +225,156 @@ export function buildOfficialSystemBlocks(
   }> = [
     { type: "text", text: OFFICIAL_CLI_PREFIX, cache_control: ephemeral },
     { type: "text", text: stable, cache_control: ephemeral },
+    /**
+     * ★★★ environment 段（2026-09-28 补，子代理 P0-3）。
+     *
+     * ## 问题（实测）
+     *
+     * `OFFICIAL_ENVIRONMENT_LABELS` 早就定义好了，但**一次都没被引用** ——
+     * 官方每个会话都会告诉模型它的运行环境，本桥完全没发。
+     *
+     * 实测后果（子代理做的）：
+     *
+     *     问：Which model are you?
+     *     答：I'm ZCode, powered by GLM (trained by Z.ai).
+     *
+     * 只能答出笼统的 "GLM" —— 因为它**没被告知**自己是
+     * `zcode-bridge/GLM-5.3`，也不知道自己的工作目录和平台。
+     *
+     * ## 为什么这影响「能力」而不只是「自我认知」
+     *
+     * - 不知道 `Primary working directory` ⇒ 容易用相对路径瞎猜
+     * - 不知道 `Platform` / `Shell` ⇒ 可能给出 bash 命令而这里是 PowerShell
+     * - 不知道 `Is a git repository` ⇒ 会去试探性地跑 git status
+     *
+     * 这些都是**每轮都要用**的环境事实。官方给，我们也该给。
+     *
+     * ⚠ 与「P0-1 改默认模型」必须**一起做**：只把默认模型换成 GLM-5.3
+     * 而这里不告诉它型号，模型仍不知道自己叫什么。
+     */
+    { type: "text", text: environmentSection, cache_control: ephemeral },
   ];
   if (typeof callerSystem === "string" && callerSystem.trim().length > 0) {
     blocks.push({ type: "text", text: callerSystem, cache_control: ephemeral });
   }
   return blocks;
+}
+
+/**
+ * 构造官方形态的 `# Environment` 段。
+ *
+ * ## 逐字复刻官方（`OFFICIAL_ENVIRONMENT_LABELS` 定义的就是这些标签）
+ *
+ * ```
+ * # Environment
+ * You have been invoked in the following environment:
+ *  - Primary working directory: <cwd>
+ *  - Is a git repository: yes|no
+ *  - Platform: win32
+ *  - Shell: powershell
+ *  - OS Version: Windows 11 ...
+ *  - You are powered by the model named <provider>/<model>.
+ * ```
+ *
+ * ## `poweredByLine` 的 `{provider}` 填什么
+ *
+ * 填 **DSH 的 provider id**（`zcode-bridge`），不是上游账号 id。
+ * 理由：模型自我认知要服务于**当前这个调用方**（DSH），
+ * 告诉它「你在 DSH 里被当作 zcode-bridge/GLM-5.3」比
+ * 告诉它上游账号 id 更有用 —— 用户问「你是什么模型」时，
+ * 答案应当与设置页里显示的一致。
+ */
+function buildEnvironmentSection(options: { cwd: string; model?: string }): string {
+  const L = OFFICIAL_ENVIRONMENT_LABELS;
+  const cwd = options.cwd && options.cwd.trim().length > 0 ? options.cwd : ".";
+  const provider = "zcode-bridge";
+  const model = options.model && options.model.length > 0 ? options.model : "glm-5.3";
+  const lines = [
+    L.heading,
+    L.invokedLine,
+    ` - ${L.cwdLabel}: ${cwd}`,
+    // git 状态用**文件系统探测**（`.git` 是否存在），比跑 `git rev-parse` 便宜且无副作用
+    ` - ${L.gitLabel}: ${isGitRepo(cwd) ? "yes" : L.gitNo}`,
+    ` - ${L.platformLabel}: ${process.platform}`,
+    ` - ${L.shellLabel}: ${process.platform === "win32" ? "powershell" : "bash"}`,
+    ` - ${L.osVersionLabel}: ${osVersionLabel()}`,
+    L.poweredByLine.replace("{provider}", provider).replace("{model}", model),
+  ];
+  return lines.join("\n");
+}
+
+/** 判断目录是否是 git 仓库 —— 只看 `.git` 是否存在。 */
+function isGitRepo(cwd: string): boolean {
+  try {
+    // 同步探测：这个函数在每次请求的 system 构造路径上，
+    // 必须廉价。`existsSync` 一次 stat 即可。
+    const { existsSync } = require("node:fs") as typeof import("node:fs");
+    const { join } = require("node:path") as typeof import("node:path");
+    return existsSync(join(cwd, ".git"));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 取人类可读的 OS 版本描述。
+ *
+ * ## ⚠ 实测踩到的坑（Electron utilityProcess 里 os 模块不可靠）
+ *
+ * 在**纯 Node** 下探测：
+ *
+ *     node -e "const os=require('node:os'); console.log(os.release(), os.type())"
+ *     → "10.0.26200"  "Windows_NT"      ✅ 正常
+ *
+ * 但在**桥运行的 Electron utilityProcess** 里，同一段代码产出：
+ *
+ *     OS Version: win32        ← 值等于 process.platform，不是版本号
+ *
+ * 所以 `os.release()` 与 `os.type()` 在这个运行时里都可能退化成
+ * 平台标识（Electron 对 utilityProcess 的 `os` 做了裁剪/打桩）。
+ *
+ * ## 做法：多级回退，且**先验证候选值像不像版本号**
+ *
+ * 从最可靠的来源往下试，任何一个「像版本」就采用：
+ *   ① `process.getSystemVersion()`（Electron 专有 API，最准）
+ *   ② `os.release()`（纯 Node 下可用）
+ *   ③ `os.type()`
+ *   ④ 兜底 `Windows`
+ *
+ * 每一级都要求**含数字**才接受，否则继续往下 —— 这样就不会再把
+ * `win32` / `Windows_NT` 这类无信息量的值当成版本号发出去。
+ */
+function osVersionLabel(): string {
+  const accept = (value: unknown, prefix: string): string | undefined => {
+    if (typeof value !== "string" || value.length === 0) return undefined;
+    // 版本号必然含数字；`win32` / `Windows_NT` 这类平台标识会被挡下
+    if (!/\d/.test(value)) return undefined;
+    return prefix.length > 0 ? `${prefix} ${value}` : value;
+  };
+
+  try {
+    // ① Electron 专有：`process.getSystemVersion()`。
+    //    它存在时最准 —— 正是为「Electron 里 os 模块不可靠」设计的。
+    const proc = process as unknown as { getSystemVersion?: () => string };
+    if (typeof proc.getSystemVersion === "function") {
+      const v = accept(proc.getSystemVersion(), "Windows");
+      if (v !== undefined) return v;
+    }
+  } catch {
+    /* 继续往下试 */
+  }
+
+  try {
+    const os = require("node:os") as typeof import("node:os");
+    const isWin = process.platform === "win32";
+    const prefix = isWin ? "Windows" : "";
+    const r = accept(os.release(), prefix);
+    if (r !== undefined) return r;
+    const t = accept(os.type(), prefix);
+    if (t !== undefined) return t;
+  } catch {
+    /* 继续往下试 */
+  }
+
+  return process.platform === "win32" ? "Windows" : process.platform;
 }
