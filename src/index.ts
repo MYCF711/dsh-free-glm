@@ -38,6 +38,7 @@ import { probeBridge, resolveBridgeEndpoint, resolveLiveBridgeEndpoint } from ".
 import {
   fetchBilling,
   requestClaim,
+  requestCliLogin,
   requestLogin,
   type BillingData,
   type ClaimData,
@@ -1004,9 +1005,49 @@ function registerSlashCommands(ctx: Context): void {
       description: "登录 ZCode（弹出浏览器授权页；授权完成后凭据自动写回）",
       handler: async () =>
         await guard(async () => {
+          /**
+           * ★ 优先走「服务端中介登录」（2026-09-28）。
+           *
+           * 原路径经 `/api/v1/oauth/token` 换 token，而该端点自 09-28 起
+           * 稳定返回 `500 / code 2007`（假 code 直测也是 500 ⇒ 端点故障）。
+           *
+           * 新路径 `/oauth/cli/*` 是官方 3.12.3 桌面版的默认方式：
+           * 授权在服务端完成，token 由轮询直接返回。
+           *
+           * **⚠ 同步等待最长 5 分钟** —— 等用户在浏览器点「授权」。
+           * 失败时回退到 renderer 路径（至少能弹出授权页）。
+           */
+          const cliResult = await requestCliLogin({ waitMs: 280_000 });
+          if (cliResult.ok && typeof cliResult.data?.token === "string") {
+            return {
+              kind: "success",
+              text: [
+                "★ 登录成功（服务端中介路径）",
+                "",
+                `账号: ${JSON.stringify(cliResult.data.user ?? "未知")}`,
+                "",
+                "凭据已由服务端签发。可用 /zcode-quota 查看额度。",
+              ].join("\n"),
+            };
+          }
+          if (cliResult.ok && cliResult.data?.timeout === true) {
+            return {
+              kind: "error",
+              text: [
+                `等待授权超时（当前状态 ${cliResult.data.lastStatus ?? "pending"}）。`,
+                "请在浏览器里完成登录并点「授权」，然后重新执行 /zcode-login。",
+                cliResult.data.authorizeUrl !== undefined
+                  ? `授权页: ${cliResult.data.authorizeUrl}`
+                  : "",
+              ].filter((s) => s.length > 0).join("\n"),
+            };
+          }
           const result = await requestLogin();
           if (!result.ok) {
-            return { kind: "error", text: `触发登录失败：${result.error ?? "未知原因"}` };
+            return {
+              kind: "error",
+              text: `两条登录路径都失败。\n服务端中介: ${cliResult.error ?? "未知"}\nrenderer: ${result.error ?? "未知"}`,
+            };
           }
           /**
            * ⚠ **不要**在这里 `void runOnce()`（2026-09-28 实测踩过）。

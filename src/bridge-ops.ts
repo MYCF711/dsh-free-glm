@@ -222,6 +222,70 @@ export async function requestLogin(): Promise<BridgeOpsResult<OAuthLoginData>> {
   });
 }
 
+/** 桥端点：服务端中介登录（2026-09-28 新增）。 */
+export const OAUTH_CLI_LOGIN_PATH = "/oauth/cli-login";
+
+/** `POST /oauth/cli-login` 的响应。 */
+export interface CliLoginData {
+  readonly ok?: boolean;
+  readonly timeout?: boolean;
+  readonly flowId?: string;
+  readonly authorizeUrl?: string;
+  readonly browserOpened?: boolean;
+  readonly browserMessage?: string;
+  readonly lastStatus?: string;
+  readonly message?: string;
+  /** ★ 成功时返回的 zcode JWT（就是我们要的凭据）。 */
+  readonly token?: string | null;
+  readonly user?: unknown;
+  readonly bigmodel?: unknown;
+}
+
+/**
+ * ★ 服务端中介登录 —— **绕开故障的 `/oauth/token`**（2026-09-28 新增）。
+ *
+ * ## 为什么需要它
+ *
+ * 原有登录走壳的 renderer，最终经 `POST /api/v1/oauth/token` 换 token。
+ * 而该端点在 2026-09-28 起稳定返回 `500 / code 2007`：
+ *
+ * - 三次真实登录尝试全部 500（11:00 / 11:14 / 13:47）
+ * - **用假 code 直测也是 500** ⇒ 端点自身故障，非参数问题
+ * - 官方 i18n：`2007 = "上游服务暂时不可用，请稍后重试"`
+ *
+ * ## 替代路径（官方 3.12.3 桌面版的默认方式）
+ *
+ * ```
+ * ① POST /api/v1/oauth/cli/init  {provider}   Bearer <32字节hex>
+ * ② 浏览器打开 authorize_url（桥自动做）
+ * ③ GET  /api/v1/oauth/cli/poll/{flow_id}
+ *      → status:"ready" 时返回 { token, user, bigmodel:{access_token} }
+ * ```
+ *
+ * **⇒ 授权在服务端完成（`/oauth/cli/callback/bigmodel`），
+ * token 由轮询直接返回，完全不经过 `/oauth/token`。**
+ *
+ * ## 超时语义
+ *
+ * 本函数是**同步等待**的（默认 5 分钟）—— 它在等用户在浏览器里点「授权」。
+ * 所以超时是正常路径之一：超时返回 `{ok:false, timeout:true}`，
+ * 并带上 `authorizeUrl` 以便调用方展示或手动重开。
+ */
+export async function requestCliLogin(
+  options: { provider?: string; waitMs?: number } = {},
+): Promise<BridgeOpsResult<CliLoginData>> {
+  return await callBridge<CliLoginData>(OAUTH_CLI_LOGIN_PATH, {
+    method: "POST",
+    body: {
+      provider: options.provider ?? "bigmodel",
+      // 默认 5 分钟：与官方 LOGIN_TIMEOUT_MS 一致
+      waitMs: options.waitMs ?? 290_000,
+    },
+    // 客户端超时略大于桥侧，让桥自己先返回 timeout 响应（信息更全）
+    timeoutMs: (options.waitMs ?? 290_000) + 30_000,
+  });
+}
+
 /** `GET /diagnostics/billing` 的响应（字段与桥逐字对应）。 */
 export interface BillingData {
   readonly ok?: boolean;

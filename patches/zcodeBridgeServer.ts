@@ -601,6 +601,33 @@ export interface ZCodeBridgeDeps {
     /** 人可读的状态说明 */
     message?: string;
   }>;
+
+  /**
+   * 用系统浏览器打开任意 URL（2026-09-28 新增）。
+   *
+   * ## 为什么需要（与 startLogin 的区别）
+   *
+   * `startLogin` 走的是**壳的 renderer**（生成 state、注册、开浏览器）——
+   * 它依赖 `zcode://oauth/callback` 深链回流，且**必须经
+   * `/api/v1/oauth/token` 换 token**。
+   *
+   * 而该端点在 2026-09-28 起稳定返回 `500 / code 2007`
+   * （官方 i18n 定义为「上游服务暂时不可用」，三次实测一致，
+   * 用假 code 直测也是 500 ⇒ 端点自身故障）。
+   *
+   * **替代路径：服务端中介的 CLI 登录**（官方 3.12.3 桌面版的默认方式）：
+   *
+   * ```
+   * POST /api/v1/oauth/cli/init  {provider}   → {flow_id, authorize_url, poll_interval_sec}
+   * 浏览器打开 authorize_url                    ← 用本方法
+   * GET  /api/v1/oauth/cli/poll/{flow_id}      → status:"ready" 时返回 token
+   * ```
+   *
+   * **⇒ 全程纯 HTTP，不经过 `/oauth/token`，也不依赖 renderer。**
+   *
+   * 本方法只负责第 2 步（开浏览器）；init 与 poll 由桥自己用 fetch 完成。
+   */
+  readonly openUrl?: (url: string) => Promise<{ ok: boolean; message?: string }>;
   readonly mintAuthMaterial?: (params: {
     providerId: string;
     modelId: string;
@@ -1678,6 +1705,196 @@ export function createZCodeBridge(deps: ZCodeBridgeDeps): Promise<ZCodeBridge> {
        *   200 { ok: true, authorizeUrl, message }
        *   501 宿主没注入 startLogin
        */
+      /**
+       * ★★ `POST /oauth/cli-login` —— 服务端中介登录（2026-09-28 新增）。
+       *
+       * ## 为什么加这条（解决登录的硬阻塞）
+       *
+       * 原有的 `/oauth/login` 走壳的 renderer，最终经
+       * `POST /api/v1/oauth/token` 换 token —— 而该端点在 2026-09-28
+       * 起稳定返回 `500 / code 2007`：
+       *
+       * - 三次真实登录尝试（11:00 / 11:14 / 13:47）全部 500
+       * - **用假 code 直测也是 500** ⇒ 端点自身故障，非参数问题
+       * - 官方 i18n：`2007 = "上游服务暂时不可用，请稍后重试"`
+       *
+       * ## 替代路径（官方 3.12.3 桌面版的默认方式）
+       *
+       * ```
+       * ① POST /api/v1/oauth/cli/init   body {provider}   Bearer <32字节hex>
+       *      → { flow_id, authorize_url, expires_at, poll_interval_sec }
+       * ② 用系统浏览器打开 authorize_url（本端点自动做）
+       * ③ GET /api/v1/oauth/cli/poll/{flow_id}   Bearer <同一个 token>
+       *      → status:"pending" 继续轮询；"ready" 时返回 { token, user, ... }
+       * ```
+       *
+       * **⇒ 授权在服务端完成（`/oauth/cli/callback/bigmodel` 记录），
+       * token 由轮询直接返回，完全不经过 `/oauth/token`。**
+       *
+       * 实测（本项目 2026-09-28）：
+       * ```
+       * init  → {"code":0,"data":{"flow_id":"78a978bb...","authorize_url":
+       *          "https://bigmodel.cn/login?appId=zcode&redirect=
+       *           https://zcode.z.ai/api/v1/oauth/cli/callback/bigmodel&state=..."}}
+       * poll  → {"code":0,"data":{"status":"pending"}}   ← 端点活着
+       * ```
+       *
+       * ## 与 `/oauth/login` 的关键差异
+       *
+       * | | /oauth/login | /oauth/cli-login |
+       * |---|---|---|
+       * | 依赖 renderer | 是（生成 state、注册） | **否（纯 HTTP）** |
+       * | 换 token | `/oauth/token`（**故障**） | poll 直接返回 |
+       * | 回调 | `zcode://` deep link | 服务端 callback 路由 |
+       *
+       * ## 请求
+       *
+       *   { "provider": "bigmodel" }   可选，默认 bigmodel
+       *   { "waitMs": 300000 }         可选，轮询最长等待（默认 5 分钟）
+       */
+      if (method === "POST" && url === "/oauth/cli-login") {
+        let cliBody: Record<string, unknown> = {};
+        try {
+          cliBody = JSON.parse(await readBody(request)) as Record<string, unknown>;
+        } catch {
+          cliBody = {};
+        }
+        const provider =
+          typeof cliBody["provider"] === "string" && cliBody["provider"].trim().length > 0
+            ? cliBody["provider"].trim()
+            : "bigmodel";
+        const waitMs =
+          typeof cliBody["waitMs"] === "number" && cliBody["waitMs"] > 0
+            ? cliBody["waitMs"]
+            : 300_000;
+        const CLI_BASE = "https://zcode.z.ai/api/v1/oauth/cli";
+        /** 客户端 poll token：32 字节 hex，init 与 poll 共用同一个。 */
+        const { randomBytes: rb } = await import("node:crypto");
+        const pollToken = rb(32).toString("hex");
+        try {
+          /** ① init */
+          const initResponse = await fetch(`${CLI_BASE}/init`, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${pollToken}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ provider }),
+          });
+          const initText = await initResponse.text();
+          const initPayload = JSON.parse(initText) as {
+            code?: number;
+            msg?: string;
+            data?: {
+              flow_id?: string;
+              authorize_url?: string;
+              expires_at?: number;
+              poll_interval_sec?: number;
+            };
+          };
+          if (
+            initPayload.code !== 0 ||
+            typeof initPayload.data?.flow_id !== "string" ||
+            typeof initPayload.data?.authorize_url !== "string"
+          ) {
+            errorJson(
+              response,
+              502,
+              `cli/init failed: ${initText.slice(0, 300)}`,
+              "upstream_error",
+            );
+            return;
+          }
+          const flowId = initPayload.data.flow_id;
+          const authorizeUrl = initPayload.data.authorize_url;
+          const pollIntervalSec = initPayload.data.poll_interval_sec ?? 2;
+
+          /** ② 开浏览器（宿主注入的能力；缺了就返回 URL 让调用方自己开）。 */
+          let browserOpened = false;
+          let browserMessage = "宿主未注入 openUrl，请手动打开返回的 authorizeUrl";
+          if (deps.openUrl !== undefined) {
+            const opened = await deps.openUrl(authorizeUrl);
+            browserOpened = opened.ok;
+            browserMessage = opened.message ?? (opened.ok ? "已打开授权页" : "打开失败");
+          }
+
+          /** ③ 轮询到 ready / 超时 */
+          const deadline = Date.now() + waitMs;
+          let finalData: Record<string, unknown> | null = null;
+          let lastStatus = "pending";
+          while (Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, pollIntervalSec * 1000));
+            const pollResponse = await fetch(
+              `${CLI_BASE}/poll/${encodeURIComponent(flowId)}`,
+              { headers: { authorization: `Bearer ${pollToken}` } },
+            );
+            /** 5xx / 网络错误按 pending 重试（与官方语义一致）。 */
+            if (pollResponse.status >= 500) continue;
+            if (pollResponse.status >= 400 && pollResponse.status !== 408 && pollResponse.status !== 429) {
+              errorJson(response, 502, `cli/poll fatal: status=${pollResponse.status}`, "upstream_error");
+              return;
+            }
+            const pollText = await pollResponse.text();
+            let pollPayload: { code?: number; data?: Record<string, unknown> } = {};
+            try {
+              pollPayload = JSON.parse(pollText) as typeof pollPayload;
+            } catch {
+              continue;
+            }
+            if (pollPayload.code !== 0) {
+              errorJson(response, 502, `cli/poll failed: ${pollText.slice(0, 200)}`, "upstream_error");
+              return;
+            }
+            const status = String(pollPayload.data?.["status"] ?? "pending");
+            lastStatus = status;
+            if (status === "ready") {
+              finalData = pollPayload.data ?? null;
+              break;
+            }
+            if (status === "failed") {
+              errorJson(response, 502, "cli/poll reported failed", "upstream_error");
+              return;
+            }
+          }
+          if (finalData === null) {
+            json(response, 200, {
+              ok: false,
+              timeout: true,
+              flowId,
+              authorizeUrl,
+              browserOpened,
+              browserMessage,
+              lastStatus,
+              message: `等待授权超时（${Math.round(waitMs / 1000)}秒），当前状态 ${lastStatus}。`,
+            });
+            return;
+          }
+          json(response, 200, {
+            ok: true,
+            flowId,
+            authorizeUrl,
+            browserOpened,
+            browserMessage,
+            /**
+             * `token` 就是 zcode JWT。
+             * `user` / `bigmodel` 含账号与 access_token。
+             */
+            token: finalData["token"] ?? null,
+            user: finalData["user"] ?? null,
+            bigmodel: finalData["bigmodel"] ?? null,
+            raw: finalData,
+          });
+        } catch (error) {
+          errorJson(
+            response,
+            502,
+            `cli-login failed: ${error instanceof Error ? error.message : String(error)}`,
+            "upstream_error",
+          );
+        }
+        return;
+      }
+
       if (method === "POST" && url === "/oauth/login") {
         if (deps.startLogin === undefined) {
           errorJson(
