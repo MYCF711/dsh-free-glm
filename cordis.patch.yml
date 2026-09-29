@@ -1,5 +1,5 @@
-# dsh-zcode-bridge 配置包补丁：在空配置根上追加插件行。
+# dsh-free-glm 配置包补丁：在空配置根上追加插件行。
 # 后续配置补丁可通过 id 引用此行。
 - insert:
     - id: zcode-bridge
-      name: 'dsh-zcode-bridge'
+      name: 'dsh-free-glm'

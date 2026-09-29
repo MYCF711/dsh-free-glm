@@ -708,7 +708,7 @@ export async function apply(ctx: Context): Promise<void> {
         }
         try {
           writeFileSync(
-            join(tmpdir(), "dsh-zcode-bridge-settled.json"),
+            join(tmpdir(), "dsh-free-glm-settled.json"),
             JSON.stringify(
               {
                 sampledAt: new Date().toISOString(),

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "ZCode Quota Access",
+    "description": "Brings the local ZCode client's model quota into DSH: manage available models and accounts from Settings > Models, with one-click check-in and automatic claiming, and tool calling in conversations."
+  }
+}

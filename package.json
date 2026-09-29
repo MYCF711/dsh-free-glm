@@ -1,7 +1,7 @@
 {
-  "name": "dsh-zcode-bridge",
-  "version": "0.9.3",
-  "description": "DSH plugin: ZCode free-quota GLM provider via the local ZCode bridge, with prompt-bridged tool calling (requires the ZCode opensource instance running with ZCODE_BRIDGE=1)",
+  "name": "dsh-free-glm",
+  "version": "0.10.0",
+  "description": "ZCode quota access for DSH: manage models and accounts from the Models settings page, with check-in and automatic claiming.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -17,13 +17,13 @@
   },
   "files": [
     "lib",
+    "locale",
     "cordis.patch.yml"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/bundle-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node scripts/test-tool-bridge.mjs",
-    "prepare": "tsc -p tsconfig.json && node scripts/bundle-client.mjs"
+    "test": "node scripts/test-tool-bridge.mjs"
   },
   "dsh": {
     "bundle": {
@@ -40,7 +40,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
     "@deepseek-ai/schemastery": "3.18.4",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.3"
