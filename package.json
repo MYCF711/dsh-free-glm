@@ -22,7 +22,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/bundle-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node scripts/test-tool-bridge.mjs"
+    "test": "node scripts/test-tool-bridge.mjs",
+    "prepare": "tsc -p tsconfig.json && node scripts/bundle-client.mjs"
   },
   "dsh": {
     "bundle": {
@@ -39,7 +40,7 @@
   },
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.2",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
     "@deepseek-ai/schemastery": "3.18.4",
     "@types/node": "^22.0.0",
     "typescript": "^5.6.3"
@@ -49,4 +50,3 @@
   },
   "license": "MIT"
 }
-
