@@ -17,8 +17,11 @@
   },
   "files": [
     "lib",
+    "src",
+    "scripts/bundle-client.mjs",
     "locale",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "tsconfig.json"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/bundle-client.mjs",
