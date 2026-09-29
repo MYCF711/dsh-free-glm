@@ -904,44 +904,58 @@ export async function apply(ctx: Context): Promise<void> {
       settingsNs: SETTINGS_NS,
       settingsPath: [],
     },
-    /**
-     * ★ 声明式镜像 route（2026-09-29 新增）。
-     *
-     * ## 为什么必须在这里也声明一次
-     *
-     * `syncDeclarativeMirror()` 只是把配置**写进** settings 的
-     * `llm-pi-ai.providers.zcode-free` —— 但**写不等于声明**。
-     * 官方的 `joinProviderDirectory()` 对"已注册但未声明"的 route 一律给
-     * `settingsNs: ""`：
-     *
-     * ```js
-     * for (const provider of registered) {
-     *   if (declared.has(provider.id)) continue;
-     *   rows.push({ provider: provider.id, displayName: provider.name,
-     *               settingsNs: "", settingsPath: [], active: true });   // ← 空串
-     * }
-     * ```
-     *
-     * 而 `settingsNs` 为空串的 route 在设置页里**渲染不出编辑器**
-     *（没有可寻址的配置段）。所以必须在这里把镜像 route 也登记进
-     * `registerConfigurableProviders`，并给出它真实的 settings 地址
-     * `["providers", MIRROR_ROUTE]`（相对 `llm-pi-ai` 命名空间）。
-     *
-     * ## 与第一个条目的分工
-     *
-     * | provider | settingsNs | settingsPath | 设置页表现 |
-     * |---|---|---|---|
-     * | `zcode-bridge`（插件注册） | `zcode-bridge` | `[]` | 卡片可显示；**扩展槽**承载我们的 UI |
-     * | `zcode-free`（声明式镜像） | `llm-pi-ai` | `["providers","zcode-free"]` | **官方原生**可编辑卡片 |
-     *
-     * 两者共存不冲突：route id 不同，各自注册各自的 adapter。
-     */
-    {
-      provider: MIRROR_ROUTE,
-      displayName: "ZCode Bridge (声明式)",
-      settingsNs: "llm-pi-ai",
-      settingsPath: ["providers", MIRROR_ROUTE],
-    },
+  /**
+   * ⚠ **不要在这里声明镜像 route**（2026-09-29 实测纠正）。
+   *
+   * 早先这里加过一条：
+   *
+   * ```ts
+   * { provider: MIRROR_ROUTE, displayName: "...",
+   *   settingsNs: "llm-pi-ai", settingsPath: ["providers", MIRROR_ROUTE] }
+   * ```
+   *
+   * 它会让**整个插件加载失败**（实测）：
+   *
+   * ```
+   * LlmError: configurable provider "zcode-free" is already declared
+   *   at registerConfigurableProviders (dsh-llm/lib/index.js:1937)
+   * dsh: warning: 1 entry did not activate
+   * ```
+   *
+   * ## 为什么必然冲突
+   *
+   * `dsh-llm` 的 `commit()` 判据是：
+   *
+   * ```js
+   * if (this.directory.has(entry.provider) && !own.has(entry.provider)
+   *     || detached.some((seen) => seen.provider === entry.provider))
+   *   throw new LlmError(... "DUPLICATE_DIRECTORY");
+   * ```
+   *
+   * 而 `zcode-free` **已经由 `llm-pi-ai` 声明** ——
+   * `syncDeclarativeMirror()` 把它写进 settings 的
+   * `llm-pi-ai.providers.zcode-free`，那正是该 namespace 的 Config 内容，
+   * 由 llm-pi-ai 自己登记进 directory。
+   * 于是 `directory.has("zcode-free")` 为真、`own` 不含它 → 抛错。
+   *
+   * ## 后果为什么严重
+   *
+   * 注册是 **all-or-nothing**（`dsh-llm` 原文：「an empty list, invalid entry,
+   * or a provider already declared by any registration throws LlmError
+   * **without registering the rest**」）。
+   * 异常从 `apply()` 抛出 → **后面的 `registerAdapter` 全都没执行**
+   * → provider 根本没注册 → 模型选择器里看不到它。
+   *
+   * ## 正确分工
+   *
+   * | route | 谁声明 | 载体 |
+   * |---|---|---|
+   * | `zcode-bridge` | 本插件 | 上面那条 registerConfigurableProviders |
+   * | `zcode-free` | **llm-pi-ai** | syncDeclarativeMirror() 写 settings |
+   *
+   * 镜像 route 是「借 llm-pi-ai 的车」，**声明权归 llm-pi-ai**；
+   * 我们只负责把端口写对。两条路都声明 = 冲突。
+   */
   ]);
 
   const adapter = new ZCodeBridgeAdapter({
