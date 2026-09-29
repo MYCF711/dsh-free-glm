@@ -1,0 +1,4410 @@
+diff --git a/docs/agents/catalog-gating.md b/docs/agents/catalog-gating.md
+index 102e8df..4fd1c81 100644
+--- a/docs/agents/catalog-gating.md
++++ b/docs/agents/catalog-gating.md
+@@ -15,7 +15,7 @@
+ - 过滤点在适配器的 `listModels`，每次调用实时读 `pool.disabledModelsFor(provider)`，改开关后无需重建适配器
+ - **只影响模型目录播报，不影响路由**：被关闭的模型仍可 `resolveModel` / 正常收发请求（DSH 约定：`listModels` 结果仅供参考）
+ - `AccountPool` 的 `writeAccounts` / `writeModels` 都是**整体 replace**，两者必须互相携带对方的字段，否则一次账号操作会把模型开关清空（反之亦然）
+-- `CodeArtsAdapter.listModels` 必须 `await this.ensureRemoteModels()`：早期用 `void` 丢弃 Promise，冷缓存时会误用静态兜底表
++- `CodeArtsAdapter.listModels` **不得** `await this.ensureRemoteModels()`：`listModels()` 是模型选择器的 UI 热路径，等待网络会让选择器卡住（见下「非阻塞」一节）。早期它确实 `await` 过，当时的理由是「冷缓存时会误用静态兜底表」—— 该问题现由「首帧给已知目录 + 后台刷新完成即广播重读」解决
+ - RPC：`model.list` / `model.setDisabled`（`src/jet-hub-rpc.ts`），前端在 `plugin-src/client/jet-hub.js` 的 `ModelListPanel`
+ 
+ ### ⚠️ 设置页目录必须走 `listAllModels`，不能复用 `listModels`
+@@ -40,6 +40,93 @@
+ 名字随开关跳变。
+ 
+ 
++---
++
++## ⚠ `listModels()` 必须**非阻塞**：首帧只读缓存，网络转后台
++
++**真实性能缺陷**（用户报障：「装了 JetHub 后，会话框右下角的模型选择器要加载
++很久才出来」）。
++
++### 根因
++
++`listModels()` 是**模型选择器的 UI 热路径**，而多个适配器在里面**同步等待网络**：
++
++| 适配器 | 修复前的阻塞点 |
++|---|---|
++| `antigravity-adapter` | `await this.ensureRemoteModels()` |
++| `antigravity-local-adapter` | `await this.ensureModelConfigs()` + `await this.probeChannels()` |
++| `buddy-adapter` | `await this.ensureRemoteModels()` |
++| `llm-adapter`(codearts) | `await this.ensureRemoteModels()` |
++| `lobsterai-adapter` | `await this.ensureRemoteModels()` |
++| `trae-adapter` | `await this.ensureRemoteModels()` |
++| `zcode-adapter` / `raccoon` / `loomy` / `cline` | `await this.loadModels()` / `ensureRemoteModels()` |
++| 全部 14 个 provider | `await providerCatalogVisible(...)`（凭据解析） |
++
++DSH 逐个 provider 收集目录，这些 await **串行叠加** ⇒ 首帧耗时 = 所有 provider
++的网络往返之和。
++
++### 修法：`src/catalog-refresh.ts` 的 `CatalogRefresh`
++
++每个适配器持有一个 `CatalogRefresh<T>`，它把「缓存 / 并发去重 / 变化广播 /
++失败冷却」收敛成一份实现：
++
++1. **`listModels()` 只读 `refresh.get()`**（纯内存、同步），**并调用
++   `refresh.start()` 触发后台刷新**（`start()` 同步返回，不 await）；
++2. 拉到结果且**与上次播报的不同**时，回调 `onCatalogChanged`
++   → 广播 `llm/adapters-updated` → 选择器重读；
++3. **`resolveModel()` / `stream()` 仍等**（`await refresh.settled()`）：它们
++   需要**准确**元数据（上下文窗口、图片能力），且不是首帧热路径。
++
++⚠ **`onCatalogChanged` 必须由 `index.ts` 注入**（复用 `broadcastCatalogChanged`）。
++不注入则首帧的兜底表不会被真实目录替换，用户看到「模型少了一大截」。
++
++⚠ **必须有失败冷却**（`FAILURE_COOLDOWN_MS`，30 秒）：拉取失败时缓存仍为空，
++而 `listModels()` 会被反复调用 —— 没有冷却就变成「每次打开选择器都重试一次
++网络」的请求风暴，**比修复前更糟**（修复前至少只发一次）。
++
++⚠⚠ **`start()` 里不能写 `this.loading = this.run()`**：`run()` 可能在第一个
++`await` 之前就同步跑完（`fetch()` 同步抛错即是），于是 `finally` 先清空
++`loading`、赋值语句再把它写回 ⇒ `loading` 永远非 undefined ⇒ `settled()`
++死循环。必须「先存本地变量、再挂清理钩子」。回归用例见
++`tests/unit/catalog-refresh.spec.ts` 的「同步抛错的 fetch 不得让 settled() 死锁」。
++
++### 门控同步化：`providerCatalogVisibleSync`
++
++`hasLoggedInAccount()` 是异步的（逐个 `await ctx.credentials.resolve`）。为让
++热路径彻底无 `await`，新增同步版：
++
++- `AccountPool.catalogVisibleSync(provider)`：返回**上次已知结果**并后台刷新；
++  冷启动无缓存时**保守放行**（返回 true）。
++- `providerCatalogVisibleSync()`：与异步版**同一套开关与保守放行**，只是不等。
++
++⚠ **冷启动那一帧的「假放行」必须被纠正**：算出的结果与**已渲染的那一帧**不同时，
++`AccountPool.onVisibilityChanged` 会广播（由 `index.ts` 注入）。否则「未登录的
++provider 不该显示」这条语义会在整个会话里失效。
++
++⚠ **替身必须实现 `catalogVisibleSync`**：`providerCatalogVisibleSync` 对它做
++**能力检测**，缺失时保守放行。只 mock `hasLoggedInAccount` 的门控用例会
++**永远可见**、形同虚设（改门控相关测试时极易踩到）。
++
++### `whenCatalogReady()`：非热路径的等待入口
++
++`model.list` / `model.setDisabled` 等 RPC 是**用户主动发起**的，需要准确目录，
++故在取 `listAllModels()` 之前 `await adapter.whenCatalogReady?.()`。
++
++⚠ **`model.setAllDisabled` 尤其必须等**：据兜底表写入黑名单会**漏掉远端独有**
++的模型，用户看到「关了全部却还有几个亮着」。
++
++⚠ `whenCatalogReady()` 是**可选方法**（`ModelCatalogSource` 契约里带 `?`），
++缺省时退化为「直接用当前缓存」，不会报错。
++
++### 验证
++
++- `tests/unit/catalog-refresh.spec.ts` —— 共享部件的契约（同步返回 / 并发去重 /
++  变化才广播 / 失败冷却 / 死锁回归）。
++- `scripts/probe-listmodels-nonblocking.mts` —— **行为证明**：把 11 个适配器的
++  远端拉取换成**永不 resolve** 的 Promise，断言 `listModels()` 仍在 50ms 内返回。
++  修复前该脚本会在 loomy 上超时（已做反向验证）。
++
++
+ ---
+ 
+ ## 目录门控：没有已登录账号就隐藏整个 provider
+diff --git a/src/account-pool.ts b/src/account-pool.ts
+index 35a001f..6fa2f07 100644
+--- a/src/account-pool.ts
++++ b/src/account-pool.ts
+@@ -69,6 +69,30 @@ export class AccountPool {
+   private loomyPermanentLockedCache = false
+   /** 是否已完成首次载入。 */
+   private loaded = false
++  /**
++   * provider → 「是否至少有一个已登录账号」的**上次已知结果**。
++   *
++   * 供 {@link catalogVisibleSync} 给 UI 热路径做同步判定（见该方法的注释）。
++   * 只在内存里，不落盘 —— 它是派生值，落盘反而会与凭据状态不一致。
++   */
++  private readonly visibilityCache = new Map<string, boolean>()
++  /**
++   * provider → **已经播报给客户端的那一帧**可见性。
++   *
++   * 与 {@link visibilityCache} 的区别：后者是「当前已知真相」，本字段是
++   * 「客户端当前看到的是什么」。两者不同即需要广播重读（见
++   * {@link AccountPool.applyVisibility}）。
++   */
++  private readonly visibilityRendered = new Map<string, boolean>()
++  /** 正在进行中的可见性刷新（按 provider 去重）。 */
++  private readonly visibilityLoading = new Set<string>()
++  /**
++   * 可见性判定结果与「已播报的那一帧」不一致时的回调。
++   *
++   * 由 `index.ts` 注入为「广播 `llm/adapters-updated`」。**不是必填**：
++   * headless / 单测下不注入即退化为「只更新缓存，不通知」。
++   */
++  onVisibilityChanged: ((provider: string, visible: boolean) => void) | undefined
+   private listeners: Array<() => void | Promise<void>> = []
+ 
+   /** 订阅账号池变更事件（新增/删除/更新/清理时触发）。返回退订函数。 */
+@@ -463,7 +487,6 @@ export class AccountPool {
+   findAccount(id: string): ProviderAccountEntry | undefined {
+     return this.readAccounts().find(a => a.id === id)
+   }
+-
+   /** 列出某 provider 的全部账号（含已停用），供「重测所有 / 重置所有」使用。 */
+   listAccountsByProvider(provider: string): ProviderAccountEntry[] {
+     return this.readAccounts().filter(a => a.provider === provider)
+@@ -502,6 +525,80 @@ export class AccountPool {
+     return false
+   }
+ 
++  /**
++   * **同步**版的登录账号判据，供 UI 热路径（`listModels`）使用。
++   *
++   * ## 为什么需要它
++   *
++   * `hasLoggedInAccount()` 是异步的（要逐个 `await ctx.credentials.resolve`）。
++   * 虽然实测只花 6ms（11 个账号都在本地凭据存储里，不涉网络），但
++   * `listModels()` 是模型选择器的**首帧热路径**，任何 `await` 都会让
++   * `listModels` 返回的 Promise 挂起到下一个微任务 —— 14 个 provider 叠加
++   * 起来就是可感知的延迟。故这里给出「**读已知结果 + 后台刷新**」的同步形态。
++   *
++   * ## 语义：保守放行 + 结果变化即通知
++   *
++   * - 尚无缓存（冷启动首次调用）→ 返回 **true**（可见）。与
++   *   `providerCatalogVisible` 的「判定不可用时宁多勿少」同一条约定。
++   * - 有缓存 → 返回上次结果，**同时**在后台刷新。
++   *
++   * ## ⚠ 冷启动那一帧的「假放行」必须被纠正
++   *
++   * 冷启动首帧返回 true 是个**临时的猜测**。若后台算出的结果与**已经渲染
++   * 出去的那一帧**不同，必须通知客户端重读 —— 否则「未登录的 provider
++   * 不该显示」这条既有语义会在整个会话里失效（用户看到一堆用不了的模型）。
++   *
++   * 故这里记两份：{@link visibilityCache} 是**当前已知真相**，
++   * {@link visibilityRendered} 是**已经播报出去的那一帧**。两者不一致时
++   * 调用 `onVisibilityChanged`（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`），并在广播后把后者对齐到前者。
++   *
++   * ⚠ 与「用户登录/登出」路径的广播**不重复**：那条路径走 RPC，
++   * 由 `jet-hub-rpc.ts` 的 `broadcastCatalogChanged` 负责；这里只处理
++   * 「冷启动首帧猜错」这一种情形，且只在**值真的从渲染基准变了**时才发。
++   */
++  catalogVisibleSync(provider: string): boolean {
++    const cached = this.visibilityCache.get(provider)
++    const rendered = cached ?? true
++    // 已渲染的那一帧：首次调用即固定下来（就是本次要返回的值）。
++    if (!this.visibilityRendered.has(provider)) this.visibilityRendered.set(provider, rendered)
++    // 后台刷新（去重：已有进行中的刷新就跳过）。
++    if (!this.visibilityLoading.has(provider)) {
++      const task = this.hasLoggedInAccount(provider)
++        .then((visible) => { this.applyVisibility(provider, visible) })
++        .catch(() => {
++          // 读凭据异常（存储损坏等）时保守置为**可见** —— 与
++          // providerCatalogVisible 的 catch 分支同义。
++          this.applyVisibility(provider, true)
++        })
++        .finally(() => { this.visibilityLoading.delete(provider) })
++      this.visibilityLoading.add(provider)
++      // ⚠ 必须吞掉 Promise 的 rejection：`.catch` 已在上游接住，这里只为
++      // 避免「unhandled rejection」告警（Node 会因此打印堆栈，干扰用户排查）。
++      void task
++    }
++    return rendered
++  }
++
++  /**
++   * 记下新的可见性；若与**已渲染的那一帧**不同，通知客户端重读。
++   *
++   * ⚠ 广播必须吞掉异常：它只是「请重读」的提示，失败不应影响判定本身
++   * （与 `broadcastCatalogChanged` 同一条约定）。
++   */
++  private applyVisibility(provider: string, visible: boolean): void {
++    this.visibilityCache.set(provider, visible)
++    if (this.visibilityRendered.get(provider) === visible) return
++    // 对齐「已渲染」基准，随后广播 —— 顺序不能反：先对齐再广播，
++    // 途中若又被调用（并发）会看到已对齐的值，不会重复广播。
++    this.visibilityRendered.set(provider, visible)
++    try {
++      this.onVisibilityChanged?.(provider, visible)
++    } catch {
++      // 通知失败不影响判定（同上）。
++    }
++  }
++
+   /**
+    * 按账号 id 解析凭据（**不检查 enabled**）。
+    *
+@@ -834,6 +931,31 @@ export async function providerCatalogVisible(
+   }
+ }
+ 
++/**
++ * **同步**版的 {@link providerCatalogVisible}，供 `listModels` 这类 UI 热路径用。
++ *
++ * 判定语义与异步版**完全一致**（同一个开关、同一套保守放行），唯一区别是
++ * 「不等凭据解析」—— 拿 {@link AccountPool.catalogVisibleSync} 的上次已知结果。
++ *
++ * 为什么值得单列一个函数而不是把异步版改成同步：`hasLoggedInAccount` 是
++ * **凭据存储的真相来源**，设置页/诊断路径仍要它的精确值；而 `listModels`
++ * 只要「首帧够快」。两个消费者需求不同，故两个入口。
++ */
++export function providerCatalogVisibleSync(
++  accountPool: AccountPool | undefined,
++  provider: string,
++): boolean {
++  if (!resolveHideWithoutAccountFlag(process.env.DSH_HIDE_MODELS_WITHOUT_ACCOUNT)) return true
++  if (accountPool === undefined) return true
++  if (typeof accountPool.catalogVisibleSync !== 'function') return true
++  try {
++    return accountPool.catalogVisibleSync(provider)
++  } catch {
++    // 与异步版同理：判定不可用时保守展示（宁多勿少）。
++    return true
++  }
++}
++
+ /**
+  * 解析 `DSH_HIDE_MODELS_WITHOUT_ACCOUNT`；**默认开启**。
+  *
+diff --git a/src/antigravity-adapter.ts b/src/antigravity-adapter.ts
+index 9b685cf..8acaf2d 100644
+--- a/src/antigravity-adapter.ts
++++ b/src/antigravity-adapter.ts
+@@ -74,6 +74,7 @@ import {
+   type AntigravityCredential,
+ } from './antigravity.js'
+ import { readWithIdleTimeout, resolveToolPairing } from './sse.js'
++import { CatalogRefresh } from './catalog-refresh.js'
+ 
+ /** provider 路由名（注册到 ctx.llm）。 */
+ export const ANTIGRAVITY_PROVIDER = 'antigravity'
+@@ -165,6 +166,14 @@ export interface AntigravityAdapterOptions {
+    */
+   refresh?: (refreshToken: string) => Promise<string>
+   fetchImpl?: typeof fetch
++  /**
++   * 后台刷新**改变了目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ **必须注入**，否则 `listModels()` 非阻塞化会引入回归：首帧渲染内置
++   * 目录，远端目录随后落地却没人通知选择器。见 `catalog-refresh.ts`。
++   */
++  onCatalogChanged?: () => void
+   /** 跳过向 ctx.llm 注册 configurableProviders（由 index.ts 统一管理）。 */
+   skipConfigurableRegistration?: boolean
+ }
+@@ -373,8 +382,20 @@ export class AntigravityAdapter extends LlmAdapter {
+   private readonly fetchImpl: typeof fetch
+   private readonly readCredential: () => AntigravityCredential | undefined
+   private readonly refreshImpl: ((refreshToken: string) => Promise<string>) | undefined
+-  /** 远端模型缓存（成功拉取一次后填充）。 */
+-  private remoteModels: readonly LlmModelInfo[] | undefined
++  /**
++   * 远端模型目录的**非阻塞**加载器（修复前是裸的 `remoteModels` 字段 +
++   * `await this.ensureRemoteModels()`）。
++   *
++   * ⚠ `listModels()` 是模型选择器的 UI 热路径，原先在那里 `await` 一次网络
++   * 往返（还含一次 token 解析）。详见 `catalog-refresh.ts`。
++   */
++  private readonly remote: CatalogRefresh<readonly LlmModelInfo[]>
++
++  /** 远端模型目录（未拉取到时为 undefined，调用方回退内置目录）。 */
++  private get remoteModels(): readonly LlmModelInfo[] | undefined {
++    return this.remote.get()
++  }
++
+   /** 最近一次成功续期得到的 token（仅在配置了 refresh 时使用）。 */
+   private refreshedToken: { token: string; obtainedAt: number } | undefined
+ 
+@@ -383,6 +404,11 @@ export class AntigravityAdapter extends LlmAdapter {
+     this.fetchImpl = options.fetchImpl ?? fetch
+     this.readCredential = options.readCredential ?? readAntigravityCredential
+     this.refreshImpl = options.refresh
++    this.remote = new CatalogRefresh(
++      () => this.fetchRemoteModels(),
++      options.onCatalogChanged,
++      (models) => models.length > 0,
++    )
+   }
+ 
+   providerInfo(provider: string): LlmProviderInfo {
+@@ -464,40 +490,47 @@ export class AntigravityAdapter extends LlmAdapter {
+   }
+ 
+   /**
+-   * 拉取远端可用模型。
++   * 真正执行远端拉取（供 {@link remote} 调用）。
+    *
+    * 实测该端点的请求 schema 与最初的猜测不同（返回 400 Unknown name），
+    * 故这里**失败即回退到内置目录**，不把探测失败暴露为错误 —— 模型列表
+    * 是 advisory 的，缺失不应影响对话。
+    */
+-  private async ensureRemoteModels(): Promise<void> {
+-    if (this.remoteModels !== undefined) return
+-    try {
+-      const accessToken = await this.resolveAccessToken()
+-      const response = await this.call('/v1internal:fetchAvailableModels', {}, undefined, accessToken)
+-      if (!response.ok) return
+-      const body = await response.json() as { models?: unknown }
+-      const models: LlmModelInfo[] = []
+-      if (Array.isArray(body.models)) {
+-        for (const entry of body.models) {
+-          if (typeof entry !== 'object' || entry === null) continue
+-          const record = entry as Record<string, unknown>
+-          const id = typeof record.id === 'string' ? record.id : undefined
+-          if (id === undefined || id.length === 0) continue
+-          models.push({
+-            provider: ANTIGRAVITY_PROVIDER,
+-            id,
+-            name: typeof record.displayName === 'string' && record.displayName.length > 0
+-              ? record.displayName
+-              : id,
+-            inputModalities: ['text', 'image'],
+-          })
+-        }
++  private async fetchRemoteModels(): Promise<readonly LlmModelInfo[]> {
++    const accessToken = await this.resolveAccessToken()
++    const response = await this.call('/v1internal:fetchAvailableModels', {}, undefined, accessToken)
++    if (!response.ok) return []
++    const body = await response.json() as { models?: unknown }
++    const models: LlmModelInfo[] = []
++    if (Array.isArray(body.models)) {
++      for (const entry of body.models) {
++        if (typeof entry !== 'object' || entry === null) continue
++        const record = entry as Record<string, unknown>
++        const id = typeof record.id === 'string' ? record.id : undefined
++        if (id === undefined || id.length === 0) continue
++        models.push({
++          provider: ANTIGRAVITY_PROVIDER,
++          id,
++          name: typeof record.displayName === 'string' && record.displayName.length > 0
++            ? record.displayName
++            : id,
++          inputModalities: ['text', 'image'],
++        })
+       }
+-      if (models.length > 0) this.remoteModels = models
+-    } catch {
+-      // 远端不可用：保持 undefined，调用方回退内置目录
+     }
++    // 空结果由 `CatalogRefresh` 的 isUsable 判为「本次无数据」，不会覆盖缓存。
++    return models
++  }
++
++  /**
++   * 等到远端目录落地。
++   *
++   * ⚠ **只给非热路径用**（`resolveModel`）：它等到目录落地才返回。
++   * `listModels()` 不得调用它。
++   */
++  private async ensureRemoteModels(): Promise<void> {
++    this.remote.start()
++    await this.remote.settled()
+   }
+ 
+   /**
+@@ -571,8 +604,24 @@ export class AntigravityAdapter extends LlmAdapter {
+     }
+   }
+ 
++  /**
++   * 等待后台目录刷新落定。
++   *
++   * ⚠ **只给非 UI 热路径用**（Jet Hub 设置页「显示列表」、`model.list` RPC）。
++   * `listModels()` 绝不能调用它 —— 那会退回「首帧等网络」的老路。
++   */
++  async whenCatalogReady(): Promise<void> {
++    // 先触发（冷缓存时这里才会真的发起拉取），再等它落定。
++    this.remote.start()
++    await this.remote.settled()
++  }
++
+   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+-    await this.ensureRemoteModels()
++    // ⚠ **刻意不 await**（修复前是 `await this.ensureRemoteModels()`）：
++    // 只触发后台拉取，首帧用当前已知目录（已缓存远端目录，否则内置目录）。
++    // 拉取完成后 `CatalogRefresh` 会经 `onCatalogChanged` 广播
++    // `llm/adapters-updated`，选择器重读并替换掉内置目录那一帧。
++    this.remote.start()
+     const source = this.remoteModels ?? FALLBACK_MODELS.map((model) => ({
+       provider: ANTIGRAVITY_PROVIDER,
+       id: model.id,
+diff --git a/src/antigravity-local-adapter.ts b/src/antigravity-local-adapter.ts
+index a1e4182..e1bd6ef 100644
+--- a/src/antigravity-local-adapter.ts
++++ b/src/antigravity-local-adapter.ts
+@@ -56,6 +56,7 @@ import type {
+   StreamChunk,
+ } from '@deepseek-ai/dsh-llm'
+ import { AntigravityAdapter } from './antigravity-adapter.js'
++import { CatalogRefresh } from './catalog-refresh.js'
+ import {
+   DEFAULT_REPLY_TIMEOUT_MS,
+   MIN_REQUEST_GAP_MS,
+@@ -147,6 +148,14 @@ export interface AntigravityLocalAdapterOptions {
+   /** language_server 发现实现，注入点主要用于测试。 */
+   discover?: () => Promise<LanguageServerInstance | undefined>
+   fetchImpl?: typeof fetch
++  /**
++   * 后台刷新**改变了模型目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ **必须注入**，否则 `listModels()` 非阻塞化会引入回归：首帧渲染静态
++   * 兜底表，本地通道的目录随后落地却没人通知选择器。见 `catalog-refresh.ts`。
++   */
++  onCatalogChanged?: () => void
+   /** 等待回复的总超时（毫秒）。 */
+   replyTimeoutMs?: number
+   /** 轮询间隔（毫秒）。 */
+@@ -350,10 +359,24 @@ export class AntigravityLocalAdapter extends LlmAdapter {
+ 
+   /** 已发现的实例缓存。仅在发现失败时失效重探，避免每次调用都跑 PowerShell。 */
+   private instance: LanguageServerInstance | undefined
+-  /** 成功拉取过的模型配置缓存。 */
+-  private modelConfigs: readonly CascadeModelConfig[] | undefined
++  /**
++   * 本地通道模型配置的**非阻塞**加载器（修复前是裸的 `modelConfigs` 字段 +
++   * `await this.ensureModelConfigs()`）。
++   *
++   * ⚠ `listModels()` 是模型选择器的 UI 热路径，原先在那里 `await` 一次
++   * 本地 HTTP（拉 `fetchModelConfigs`）。详见 `catalog-refresh.ts`。
++   */
++  private readonly configs: CatalogRefresh<readonly CascadeModelConfig[]>
+   /** 上一次通道探测结果（带 TTL，避免每次请求都探测）。 */
+   private probeCache: { result: ChannelProbe; at: number } | undefined
++  /**
++   * 进行中的通道探测（同步版探针的并发去重）。
++   *
++   * 与 {@link probeCache} 分工不同：`probeCache` 是**结果**+TTL，本字段是
++   * **进行中的 Promise**。同步探针在缓存过期时触发后台刷新，靠它避免
++   * 连续多次 `listModels` 打出多份重复探测。
++   */
++  private probeRefreshing: Promise<void> | undefined
+   /** DSH 会话 ID ↔ IDE cascadeId 的映射缓存，避免每轮对话都创建新 Cascade 会话 */
+   private readonly sessionCascades = new Map<string, string>()
+ 
+@@ -365,6 +388,35 @@ export class AntigravityLocalAdapter extends LlmAdapter {
+     this.pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS
+     this.allowPublicFallback = options.allowPublicFallback ?? (options.publicAdapter !== undefined)
+     this.publicAdapter = options.publicAdapter
++    this.configs = new CatalogRefresh(
++      async () => (await this.fetchModelConfigsOnce()) ?? [],
++      options.onCatalogChanged,
++      (configs) => configs.length > 0,
++    )
++  }
++
++  /** 当前已知的本地通道模型配置（可能为空 —— 调用方回退静态表）。 */
++  private get modelConfigs(): readonly CascadeModelConfig[] | undefined {
++    const configs = this.configs.get()
++    return configs !== undefined && configs.length > 0 ? configs : undefined
++  }
++
++  /**
++   * 拉一次本地通道模型配置（供 {@link configs} 调用）。
++   *
++   * 与 {@link ensureModelConfigs} 的区别：本方法**不做缓存判断**，每次都真的
++   * 去读 —— 缓存策略由 {@link CatalogRefresh} 统一负责。
++   */
++  private async fetchModelConfigsOnce(): Promise<readonly CascadeModelConfig[] | undefined> {
++    const instance = await this.resolveInstance()
++    if (instance === undefined) return undefined
++    try {
++      const configs = await this.gate.run(async () =>
++        fetchModelConfigs(instance, { fetchImpl: this.fetchImpl }))
++      return configs.length > 0 ? configs : undefined
++    } catch {
++      return undefined
++    }
+   }
+ 
+   providerInfo(provider: string): LlmProviderInfo {
+@@ -408,6 +460,44 @@ export class AntigravityLocalAdapter extends LlmAdapter {
+     }
+   }
+ 
++  /**
++   * **同步**版的通道探测，供 `listModels()` 这类 UI 热路径使用。
++   *
++   * ## 为什么需要它
++   *
++   * `probeChannels()` 的缓存一旦过期（成功 60s / 失败 3s），下一次调用就会
++   * **同步等**一次探测 —— 那可能包含 `resolveInstance`（失败时还要跑
++   * PowerShell 发现进程）与公共通道的 `probeAccess()`（一次 HTTPS）。
++   * 放在 `listModels()` 里就是「选择器偶尔卡一下」，且这个卡顿**随 TTL
++   * 到期时机抖动**，很难复现。
++   *
++   * ## 语义
++   *
++   * - 有缓存（无论是否过期）→ **立即返回缓存值**，过期时在后台重新探测；
++   * - 无缓存 → 返回 `undefined`，同时在后台探测。
++   *
++   * ⚠ 调用方拿到 `undefined` 时**必须回退到「不依赖通道判定」的路径**
++   * （本项目里是：有本地模型配置就直接用配置，否则用静态兜底表）——
++   * 而不是把 `undefined` 当成「公共通道」。
++   */
++  probeChannelsSync(): ChannelProbe | undefined {
++    const now = Date.now()
++    const cached = this.probeCache
++    if (cached !== undefined) {
++      const ttl = cached.result.channel === 'local' ? PROBE_SUCCESS_TTL_MS : PROBE_FAIL_TTL_MS
++      // 未过期：直接用，无需后台刷新。
++      if (now - cached.at < ttl) return cached.result
++    }
++    // 过期或没有缓存：后台刷新（去重），本次仍返回上次已知值（可能为 undefined）。
++    if (this.probeRefreshing === undefined) {
++      this.probeRefreshing = this.probeChannels()
++        .then(() => undefined)
++        .catch(() => undefined)
++        .finally(() => { this.probeRefreshing = undefined })
++    }
++    return cached?.result
++  }
++
+   /**
+    * 探测当前环境下的通道可用性。
+    */
+@@ -478,6 +568,9 @@ export class AntigravityLocalAdapter extends LlmAdapter {
+   invalidateProbe(): void {
+     this.probeCache = undefined
+     this.instance = undefined
++    // 实例失效时模型配置也必须丢弃：那些配置是从**旧实例**的端口拉的，
++    // 实例重启后端口会变。保留会让 `listModelsSync` 继续播报旧实例的目录。
++    this.configs.invalidate()
+   }
+ 
+   async currentChannel(): Promise<AntigravityChannel> {
+@@ -500,19 +593,16 @@ export class AntigravityLocalAdapter extends LlmAdapter {
+     return lines.join('\n')
+   }
+ 
+-  /** 拉取远端模型配置（本地通道）。 */
++  /**
++   * 拉取远端模型配置（本地通道）。
++   *
++   * ⚠ **只给非热路径用**（`probeChannels` / `resolveModel`）：等到配置落地
++   * 才返回。`listModels()` 不得调用它 —— 见 {@link probeChannelsSync}。
++   */
+   private async ensureModelConfigs(force = false): Promise<readonly CascadeModelConfig[] | undefined> {
+-    if (!force && this.modelConfigs !== undefined) return this.modelConfigs
+-    const instance = await this.resolveInstance()
+-    if (instance === undefined) return undefined
+-    try {
+-      const configs = await this.gate.run(async () =>
+-        fetchModelConfigs(instance, { fetchImpl: this.fetchImpl }))
+-      if (configs.length > 0) this.modelConfigs = configs
+-      return configs.length > 0 ? configs : undefined
+-    } catch {
+-      return undefined
+-    }
++    this.configs.start({ force })
++    await this.configs.settled()
++    return this.modelConfigs
+   }
+ 
+   /**
+@@ -533,6 +623,20 @@ export class AntigravityLocalAdapter extends LlmAdapter {
+    * `probeChannels` 负责预热。缓存尚未建立时回退到静态 `FALLBACK_MODELS`，
+    * 保证设置页首次打开也有内容可渲染。
+    */
++  /**
++   * 等待后台目录刷新落定。
++   *
++   * ⚠ **只给非 UI 热路径用**（Jet Hub 设置页显式打开的「显示列表」、
++   * model.list RPC）：那是用户主动发起的操作，需要**准确**目录。
++   * 模型选择器的 listModels() 绝不能调用它 —— 那会退回「首帧等网络」
++   * 的老路（正是本次修复的对象）。
++   */
++  async whenCatalogReady(): Promise<void> {
++    // 先触发（冷缓存时这里才会真的发起拉取），再等它落定。
++    this.configs.start()
++    await this.configs.settled()
++  }
++
+   listAllModels(): readonly { id: string; name: string }[] {
+     const configs = this.modelConfigs
+     if (configs !== undefined && configs.length > 0) {
+@@ -542,7 +646,18 @@ export class AntigravityLocalAdapter extends LlmAdapter {
+   }
+ 
+   async listModels(_provider: string): Promise<readonly LlmModelInfo[]> {
+-    const configs = await this.ensureModelConfigs()
++    // ⚠ **本方法必须是纯内存 + 同步的**（模型选择器的 UI 热路径）。
++    //
++    // 修复前这里有两处阻塞 await：
++    //   `await this.ensureModelConfigs()` —— 一次本地 HTTP；
++    //   `await this.probeChannels()`     —— 缓存过期时是一次进程发现 + 探活。
++    // 两者都在首帧路径上，且第二处会随 TTL 到期时机**抖动**（偶发卡顿）。
++    //
++    // 现在：只读缓存 + 后台预热，首帧立即返回当前已知目录。
++    // 后台刷新完成后 `CatalogRefresh` 会经 `onCatalogChanged` 广播
++    // `llm/adapters-updated`，选择器重读。
++    this.configs.start()
++    const configs = this.modelConfigs
+     if (configs !== undefined && configs.length > 0) {
+       return configs.map((config) => ({
+         provider: ANTIGRAVITY_PROVIDER,
+@@ -551,8 +666,14 @@ export class AntigravityLocalAdapter extends LlmAdapter {
+         inputModalities: config.supportsImages ? ['text', 'image'] as const : ['text'] as const,
+       }))
+     }
+-    const probe = await this.probeChannels()
+-    if (probe.channel === 'public') return this.publicChannel().listModels(_provider)
++    // 没有已知配置：读**缓存**的通道判定决定回退哪条路。
++    //
++    // ⚠ 同步探针可能返回 `undefined`（冷启动尚无缓存）。此时**不能**当成
++    // 「公共通道」—— 那会在 IDE 明明跑着的情况下把目录换成公共 API 的
++    // （本机实测该账号公共 API 全部 403）。故 `undefined` 一律走静态兜底表：
++    // 本地通道是首选，且帧内容随后会被后台刷新纠正。
++    const probe = this.probeChannelsSync()
++    if (probe?.channel === 'public') return this.publicChannel().listModels(_provider)
+     return FALLBACK_MODELS.map((model) => ({
+       provider: ANTIGRAVITY_PROVIDER,
+       id: model.id,
+diff --git a/src/buddy-adapter.ts b/src/buddy-adapter.ts
+index e74351b..c906c5f 100644
+--- a/src/buddy-adapter.ts
++++ b/src/buddy-adapter.ts
+@@ -17,7 +17,8 @@ import {
+   LlmAdapter, LlmError,
+   ReasoningEffortId,
+ } from '@deepseek-ai/dsh-llm'
+-import { AccountPool, providerCatalogVisible } from './account-pool.js'
++import { AccountPool, providerCatalogVisibleSync } from './account-pool.js'
++import { CatalogRefresh } from './catalog-refresh.js'
+ import { settingsNamespaceFor } from './settings-compat.js'
+ import { isRateLimited, parseRateLimitError } from './llm-adapter.js'
+ import { ToolCallId } from '@deepseek-ai/dsh-llm'
+@@ -178,6 +179,14 @@ export interface BuddyAdapterOptions {
+   refresh: () => Promise<void>
+   /** 动态拉取远端模型列表（含上下文窗口与能力，若远端下发）；失败时调用方回退到静态列表。 */
+   fetchRemoteModels?: () => Promise<BuddyRemoteModel[]>
++  /**
++   * 后台刷新**改变了目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ **必须注入**，否则 `listModels()` 非阻塞化会引入回归：首帧渲染静态
++   * 兜底表，远端目录随后落地却没人通知选择器。见 `catalog-refresh.ts`。
++   */
++  onCatalogChanged?: () => void
+   /**
+    * 读取一张图片的原始字节（图片输入必需）。
+    *
+@@ -553,8 +562,21 @@ export class BuddyAdapter extends LlmAdapter {
+    * 服务端据此把相同前缀的 KV 缓存跨请求复用；缺失时缓存命中恒为 0。
+    */
+   private readonly sessionId: string
+-  /** 动态模型缓存（首次 listModels 成功后填充）。 */
+-  private remoteModels: BuddyRemoteModel[] | undefined
++  /**
++   * 远端模型目录的**非阻塞**加载器（修复前是裸的 `remoteModels` 字段 +
++   * `await this.ensureRemoteModels()`）。
++   *
++   * ⚠ `listModels()` 是模型选择器的 UI 热路径，原先在那里 `await` 一次网络
++   * 往返。本适配器服务 4 个 provider（buddy / buddy-intl / workbuddy /
++   * workbuddy-cn），每个都是一个独立实例、各等一次 —— 叠加起来正是用户看到的
++   * 「装 JetHub 后模型选择器要加载很久」。详见 `catalog-refresh.ts`。
++   *
++   * ⚠ 缓存的**唯一真相源**是本加载器；{@link remoteModels} /
++   * {@link remoteMeta} / {@link remoteContextWindows} 都是从它派生的镜像，
++   * 由 {@link syncRemoteDerived} 统一更新 —— 三者必须同步，否则会出现
++   * 「目录里有该模型、但 `resolveModel` 查不到它的窗口」这类不一致。
++   */
++  private readonly remote: CatalogRefresh<BuddyRemoteModel[]>
+   /** 远端下发的模型元数据（id → 能力），listModels/resolveModel/stream 共用。 */
+   private remoteMeta: ReadonlyMap<string, BuddyRemoteModel> = new Map()
+   /** 远端下发的模型上下文窗口（/v3/config data.models[].maxInputTokens）。 */
+@@ -567,6 +589,22 @@ export class BuddyAdapter extends LlmAdapter {
+   /** 产品级兜底上下文窗口（构造时从 fallbackModels 提取）。 */
+   private readonly productFallbackContextWindows: ReadonlyMap<string, number>
+ 
++  /** 远端模型目录（未拉取到时为 undefined，调用方回退兜底表）。 */
++  private get remoteModels(): BuddyRemoteModel[] | undefined {
++    return this.remote.get()
++  }
++
++  /** 把 {@link remote} 的当前值同步到派生镜像（三个字段必须一起更新）。 */
++  private syncRemoteDerived(): void {
++    const reconciled = this.remote.get()
++    this.remoteMeta = new Map(reconciled?.map((model) => [model.id, model]) ?? [])
++    this.remoteContextWindows = new Map(
++      (reconciled ?? [])
++        .filter((model) => model.contextWindow !== undefined)
++        .map((model) => [model.id, model.contextWindow as number]),
++    )
++  }
++
+   constructor(private readonly options: BuddyAdapterOptions) {
+     super()
+     // 默认 CodeBuddy，保证既有行为完全不变。
+@@ -580,11 +618,24 @@ export class BuddyAdapter extends LlmAdapter {
+         .filter((model) => model.contextWindow !== undefined)
+         .map((model) => [model.id, model.contextWindow as number]),
+     )
++    // 远端结果必须先经 `reconcileWithFallback` 校正（见该方法的说明），
++    // 且**每次成功落地都要刷新派生镜像** —— `onCatalogChanged` 只负责广播，
++    // 镜像同步不能依赖它（广播会因「目录没变」而跳过）。
++    this.remote = new CatalogRefresh(
++      async () => {
++        const reconciled = this.reconcileWithFallback(await options.fetchRemoteModels!())
++        this.syncRemoteDerived()
++        return reconciled
++      },
++      options.onCatalogChanged,
++      (models) => models.length > 0,
++    )
+     if (typeof this.options.accountPool?.onAccountsChanged === "function") {
+       this.options.accountPool.onAccountsChanged(() => {
+-        this.remoteModels = undefined
+-        this.remoteMeta = new Map()
+-        this.remoteContextWindows = new Map()
++        // 账号切换后模型池可能完全不同，必须丢弃缓存重拉
++        // （`remoteMeta` / `remoteContextWindows` 随之一并清空）。
++        this.remote.invalidate()
++        this.syncRemoteDerived()
+       })
+     }
+   }
+@@ -612,30 +663,21 @@ export class BuddyAdapter extends LlmAdapter {
+    * 动态拉取失败时静默回退（与 Rust fetch_models 的 Vec::new() 语义一致）。
+    */
+   /**
+-   * 懒加载远端模型目录（仅拉取一次）。listModels 与 resolveModel 共用：
+-   * resolveModel 可能先于 listModels 被调用（如直接进入会话），此时同样
+-   * 触发一次远端拉取，保证 /v3/config 的 maxInputTokens 能生效。
++   * 懒加载远端模型目录。`resolveModel` 可能先于 `listModels` 被调用
++   * （如直接进入会话），此时同样触发远端拉取，保证 /v3/config 的
++   * maxInputTokens 能生效。
++   *
++   * ⚠ **只给非热路径用**：本方法会等到目录落地（准确元数据优先于首帧速度）。
++   * `listModels()` **不得**调用它 —— 那会退回「选择器等网络」的老路，
++   * 故 `listModels` 直接 `this.remote.start()`（只触发、不等待）。
+    */
+   private async ensureRemoteModels(): Promise<void> {
+-    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
+-    try {
+-      const models = await this.options.fetchRemoteModels()
+-      if (models.length > 0) {
+-        // /v3/config data.models[] 是权威来源（对齐 Rust TUI buddy_context_limits
+-        // 注入逻辑）：远端下发的上下文窗口优先于静态 fallback 表；
+-        // 能力字段（supportsImages / reasoning.supportedEfforts）同理。
+-        const reconciled = this.reconcileWithFallback(models)
+-        this.remoteModels = reconciled
+-        this.remoteMeta = new Map(reconciled.map((model) => [model.id, model]))
+-        this.remoteContextWindows = new Map(
+-          reconciled
+-            .filter((model) => model.contextWindow !== undefined)
+-            .map((model) => [model.id, model.contextWindow as number]),
+-        )
+-      }
+-    } catch {
+-      // 远端不可用：回退静态列表
+-    }
++    if (this.options.fetchRemoteModels === undefined) return
++    this.remote.start()
++    await this.remote.settled()
++    // 兜底同步：远端拉取可能早已完成（`start()` 直接返回），此时
++    // `syncRemoteDerived` 已在构造函数注入的 fetch 里跑过，这里再调一次幂等。
++    this.syncRemoteDerived()
+   }
+ 
+   /**
+@@ -788,6 +830,22 @@ export class BuddyAdapter extends LlmAdapter {
+    * 而非 `listed`。用过滤后的集合会让「关掉其中一个同名模型」改变另一个的
+    * 变体标记，名字随开关跳变。
+    */
++  /**
++   * 等待后台目录刷新落定。
++   *
++   * ⚠ **只给非 UI 热路径用**（Jet Hub 设置页显式打开的「显示列表」、
++   * model.list RPC）：那是用户主动发起的操作，需要**准确**目录。
++   * 模型选择器的 listModels() 绝不能调用它 —— 那会退回「首帧等网络」
++   * 的老路（正是本次修复的对象）。
++   */
++  async whenCatalogReady(): Promise<void> {
++    // 先触发（冷缓存时这里才会真的发起拉取），再等它落定。
++    this.remote.start()
++    await this.remote.settled()
++    // 目录落地后同步派生镜像（remoteMeta / remoteContextWindows）。
++    this.syncRemoteDerived()
++  }
++
+   listAllModels(): readonly { id: string; name: string }[] {
+     const source = this.remoteModels ?? this.staticFallbackModels()
+     return source.map((model) => ({ id: model.id, name: displayNameFor(model, source) }))
+@@ -797,8 +855,14 @@ export class BuddyAdapter extends LlmAdapter {
+     // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+     // 不必拉。返回空数组 → DSH 的 `buildModelCatalog` 把整个 provider 分组隐藏。
+     // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`）。
+-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
+-    await this.ensureRemoteModels()
++    if (!providerCatalogVisibleSync(this.options.accountPool, this.product.id)) return []
++    // ⚠ **刻意不 await**（修复前是 `await this.ensureRemoteModels()`）：
++    // 只触发后台拉取，首帧用当前已知目录（已缓存远端目录，否则静态兜底表）。
++    // 拉取完成后 `CatalogRefresh` 会经 `onCatalogChanged` 广播
++    // `llm/adapters-updated`，选择器重读并替换掉兜底表那一帧。
++    //
++    // 门控仍放在拉取**之前**：没有已登录账号时连远端目录都不必拉。
++    if (this.options.fetchRemoteModels !== undefined) this.remote.start()
+     const source = this.remoteModels ?? this.staticFallbackModels()
+     // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
+     // 按本适配器的产品 id 取表，CodeBuddy 与 WorkBuddy 的开关互不影响。
+@@ -1771,4 +1835,4 @@ export function registerBuddyLlm(ctx: Context, options: BuddyAdapterOptions): Bu
+   // 返回实例：Jet Hub「显示列表」需要 `listAllModels()`（不受黑名单影响、
+   // 带最终展示名/倍率）。`ctx.llm` 不透传自定义方法，须由调用方持有引用。
+   return adapter
+-}
++}
+\ No newline at end of file
+diff --git a/src/catalog-refresh.ts b/src/catalog-refresh.ts
+new file mode 100644
+index 0000000..6b979b2
+--- /dev/null
++++ b/src/catalog-refresh.ts
+@@ -0,0 +1,237 @@
++/**
++ * 非阻塞的「远端模型目录」加载器。
++ *
++ * ## 为什么需要这个模块（真实性能缺陷）
++ *
++ * `listModels()` 是 **DSH 模型选择器的 UI 热路径** —— 会话框右下角的模型
++ * 选择器一打开就会向每个 provider 要一次目录。而本插件有 7 个适配器在
++ * `listModels()` 里**同步等待网络请求**：
++ *
++ * ```
++ * 逐个 adapter 的 listModels 里的网络调用（修复前）：
++ *   antigravity-adapter        → await this.ensureRemoteModels
++ *   antigravity-local-adapter  → await this.ensureModelConfigs, await this.probeChannels
++ *   buddy-adapter              → await this.ensureRemoteModels
++ *   llm-adapter (codearts)     → await this.ensureRemoteModels
++ *   lobsterai-adapter          → await this.ensureRemoteModels
++ *   trae-adapter               → await this.ensureRemoteModels
++ *   zcode-adapter              → await this.probeHealth + probeStatus + this.loadModels
++ * ```
++ *
++ * 这些 await 是**串行叠加**的（DSH 逐个 provider 收集目录），于是选择器的
++ * 首帧耗时 = 所有 provider 的网络往返之和。用户症状就是
++ * 「装了 JetHub 后，模型选择器要加载很久才出来」。
++ *
++ * ## 修法：首帧只读缓存，网络转后台
++ *
++ * `listModels()` 变成**纯内存、同步返回**：
++ *
++ * 1. **首帧立即返回当前已知目录** —— 已缓存的远端目录，否则静态兜底表；
++ * 2. 同时**触发一次后台刷新**（记录进行中的 Promise，避免并发重复拉取）；
++ * 3. 刷新完成且目录**真的变了**时，回调 `onChanged` 广播
++ *    `llm/adapters-updated`，让选择器重读（该机制见 `jet-hub-rpc.ts` 的
++ *    `broadcastCatalogChanged`）。
++ *
++ * ## 为什么不做成「等第一次拉取完再返回」
++ *
++ * 那正是要修的病。冷启动时等待网络＝选择器卡住，而目录**本来就是
++ * advisory 的**（DSH 明确约定 *"Catalog membership is advisory and never
++ * changes routing"*），用兜底表先渲染一帧、随后无感替换成远端目录，
++ * 比让 UI 空转数百毫秒正确得多。
++ *
++ * ## 并发去重
++ *
++ * `listModels()` 与 `resolveModel()` 会在启动时被 DSH **并发**调用（见
++ * `cline-adapter.ts` 的同款注释），不去重会打出多份重复的远端请求。
++ * 故进行中的 Promise 记录在 {@link CatalogRefresh.loading}，后到者直接复用。
++ */
++
++/**
++ * 拉取失败（或远端回了空结果）后的重试冷却（毫秒）。
++ *
++ * ⚠ **不是可选项**：`listModels()` 会被反复调用，而失败时缓存仍为空；
++ * 没有冷却就会形成「每次打开选择器都重试一次网络」的风暴（详见
++ * `CatalogRefresh.retryAt` 的说明）。30 秒是「网络抖动不放大」与
++ * 「恢复后不用等太久」之间的折中。
++ */
++export const FAILURE_COOLDOWN_MS = 30_000
++
++export class CatalogRefresh<T> {  /** 已落地的目录；未成功拉取过时为 undefined。 */
++  private value: T | undefined
++  /** 进行中的拉取（并发去重）；空闲时为 undefined。 */
++  private loading: Promise<void> | undefined
++  /**
++   * 上一次**已广播过**的目录快照。
++   *
++   * ⚠ 必须与 {@link value} 分开记：`listModels()` 是按 `value` 渲染的，
++   * 而「要不要广播」判的是「**渲染出去的那份**变了没」。首帧渲染的是静态
++   * 兜底表（不在这里），故远端目录第一次落地时判据必须是 `undefined → 目录`
++   * ——那正是最需要广播的一次（否则用户要等下次打开选择器才看到真实模型）。
++   */
++  private lastBroadcast: T | undefined
++  /**
++   * 下次允许重试的时刻（失败冷却）。
++   *
++   * ## 为什么必需（否则本模块会变成它要修的那个问题）
++   *
++   * `listModels()` 是**被反复调用**的热路径（每次打开模型选择器、每次目录
++   * 刷新都调一次）。而拉取失败时 `value` 仍是 `undefined`，若 `start()` 只看
++   * `value === undefined` 就发起拉取，就会形成**每次热路径调用都打一次网络**
++   * 的请求风暴 —— 比修复前更糟（修复前至少只发一次）。
++   *
++   * 故失败/无结果后必须**冷却**一段时间再试。选 30 秒：短于这个值会让
++   * 「网络抖动期反复重试」放大成风暴，长于它则用户插上网线后要等太久才恢复。
++   */
++  private retryAt = 0
++
++  /**
++   * @param fetch - 真正的远端拉取（注入以便单测）。
++   * @param onChanged - 后台刷新**改变了目录**时的回调（广播事件）。
++   *   省略时不广播，行为退化为「只更新缓存」。
++   * @param isUsable - 判定拉取结果是否可用（通常是 `models.length > 0`）。
++   *   远端可能回空数组表示「这次没数据」，采信它会把已缓存的目录清掉；
++   *   判为不可用时**不写缓存**，并按 {@link FAILURE_COOLDOWN_MS} 冷却。
++   * @param now - 取当前时间（注入以便单测跳过冷却等待）。
++   */
++  constructor(
++    private readonly fetch: () => Promise<T>,
++    private readonly onChanged?: () => void,
++    private readonly isUsable: (value: T) => boolean = () => true,
++    private readonly now: () => number = () => Date.now(),
++  ) {}
++
++  /** 当前已知目录（可能为 undefined —— 调用方自行回退静态表）。 */
++  get(): T | undefined {
++    return this.value
++  }
++
++  /**
++   * 触发一次后台刷新。
++   *
++   * **同步返回**（不 await 任何东西）—— 这是本模块存在的全部意义。
++   * 已有进行中的拉取时直接复用，不会打出重复请求。
++   *
++   * @param options.force - 为 true 时忽略缓存与冷却，强制重新拉取
++   *   （用于设置页的显式「刷新」入口）。
++   */
++  start(options?: { force?: boolean }): void {
++    if (this.loading !== undefined) return
++    if (!options?.force) {
++      if (this.value !== undefined) return
++      // 无缓存：可能是「还没拉过」也可能是「上次失败」，后者要等冷却结束。
++      if (this.now() < this.retryAt) return
++    }
++    // ⚠⚠ **不能写成 `this.loading = this.run()`**。
++    //
++    // `run()` 是 async 函数，但它可能在**第一个 await 之前**就同步跑完
++    // （例如 `fetch()` 同步抛错 —— 那正是 `fetchRemoteModels` 未注入时的
++    // 情形）。此时执行顺序会变成：
++    //
++    //   ① 调 `run()` → 它同步跑到底、返回一个已 settle 的 Promise；
++    //      若清理逻辑写在 `run()` 内部的 `finally` 里，此刻就把
++    //      `this.loading` 设成了 undefined；
++    //   ② **然后**赋值语句才把 `this.loading` 写回那个已 settle 的 Promise。
++    //
++    // ⇒ `loading` **永远非 undefined** ⇒ `settled()` 的 while 循环**死锁**。
++    // 这个 bug 实测把「跑一次测试」变成了「无限挂起」（正是被它拖住才发现的）。
++    //
++    // 正确写法：先把 Promise 存进本地变量，**再**挂清理钩子 —— 清理发生在
++    // 赋值之后，与 `run()` 内部何时 settle 无关。回归用例见
++    // `tests/unit/catalog-refresh.spec.ts` 的「同步抛错的 fetch 不得让
++    // settled() 死锁」。
++    const task = this.run()
++    this.loading = task
++    void task.finally(() => {
++      // 只清理「仍指向本次任务」的引用：期间若已发起新一轮，
++      // 不能把它的 loading 抹掉（否则并发去重会失效）。
++      if (this.loading === task) this.loading = undefined
++    })
++  }
++
++  /**
++   * 等待进行中的拉取结束。
++   *
++   * ⚠ **只给非 UI 热路径用**（`resolveModel` / e2e / 设置页显式刷新）：
++   * 需要「元数据准确」而不是「首帧快」的场合。`listModels()` 绝不能调用它，
++   * 否则又回到阻塞老路。
++   */
++  async settled(): Promise<void> {
++    // 循环而非单次 await：`run()` 完成后可能有新的拉取被发起。
++    // ⚠ 每轮重新读 `this.loading`（而不是缓存一次）—— 配合 `start()` 里
++    // 「只有仍指向本任务时才清空」的清理逻辑，保证不会漏等也不会误等。
++    while (this.loading !== undefined) await this.loading
++  }
++
++  /**
++   * 丢弃缓存（凭据变化等需要强制重读的场合）。
++   *
++   * ⚠ **同时清除冷却**：账号切换后模型池可能完全不同，必须能立刻重拉；
++   * 若沿用上一次失败留下的冷却，用户换号后会一直看到旧目录（或兜底表）。
++   */
++  invalidate(): void {
++    this.value = undefined
++    this.lastBroadcast = undefined
++    this.retryAt = 0
++  }
++
++  private async run(): Promise<void> {
++    try {
++      const fetched = await this.fetch()
++      if (!this.isUsable(fetched)) {
++        // 远端回了个「不算数」的结果（如空数组）。不写缓存，并进入冷却 ——
++        // 否则热路径下次调用又会立刻重试（见 `retryAt` 的说明）。
++        this.retryAt = this.now() + FAILURE_COOLDOWN_MS
++        return
++      }
++      const changed = !this.sameAs(this.lastBroadcast, fetched)
++      this.value = fetched
++      // 成功即清除冷却。
++      this.retryAt = 0
++      // ⚠ 只在**渲染出去的目录真的变了**时广播：无差别广播会让每一轮后台
++      // 刷新都触发选择器重读。首帧（`lastBroadcast === undefined`）必定算变化，
++      // 这正是「兜底表 → 远端目录」那一次必须通知的场景。
++      if (changed) {
++        this.lastBroadcast = fetched
++        this.onChanged?.()
++      }
++    } catch {
++      // 远端不可用：保持既有缓存（或 undefined，由调用方回退静态表）。
++      // 模型目录是展示信息，不该让整个 provider 报错。同样进入冷却。
++      this.retryAt = this.now() + FAILURE_COOLDOWN_MS
++    }
++    // ⚠ **这里不清理 `this.loading`** —— 清理移到了 `start()` 里赋值之后的
++    // `.finally()`。在本函数内清理会与赋值形成竞态（见 `start()` 的注释）。
++  }
++
++  /**
++   * 粗粒度相等判定：委托给 {@link sameCatalog}。
++   *
++   * 泛型 T 无结构保证，故用 `as unknown` 后按「数组长度 + 逐项身份」比较 ——
++   * 对本模块的两个使用场景（`{id,name}[]` 与目录对象数组）足够。
++   */
++  private sameAs(a: T | undefined, b: T): boolean {
++    if (a === undefined) return false
++    return sameCatalog(a as unknown as readonly unknown[], b as unknown as readonly unknown[])
++  }
++}
++
++/**
++ * 两个目录是否「实质相同」。
++ *
++ * 判据是**长度 + 逐项 id/name**，而不是引用相等：远端每次拉取都是新对象，
++ * 用引用比较会让每一轮后台刷新都判定为「变了」并广播，选择器随之反复重读。
++ *
++ * ⚠ 只比较稳定字段（`id` / `name`）。能力字段（contextWindow 等）变化时
++ * 选择器的展示不变，不值得为此广播。
++ */
++export function sameCatalog(a: readonly unknown[], b: readonly unknown[]): boolean {
++  if (a === b) return true
++  if (a.length !== b.length) return false
++  for (let i = 0; i < a.length; i++) {
++    const left = a[i] as { id?: unknown; name?: unknown } | null | undefined
++    const right = b[i] as { id?: unknown; name?: unknown } | null | undefined
++    if (left?.id !== right?.id) return false
++    if (left?.name !== right?.name) return false
++  }
++  return true
++}
+diff --git a/src/cline-adapter.ts b/src/cline-adapter.ts
+index 6714be0..3ae1ccf 100644
+--- a/src/cline-adapter.ts
++++ b/src/cline-adapter.ts
+@@ -31,7 +31,8 @@ import type { Context } from '@deepseek-ai/cordis'
+ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+-import { AccountPool, providerCatalogVisible } from './account-pool.js'
++import { AccountPool, providerCatalogVisibleSync } from './account-pool.js'
++import { CatalogRefresh } from './catalog-refresh.js'
+ import { settingsNamespaceFor } from './settings-compat.js'
+ import { isClineExpired, clineHeaders, type ClineCredential } from './cline.js'
+ import {
+@@ -166,6 +167,13 @@ export interface ClineAdapterOptions {
+    * 默认走 `loadClineModels`（两次远端请求）。注入后单测可完全离线。
+    */
+   loadModels?: (options: { credential?: ClineCredential }) => Promise<{ models: ClineModel[]; warnings: string[] }>
++  /**
++   * 后台刷新**改变了目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ **必须注入**，否则 `listModels()` 非阻塞化会引入回归。见 `catalog-refresh.ts`。
++   */
++  onCatalogChanged?: () => void
+ }
+ 
+ /**
+@@ -176,15 +184,29 @@ export interface ClineAdapterOptions {
+ export class ClineAdapter extends LlmAdapter {
+   private readonly product: ClineProduct
+   private readonly fetchImpl: typeof fetch
+-  /** 远端模型目录缓存（首次成功后填充）。 */
+-  private remoteModels: ClineModel[] | undefined
+-  /** 正在进行中的目录加载（避免并发重复请求）。 */
+-  private loading: Promise<void> | undefined
++  /**
++   * 远端模型目录的**非阻塞**加载器。
++   *
++   * ⚠ 本适配器早先手写了一份「`loading` Promise 去重」的实现，现已统一到
++   * 共享的 {@link CatalogRefresh}（同样的语义 + 目录变化广播），避免同一套
++   * 逻辑在本仓库里存在多份实现 —— 那正是反复出缺陷的形态。
++   */
++  private readonly remote: CatalogRefresh<ClineModel[]>
++
++  /** 远端模型目录（未拉取到时为 undefined，调用方回退静态兜底表）。 */
++  private get remoteModels(): ClineModel[] | undefined {
++    return this.remote.get()
++  }
+ 
+   constructor(private readonly options: ClineAdapterOptions) {
+     super()
+     this.product = options.product ?? CLINE
+     this.fetchImpl = options.fetchImpl ?? fetch
++    this.remote = new CatalogRefresh(
++      () => this.loadModelsOnce(),
++      options.onCatalogChanged,
++      (models) => models.length > 0,
++    )
+   }
+ 
+   /**
+@@ -221,39 +243,43 @@ export class ClineAdapter extends LlmAdapter {
+    * ⚠️ **并发去重**：`listModels` 与 `resolveModel` 会在启动时被 DSH 并发调用，
+    * 不去重会打出多份重复的远端请求（两个端点各一次，乘以并发数）。
+    */
+-  private async ensureRemoteModels(): Promise<void> {
+-    if (this.remoteModels !== undefined) return
+-    if (this.loading !== undefined) {
+-      await this.loading
+-      return
++  /**
++   * 真正执行一次远端目录拉取（供 {@link remote} 调用）。
++   *
++   * ⚠ 只负责「拉一次」：缓存/并发去重/广播由 {@link CatalogRefresh} 负责，
++   * 故这里不再自行维护 `loading` Promise。
++   */
++  private async loadModelsOnce(): Promise<ClineModel[]> {
++    const credential = await this.options.resolveCredential()
++    const load = this.options.loadModels ?? ((opts: { credential?: ClineCredential }) =>
++      loadClineModels(this.product, {
++        ...opts.credential === undefined ? {} : { credential: opts.credential },
++        fetcher: this.fetchImpl,
++      }))
++    const { models, warnings } = await load({
++      ...credential === undefined ? {} : { credential },
++    })
++    // 目录部分失败时留下日志：静默降级会让用户看到「少了模型」却无从排查
++    // （两个端点独立容错，故这里只记 warning 不抛错）。
++    for (const warning of warnings) {
++      // eslint-disable-next-line no-console
++      console.warn(`[cline] 模型目录来源失败：${warning}`)
+     }
+-    this.loading = (async () => {
+-      try {
+-        const credential = await this.options.resolveCredential()
+-        const load = this.options.loadModels ?? ((opts: { credential?: ClineCredential }) =>
+-          loadClineModels(this.product, {
+-            ...opts.credential === undefined ? {} : { credential: opts.credential },
+-            fetcher: this.fetchImpl,
+-          }))
+-        const { models, warnings } = await load({
+-          ...credential === undefined ? {} : { credential },
+-        })
+-        if (models.length > 0) this.remoteModels = models
+-        // 目录部分失败时留下日志：静默降级会让用户看到「少了模型」却无从排查
+-        // （两个端点独立容错，故这里只记 warning 不抛错）。
+-        for (const warning of warnings) {
+-          // eslint-disable-next-line no-console
+-          console.warn(`[cline] 模型目录来源失败：${warning}`)
+-        }
+-      } catch (error) {
+-        // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态兜底表。
+-        // eslint-disable-next-line no-console
+-        console.warn(`[cline] 模型目录拉取失败：${error instanceof Error ? error.message : String(error)}`)
+-      } finally {
+-        this.loading = undefined
+-      }
+-    })()
+-    await this.loading
++    return models
++  }
++
++  /**
++   * 懒加载远端模型目录。
++   *
++   * `resolveModel` / `stream` 可能先于 `listModels` 被调用（如直接进入会话），
++   * 此时同样触发远端拉取。
++   *
++   * ⚠ **只给非热路径用**（等到目录落地，保证元数据准确）。
++   * `listModels()` 不得调用它。
++   */
++  private async ensureRemoteModels(): Promise<void> {
++    this.remote.start()
++    await this.remote.settled()
+   }
+ 
+   /** 兜底目录（远端不可用时的静态表，含 5 个免费模型）。 */
+@@ -282,9 +308,23 @@ export class ClineAdapter extends LlmAdapter {
+    * 之前一定会先走 `ctx.llm.listModels()`（那会 await 加载完成），
+    * 故实际使用中不会读到空目录。
+    */
++  /**
++   * 等待后台目录刷新落定。
++   *
++   * ⚠ **只给非 UI 热路径用**（Jet Hub 设置页显式打开的「显示列表」、
++   * model.list RPC）：那是用户主动发起的操作，需要**准确**目录。
++   * 模型选择器的 listModels() 绝不能调用它 —— 那会退回「首帧等网络」
++   * 的老路（正是本次修复的对象）。
++   */
++  async whenCatalogReady(): Promise<void> {
++    // 先触发（冷缓存时这里才会真的发起拉取），再等它落定。
++    this.remote.start()
++    await this.remote.settled()
++  }
++
+   listAllModels(): readonly { id: string; name: string }[] {
+     const source = this.remoteModels ?? this.fallbackCatalog()
+-    if (this.remoteModels === undefined) void this.ensureRemoteModels()
++    if (this.remoteModels === undefined) this.remote.start()
+     return source.map((model) => ({ id: model.id, name: clineDisplayName(model) }))
+   }
+ 
+@@ -296,10 +336,12 @@ export class ClineAdapter extends LlmAdapter {
+     //
+     // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+     // 不必拉。
+-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
+-    // 必须 await：冷缓存时目录尚未落地就返回，模型选择器会短暂显示错误的
+-    // 模型集合（Jet Hub 的模型开关也据此渲染）。
+-    await this.ensureRemoteModels()
++    if (!providerCatalogVisibleSync(this.options.accountPool, this.product.id)) return []
++    // ⚠ **刻意不 await**（修复前是 `await this.ensureRemoteModels()`）：首帧用
++    // 当前已知目录，远端拉取转后台；完成后 `CatalogRefresh` 经
++    // `onCatalogChanged` 广播 `llm/adapters-updated`，选择器重读并替换掉
++    // 兜底表那一帧（修复前「必须 await」的理由正是怕兜底表那帧误导用户）。
++    this.remote.start()
+     const source = this.remoteModels ?? this.fallbackCatalog()
+     // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
+     // 只影响此处对外播报的模型目录，不改变 resolveModel/stream 的路由能力
+diff --git a/src/index.ts b/src/index.ts
+index 7b7273e..2690040 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -26,7 +26,7 @@ import { LoomyBalanceSelector } from './loomy-balance-selector.js'
+ import { RACCOON } from './raccoon-product.js'
+ import { AccountPool } from './account-pool.js'
+ import { hasLegacyNamespaceRegistration, settingsOf, suppressAutoSettingsPage } from './settings-compat.js'
+-import { buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
++import { broadcastCatalogChanged, buildRaccoonNickname, registerJetHubRpc } from './jet-hub-rpc.js'
+ import { ALL_PRODUCTS, CODEBUDDY, CODEBUDDY_INTL, WORKBUDDY, WORKBUDDY_CN } from './product.js'
+ import { LOBSTERAI } from './lobsterai-product.js'
+ import { QODER, QODER_CN } from './qoder-product.js'
+@@ -166,6 +166,41 @@ export function apply(ctx: Context): void {
+   const service = new CodeArtsAuth(ctx)
+   const pool = new AccountPool(ctx)
+ 
++  /**
++   * 后台目录刷新完成时的广播回调，注入给**每一个**适配器。
++   *
++   * ## 为什么需要它
++   *
++   * 各适配器的 `listModels()` 已改为**不阻塞**：首帧只读缓存（静态兜底表或
++   * 上一次的远端目录），远端拉取转后台。于是后台拉取落地时**必须**通知
++   * 客户端重读 —— 否则用户看到的是兜底表那份目录，要等下次打开选择器才
++   * 变成真实的（表现为「模型少了一大截」）。
++   *
++   * ## 为什么直接复用 RPC 层那个函数
++   *
++   * `broadcastCatalogChanged` 已经承载了完整的推导（为什么选
++   * `llm/adapters-updated`、它为何会真的送达浏览器、为何通知失败不能反噬），
++   * 在别处再写一遍必然漂移。故这里只做一次转发。
++   *
++   * ⚠ 用一个**惰性箭头函数**而不是 `broadcastCatalogChanged.bind(null, ctx)`：
++   * 后者在插件加载阶段就要完成绑定，而本回调只在后台拉取**真正完成**时才会
++   * 被调用 —— 惰性形态避免了任何「加载期就要 ctx 就绪」的隐式约束。
++   */
++  const onCatalogChanged = (): void => broadcastCatalogChanged(ctx)
++
++  /**
++   * 「账号门控判定结果变了」时同样广播。
++   *
++   * 冷启动首帧的门控是**同步猜的**（保守放行为「可见」，见
++   * `AccountPool.catalogVisibleSync`）。后台用真实凭据算出「其实没登录」时，
++   * 若不通知客户端，那条「未登录的 provider 不该显示」的既有语义就会在整个
++   * 会话里失效 —— 用户会一直看到一组用不了的模型。
++   *
++   * 复用同一个广播（`llm/adapters-updated` 的契约本就是「目录可能变了，
++   * 请重读 `listModels`」，可见性是目录内容的一部分）。
++   */
++  pool.onVisibilityChanged = () => broadcastCatalogChanged(ctx)
++
+   // WorkBuddy provider 已从中国版（copilot.tencent.com）改造为国际版
+   // （www.workbuddy.ai）。旧账号存的是中国版凭据，其 token.domain 指向旧端点，
+   // 用新 endpoint 发请求必然失败且会一直续期失败，故启动时清理掉。
+@@ -207,6 +242,8 @@ export function apply(ctx: Context): void {
+     },
+     fetchRemoteModels: () => service.refreshModels(pool),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     // 与其余五个 provider 一致：目录项（llm-codearts）由 registerCodeArtsLlm
+     // 自己注册。早期这里是 `skipConfigurableRegistration: true`，因为当时由
+     // index.ts 的 syncConfigurableProviders() 集中登记；该机制已移除 ——
+@@ -241,6 +278,8 @@ export function apply(ctx: Context): void {
+     fetchRemoteModels: () => buddy.fetchModels(pool),
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: CODEBUDDY,
+   })
+ 
+@@ -266,6 +305,8 @@ export function apply(ctx: Context): void {
+     fetchRemoteModels: () => buddyIntl.fetchModels(pool),
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: CODEBUDDY_INTL,
+   })
+ 
+@@ -296,6 +337,8 @@ export function apply(ctx: Context): void {
+     fetchRemoteModels: () => workbuddy.fetchModels(pool),
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: WORKBUDDY,
+   })
+ 
+@@ -321,6 +364,8 @@ export function apply(ctx: Context): void {
+     fetchRemoteModels: () => workbuddyCn.fetchModels(pool),
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: WORKBUDDY_CN,
+   })
+ 
+@@ -368,6 +413,8 @@ export function apply(ctx: Context): void {
+     resolveClientVersion: () => lobsterai.resolveClientVersion(),
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: LOBSTERAI,
+   })
+ 
+@@ -413,6 +460,8 @@ export function apply(ctx: Context): void {
+     },
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: QODER,
+   })
+ 
+@@ -442,6 +491,8 @@ export function apply(ctx: Context): void {
+     },
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: QODER_CN,
+   })
+ 
+@@ -475,6 +526,8 @@ export function apply(ctx: Context): void {
+     // 但模态按模型判定（远端 `display_config.multimodal`），故这里只负责读字节。
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: TRAE,
+   })
+ 
+@@ -508,6 +561,8 @@ export function apply(ctx: Context): void {
+     // 这里只负责读字节。
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: TRAE_INTL,
+   })
+ 
+@@ -545,6 +600,8 @@ export function apply(ctx: Context): void {
+     // 模态按模型判定（见 ClineAdapter.inputModalitiesFor）。
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: CLINE,
+   })
+ 
+@@ -682,6 +739,8 @@ export function apply(ctx: Context): void {
+     // 图片字节桥接：按模型能力判定（远端 capabilities.input_modalities 含 image）。
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: LOOMY,
+   })
+ 
+@@ -742,6 +801,8 @@ export function apply(ctx: Context): void {
+     // 图片字节桥接：按模型能力判定（远端 tags 含 vision）。
+     readImage: makeReadImage(ctx),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: RACCOON,
+   })
+ 
+@@ -828,6 +889,8 @@ export function apply(ctx: Context): void {
+     // 失败时返回空数组，由适配器回退兜底表。
+     fetchRemoteModels: () => zcode.fetchModels(),
+     accountPool: pool,
++    // 后台目录刷新完成时广播 llm/adapters-updated（见上方 onCatalogChanged 的说明）。
++    onCatalogChanged,
+     product: ZCODE,
+   })
+ 
+@@ -975,6 +1038,8 @@ export function apply(ctx: Context): void {
+   //     SUBSCRIPTION_REQUIRED，故默认关闭，改为给出"请先打开 IDE"的中文提示。
+   const disposeAntigravity = registerAntigravityLocalLlm(ctx, {
+     skipConfigurableRegistration: true,
++    // 本地通道的模型目录同样由后台拉取，落地后需广播（见 onCatalogChanged 的说明）。
++    onCatalogChanged,
+   })
+   // ⚠️ `registerAntigravityLocalLlm` 返回的是**注销函数**（`() => void`），
+   // 不是适配器实例 —— 实例由模块内的 `setRegisteredAntigravityAdapter` 持有，
+diff --git a/src/jet-hub-rpc.ts b/src/jet-hub-rpc.ts
+index b34c26e..8c92348 100644
+--- a/src/jet-hub-rpc.ts
++++ b/src/jet-hub-rpc.ts
+@@ -644,6 +644,21 @@ export function registerJetHubRpc(
+  */
+ export interface ModelCatalogSource {
+   listAllModels(): readonly { id: string; name: string }[]
++  /**
++   * 等待后台目录刷新落定（可选）。
++   *
++   * ## 为什么需要它
++   *
++   * 适配器的 `listModels()` 已改为**非阻塞**：首帧只读缓存（静态兜底表或
++   * 上一次的远端目录），远端拉取转后台。这对「每次打开模型选择器都要快」
++   * 是必需的，但设置页的「显示列表」是**用户主动打开**的，需要**准确**目录
++   * —— 否则用户会看到兜底表那份（少几个模型）并以为插件坏了。
++   *
++   * 故 `model.list` / `model.setDisabled` 在取目录前 `await` 本方法。
++   * 它**不是必填**：适配器没实现时退化为「直接用当前缓存」（历史行为），
++   * 不会因此报错。
++   */
++  whenCatalogReady?(): Promise<void>
+ }
+ 
+ /**
+@@ -668,8 +683,18 @@ export interface ModelCatalogSource {
+  *
+  * ⚠️ **通知失败不能反噬已经落盘的开关**：否则用户看到「切换失败」而实际已生效，
+  * 再点一次又因幂等而看似「无效」，比不提示更难排查。故这里自行吞掉异常只记日志。
++ *
++ * ## 为什么会由适配器调用（而不只是本模块）
++ *
++ * 各适配器的 `listModels()` 已改为**不阻塞**：首帧只读缓存（静态兜底表或
++ * 上一次的远端目录），远端拉取转后台。于是后台拉取**完成**时必须再广播一次，
++ * 让选择器丢掉那份「首帧目录」重读 —— 否则用户要等到下次打开选择器才看到
++ * 真实模型集合（表现为「模型列表少了一大截，重启后才对」）。
++ *
++ * 适配器不持有 `ctx`，故由 `index.ts` 把本函数包装成 `onCatalogChanged`
++ * 回调注入各适配器的 options（同 `fetchRemoteModels` 的注入方式）。
+  */
+-function broadcastCatalogChanged(ctx: Context): void {
++export function broadcastCatalogChanged(ctx: Context): void {
+   try {
+     ctx.emit('llm/adapters-updated')
+   } catch (error) {
+@@ -2192,6 +2217,15 @@ function registerJetHubEndpoints(
+         // （DSH 的 `ctx.llm` 只保证 `listModels`，不透传自定义方法）。
+         // 对话框模型选择器读的仍是过滤后的 `listModels`，可见性行为完全不变。
+         const catalogSource = modelAdapters?.[req.provider]
++        // ⚠ 取目录**之前**先等后台刷新落定：`llm.listModels()`（上一行）只
++        // 触发拉取而不等待，直接读 `listAllModels()` 会拿到静态兜底表，
++        // 用户看到「模型少了一截」。见 `ModelCatalogSource.whenCatalogReady`。
++        // 等待失败不影响流程：目录是 advisory 的，宁可显示兜底表也不报错。
++        try {
++          await catalogSource?.whenCatalogReady?.()
++        } catch {
++          // 忽略：见上。
++        }
+         const all = catalogSource?.listAllModels()
+         let catalog: Array<{ id: string; name: string }>
+         if (all !== undefined) {
+@@ -2276,6 +2310,16 @@ function registerJetHubEndpoints(
+         }
+         if (req.disabled) {
+           // 关闭全部：先取全量目录，再一次性写入黑名单。
++          //
++          // ⚠ **必须先等目录就绪**：适配器的 `listAllModels()` 现在只读缓存，
++          // 冷缓存时给的是静态兜底表 —— 据此写入黑名单会**漏掉远端独有**的
++          // 那些模型（它们保持「打开」），用户看到「关了全部却还有几个亮着」
++          // 且无从判断原因。这比设置页少显示几个模型严重得多。
++          try {
++            await modelAdapters?.[req.provider]?.whenCatalogReady?.()
++          } catch {
++            // 忽略：读不到就退回下面的兜底路径（那里同样会因目录不完整而拒绝落盘）。
++          }
+           let ids: string[]
+           const all = modelAdapters?.[req.provider]?.listAllModels()
+           if (all !== undefined) {
+diff --git a/src/llm-adapter.ts b/src/llm-adapter.ts
+index 920f0f9..43b5658 100644
+--- a/src/llm-adapter.ts
++++ b/src/llm-adapter.ts
+@@ -6,7 +6,8 @@ import {
+ } from '@deepseek-ai/dsh-llm'
+ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+ import { ToolCallId } from '@deepseek-ai/dsh-llm'
+-import { AccountPool, providerCatalogVisible } from './account-pool.js'
++import { AccountPool, providerCatalogVisibleSync } from './account-pool.js'
++import { CatalogRefresh } from './catalog-refresh.js'
+ import { settingsNamespaceFor } from './settings-compat.js'
+ import { isCodeArtsBenefitModel } from './models.js'
+ import { normalizeHarnessMessages } from './message-shape.js'
+@@ -61,6 +62,14 @@ export interface CodeArtsAdapterOptions {
+   refresh: () => Promise<void>
+   /** 动态拉取远端模型列表；失败时调用方回退到静态列表。 */
+   fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
++  /**
++   * 后台刷新**改变了目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ **必须注入**，否则 `listModels()` 非阻塞化会引入回归：首帧渲染静态
++   * 兜底表，远端目录随后落地却没人通知选择器。见 `catalog-refresh.ts`。
++   */
++  onCatalogChanged?: () => void
+   fetchImpl?: typeof fetch
+   chatId?: string
+   sessionId?: string
+@@ -748,6 +757,11 @@ export class CodeArtsAdapter extends LlmAdapter {
+     this.fetchImpl = options.fetchImpl ?? fetch
+     this.chatId = options.chatId ?? crypto.randomUUID().replace(/-/g, '')
+     this.sessionId = options.sessionId ?? crypto.randomUUID().replace(/-/g, '')
++    this.remote = new CatalogRefresh(
++      () => options.fetchRemoteModels!(),
++      options.onCatalogChanged,
++      (models) => models.length > 0,
++    )
+   }
+ 
+   /**
+@@ -763,21 +777,23 @@ export class CodeArtsAdapter extends LlmAdapter {
+     return { id, name: 'CodeArts Agent' }
+   }
+ 
+-  /** 动态模型缓存（首次 listModels 成功后填充）。 */
+-  private remoteModels: Array<{ id: string; name: string }> | undefined
++  /**
++   * 远端模型目录的**非阻塞**加载器（修复前是裸的 `remoteModels` 字段 +
++   * `await this.ensureRemoteModels()`）。
++   *
++   * ⚠ `listModels()` 是模型选择器的 UI 热路径，原先在那里 `await` 一次网络
++   * 往返 —— 多个 provider 的 await 串行叠加就是用户看到的
++   * 「装 JetHub 后模型选择器要加载很久」。详见 `catalog-refresh.ts`。
++   */
++  private readonly remote: CatalogRefresh<Array<{ id: string; name: string }>>
+ 
+   /**
+    * 懒加载远端模型目录。resolveModel 可能先于 listModels 被调用
+    * （如直接进入会话），此时同样触发远端拉取。
+    */
+   private async ensureRemoteModels(): Promise<void> {
+-    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
+-    try {
+-      const models = await this.options.fetchRemoteModels()
+-      if (models.length > 0) this.remoteModels = models
+-    } catch {
+-      // 拉取失败保持未定义，后续 listModels/resolveModel 仍回退静态列表
+-    }
++    this.remote.start()
++    await this.remote.settled()
+   }
+ 
+   /**
+@@ -788,8 +804,22 @@ export class CodeArtsAdapter extends LlmAdapter {
+    * （用户报障：「关闭的就没有显示倍率」）。CodeArts 目录虽无倍率，但同样
+    * 需要正确的 `name`（否则关闭项显示 `deepseek-v4-flash` 这类裸 id）。
+    */
++  /**
++   * 等待后台目录刷新落定。
++   *
++   * ⚠ **只给非 UI 热路径用**（Jet Hub 设置页显式打开的「显示列表」、
++   * model.list RPC）：那是用户主动发起的操作，需要**准确**目录。
++   * 模型选择器的 listModels() 绝不能调用它 —— 那会退回「首帧等网络」
++   * 的老路（正是本次修复的对象）。
++   */
++  async whenCatalogReady(): Promise<void> {
++    // 先触发（冷缓存时这里才会真的发起拉取），再等它落定。
++    this.remote.start()
++    await this.remote.settled()
++  }
++
+   listAllModels(): readonly { id: string; name: string }[] {
+-    const source = this.remoteModels ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
++    const source = this.remote.get() ?? DEFAULT_MODELS.map((id) => ({ id, name: id }))
+     // 与 listModels 保持同一套「可见性」过滤（VL 多模态不参与），
+     // 唯一区别是不套用户黑名单。
+     return source
+@@ -810,11 +840,20 @@ export class CodeArtsAdapter extends LlmAdapter {
+     //
+     // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+     // 不必拉。
+-    if (!await providerCatalogVisible(this.options.accountPool, PROVIDER)) return []
+-    // 必须 await：ensureRemoteModels 是异步的，早期实现用 `void` 丢弃 Promise，
+-    // 冷缓存时远端目录尚未落地就走静态兜底表，模型选择器会短暂显示错误的
+-    // 模型集合（Jet Hub 的模型开关也据此渲染，会造成"关掉的模型又冒出来"）。
+-    await this.ensureRemoteModels()
++    if (!providerCatalogVisibleSync(this.options.accountPool, PROVIDER)) return []
++    // ⚠ **这里刻意不 await 远端目录**（修复前是 `await this.ensureRemoteModels()`，
++    // 那是「模型选择器加载很久」的直接成因之一）。
++    //
++    // 早期注释里「必须 await」的理由是：冷缓存时远端目录尚未落地就走静态兜底
++    // 表，选择器会短暂显示错误的模型集合（Jet Hub 的模型开关也据此渲染，会
++    // 造成「关掉的模型又冒出来」）。该理由由两件事同时解决：
++    //
++    // 1. **首帧用就近的已知目录**（`this.remote.get()`，可能已由
++    //    `resolveModel` / 预热填好），冷启动才回退静态表；
++    // 2. **后台拉取完成后广播 `llm/adapters-updated`**（`this.remote` 的
++    //    `onCatalogChanged` 回调）——选择器重读，兜底表那一帧随即被真实目录
++    //    替换。用户看到的是「先出来、再瞬间补全」，而不是「空转等待」。
++    this.remote.start()
+     const visible = this.listAllModels()
+     // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
+     // 只影响此处对外播报的模型目录，不改变 resolveModel/stream 的路由能力
+@@ -827,8 +866,9 @@ export class CodeArtsAdapter extends LlmAdapter {
+   }
+ 
+   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
++    // 非 UI 热路径：需要准确元数据，故在此等待远端目录落地（与 listModels 相反）。
+     await this.ensureRemoteModels()
+-    const remoteModel = this.remoteModels?.find((m) => m.id === model)
++    const remoteModel = this.remote.get()?.find((m) => m.id === model)
+     const name = remoteModel?.name ?? model
+     const contextWindow = CONTEXT_WINDOWS.get(model)
+     const resolved: LlmResolvedModelInfo = { provider, id: model, name }
+diff --git a/src/lobsterai-adapter.ts b/src/lobsterai-adapter.ts
+index 2d73f53..2d98444 100644
+--- a/src/lobsterai-adapter.ts
++++ b/src/lobsterai-adapter.ts
+@@ -29,7 +29,8 @@ import {
+ } from '@deepseek-ai/dsh-llm'
+ import { ToolCallId } from '@deepseek-ai/dsh-llm'
+ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+-import { AccountPool, providerCatalogVisible } from './account-pool.js'
++import { AccountPool, providerCatalogVisibleSync } from './account-pool.js'
++import { CatalogRefresh } from './catalog-refresh.js'
+ import { settingsNamespaceFor } from './settings-compat.js'
+ import { parseRateLimitError } from './llm-adapter.js'
+ import {
+@@ -319,6 +320,14 @@ export interface LobsteraiAdapterOptions {
+   refresh: () => Promise<void>
+   /** 动态拉取远端模型列表；失败时回退到 `product.fallbackModels`。 */
+   fetchRemoteModels?: () => Promise<LobsteraiRemoteModel[]>
++  /**
++   * 后台刷新**改变了目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ **必须注入**，否则 `listModels()` 非阻塞化会引入回归：首帧渲染静态
++   * 兜底表，远端目录随后落地却没人通知选择器。见 `catalog-refresh.ts`。
++   */
++  onCatalogChanged?: () => void
+   /** 解析当前客户端版本号（chat 与模型列表都要带）。 */
+   resolveClientVersion?: () => Promise<string>
+   fetchImpl?: typeof fetch
+@@ -687,10 +696,29 @@ function resolveChunkTimeoutMs(): number {
+ export class LobsteraiAdapter extends LlmAdapter {
+   private readonly product: LobsteraiProduct
+   private readonly fetchImpl: typeof fetch
+-  /** 动态模型缓存（首次 listModels 成功后填充）。 */
+-  private remoteModels: LobsteraiRemoteModel[] | undefined
++  /**
++   * 远端模型目录的**非阻塞**加载器（修复前是裸的 `remoteModels` 字段 +
++   * `await this.ensureRemoteModels()`）。
++   *
++   * ⚠ `listModels()` 是模型选择器的 UI 热路径，原先在那里 `await` 一次网络
++   * 往返 —— 多个 provider 的 await 串行叠加就是用户看到的
++   * 「装 JetHub 后模型选择器要加载很久」。详见 `catalog-refresh.ts`。
++   */
++  private readonly remote: CatalogRefresh<LobsteraiRemoteModel[]>
+   /** 远端下发的模型元数据（id → 条目），listModels/resolveModel 共用。 */
+   private remoteMeta: ReadonlyMap<string, LobsteraiRemoteModel> = new Map()
++
++  /** 远端模型目录（未拉取到时为 undefined，调用方回退兜底表）。 */
++  private get remoteModels(): LobsteraiRemoteModel[] | undefined {
++    return this.remote.get()
++  }
++
++  /** 把 {@link remote} 的当前值同步到 {@link remoteMeta} 镜像。 */
++  private syncRemoteDerived(): void {
++    const models = this.remote.get()
++    this.remoteMeta = new Map(models?.map((model) => [model.id, model]) ?? [])
++  }
++
+   /** 产品级兜底模型索引（`product.fallbackModels` 的 id → 条目）。 */
+   private readonly fallbackIndex: ReadonlyMap<string, LobsteraiFallbackModel>
+ 
+@@ -701,6 +729,16 @@ export class LobsteraiAdapter extends LlmAdapter {
+     this.fallbackIndex = new Map(
+       (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
+     )
++    this.remote = new CatalogRefresh(
++      async () => {
++        const models = await options.fetchRemoteModels!()
++        // 每次成功落地都刷新镜像（广播会因「目录没变」被跳过，不能拿它当时机）。
++        this.syncRemoteDerived()
++        return models
++      },
++      options.onCatalogChanged,
++      (models) => models.length > 0,
++    )
+   }
+ 
+   /**
+@@ -719,20 +757,17 @@ export class LobsteraiAdapter extends LlmAdapter {
+   /**
+    * 懒加载远端模型目录（仅拉取一次）。
+    *
+-   * `listModels` 与 `resolveModel` 共用：`resolveModel` 可能先于 `listModels`
+-   * 被调用（如直接从历史会话进入），此时同样需要触发一次拉取。
++   * `resolveModel` / `stream` 共用：它们可能先于 `listModels` 被调用
++   * （如直接从历史会话进入）。
++   *
++   * ⚠ **只给非热路径用**（等到目录落地，保证 `remoteMeta` 准确）。
++   * `listModels()` 不得调用它 —— 那会退回「选择器等网络」的老路。
+    */
+   private async ensureRemoteModels(): Promise<void> {
+-    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
+-    try {
+-      const models = await this.options.fetchRemoteModels()
+-      if (models.length > 0) {
+-        this.remoteModels = models
+-        this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+-      }
+-    } catch {
+-      // 远端不可用：回退兜底目录（由 staticFallbackModels 提供）。
+-    }
++    if (this.options.fetchRemoteModels === undefined) return
++    this.remote.start()
++    await this.remote.settled()
++    this.syncRemoteDerived()
+   }
+ 
+   /**
+@@ -821,6 +856,22 @@ export class LobsteraiAdapter extends LlmAdapter {
+    * 黑名单过滤掉它们 —— RPC 层只能凭裸 id 补回，展示名与倍率随之丢失
+    * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
+    */
++  /**
++   * 等待后台目录刷新落定。
++   *
++   * ⚠ **只给非 UI 热路径用**（Jet Hub 设置页显式打开的「显示列表」、
++   * model.list RPC）：那是用户主动发起的操作，需要**准确**目录。
++   * 模型选择器的 listModels() 绝不能调用它 —— 那会退回「首帧等网络」
++   * 的老路（正是本次修复的对象）。
++   */
++  async whenCatalogReady(): Promise<void> {
++    // 先触发（冷缓存时这里才会真的发起拉取），再等它落定。
++    this.remote.start()
++    await this.remote.settled()
++    // 目录落地后同步派生镜像（remoteMeta 等）—— stream / resolveModel 读它。
++    this.syncRemoteDerived()
++  }
++
+   listAllModels(): readonly { id: string; name: string }[] {
+     const source = this.remoteModels ?? this.staticFallbackModels()
+     return source.map((model) => ({ id: model.id, name: displayNameFor(model) }))
+@@ -830,8 +881,14 @@ export class LobsteraiAdapter extends LlmAdapter {
+     // ⚠️ 门控放在 `ensureRemoteModels()` **之前**：没有已登录账号时连远端目录都
+     // 不必拉。返回空数组 → DSH 的 `buildModelCatalog` 把整个 provider 分组隐藏。
+     // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`）。
+-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
+-    await this.ensureRemoteModels()
++    if (!providerCatalogVisibleSync(this.options.accountPool, this.product.id)) return []
++    // ⚠ **刻意不 await**（修复前是 `await this.ensureRemoteModels()`）：
++    // 只触发后台拉取，首帧用当前已知目录（已缓存远端目录，否则静态兜底表）。
++    // 拉取完成后 `CatalogRefresh` 会经 `onCatalogChanged` 广播
++    // `llm/adapters-updated`，选择器重读并替换掉兜底表那一帧。
++    //
++    // 门控仍放在拉取**之前**：没有已登录账号时连远端目录都不必拉。
++    if (this.options.fetchRemoteModels !== undefined) this.remote.start()
+     const source = this.remoteModels ?? this.staticFallbackModels()
+     // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
+     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
+@@ -1659,4 +1716,4 @@ export function buildLobsteraiModelsUrl(
+ }
+ 
+ /** 模型列表请求超时（与其它控制面请求一致）。 */
+-export const LOBSTERAI_MODELS_TIMEOUT_MS = LOBSTERAI_REQUEST_TIMEOUT_MS
++export const LOBSTERAI_MODELS_TIMEOUT_MS = LOBSTERAI_REQUEST_TIMEOUT_MS
+\ No newline at end of file
+diff --git a/src/loomy-adapter.ts b/src/loomy-adapter.ts
+index 9436681..4cca45f 100644
+--- a/src/loomy-adapter.ts
++++ b/src/loomy-adapter.ts
+@@ -21,7 +21,8 @@ import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+ import type {
+   GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk,
+ } from '@deepseek-ai/dsh-llm'
+-import { AccountPool, providerCatalogVisible } from './account-pool.js'
++import { AccountPool, providerCatalogVisibleSync } from './account-pool.js'
++import { CatalogRefresh } from './catalog-refresh.js'
+ import { settingsNamespaceFor } from './settings-compat.js'
+ import {
+   isLoomyChatModel,
+@@ -133,6 +134,13 @@ export interface LoomyAdapterOptions {
+   refresh: () => Promise<void>
+   /** 拉取远端模型目录；失败时适配器回退兜底表。 */
+   fetchRemoteModels?: () => Promise<LoomyRemoteModel[]>
++  /**
++   * 后台刷新**改变了目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ **必须注入**，否则 `listModels()` 非阻塞化会引入回归。见 `catalog-refresh.ts`。
++   */
++  onCatalogChanged?: () => void
+   /** 读取图片附件的原始字节（内联为 data URL 用）。 */
+   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+   /** 账号池（目录门控与黑名单）。 */
+@@ -149,14 +157,33 @@ export class LoomyAdapter extends LlmAdapter {
+   private readonly fetchImpl: typeof fetch
+   /** 兜底模型索引（id → 条目）。 */
+   private readonly fallbackIndex: ReadonlyMap<string, LoomyFallbackModel>
+-  /** 远端模型缓存（含展示名与能力）；未拉取时为 undefined。 */
+-  private remoteModels: LoomyRemoteModel[] | undefined
++  /**
++   * 远端模型目录的**非阻塞**加载器（修复前是裸的 `remoteModels` 字段 +
++   * `await this.loadModels()`）。
++   *
++   * ⚠ `listModels()` 是模型选择器的 UI 热路径，原先在那里 `await` 一次网络
++   * 往返 —— 多个 provider 的 await 串行叠加就是用户看到的
++   * 「装 JetHub 后模型选择器要加载很久」。详见 `catalog-refresh.ts`。
++   */
++  private readonly remote: CatalogRefresh<LoomyRemoteModel[]>
++
++  /** 远端模型目录（未拉取到时为 undefined）。 */
++  private get remoteModels(): LoomyRemoteModel[] | undefined {
++    return this.remote.get()
++  }
+ 
+   constructor(private readonly options: LoomyAdapterOptions) {
+     super()
+     this.product = options.product ?? LOOMY
+     this.fetchImpl = options.fetchImpl ?? fetch
+     this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]))
++    this.remote = new CatalogRefresh(
++      () => this.loadModelsOnce(),
++      options.onCatalogChanged,
++      // ⚠ 恒真：`loadModelsOnce` 自己会把兜底表写进去（保持修复前语义 ——
++      // 远端不可用时 `remoteModels` 即为兜底表，而不是留 undefined）。
++      () => true,
++    )
+   }
+ 
+   /**
+@@ -172,29 +199,47 @@ export class LoomyAdapter extends LlmAdapter {
+     return { id, name: this.product.displayName }
+   }
+ 
++  /**
++   * 等待后台目录刷新落定。
++   *
++   * ⚠ **只给非 UI 热路径用**（Jet Hub 设置页显式打开的「显示列表」、
++   * `model.list` RPC）：那是用户主动发起的操作，需要**准确**目录。
++   * 模型选择器的 `listModels()` 绝不能调用它 —— 那会退回「首帧等网络」
++   * 的老路（正是本次修复的对象）。
++   */
++  async whenCatalogReady(): Promise<void> {
++    // 先触发（冷缓存时这里才会真的发起拉取），再等它落定。
++    this.remote.start()
++    await this.remote.settled()
++  }
++
+   /** 完整目录（**不套黑名单**），带最终展示名。设置页需要它渲染被关闭的模型。 */
+   listAllModels(): readonly { id: string; name: string }[] {
+     const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
+     return source.map((model) => ({ id: model.id, name: model.name }))
+   }
+ 
+-  /** 取（并缓存）远端模型目录；失败时回退兜底表。 */
+-  private async loadModels(): Promise<LoomyRemoteModel[]> {
+-    if (this.remoteModels !== undefined) return this.remoteModels
++  /**
++   * 取远端模型目录；失败时**回退兜底表并缓存它**。
++   *
++   * ⚠ 只负责「拉一次」：缓存/去重/广播由 {@link remote} 负责。
++   */
++  private async loadModelsOnce(): Promise<LoomyRemoteModel[]> {
+     if (this.options.fetchRemoteModels !== undefined) {
+       try {
+         const fetched = await this.options.fetchRemoteModels()
+-        if (fetched.length > 0) {
+-          this.remoteModels = fetched
+-          return fetched
+-        }
++        if (fetched.length > 0) return fetched
+       } catch {
+         // 远端失败静默回退兜底表：模型目录是展示信息，不该让整个 provider 报错。
+       }
+     }
+-    const fallback = this.product.fallbackModels.map(fallbackToRemote)
+-    this.remoteModels = fallback
+-    return fallback
++    return this.product.fallbackModels.map(fallbackToRemote)
++  }
++
++  /** 取当前已知目录（**同步**，只读缓存 + 后台预热）。 */
++  private currentModels(): LoomyRemoteModel[] {
++    if (this.options.fetchRemoteModels !== undefined) this.remote.start()
++    return this.remote.get() ?? this.product.fallbackModels.map(fallbackToRemote)
+   }
+ 
+   private inputModalitiesFor(model: LoomyRemoteModel | undefined): readonly ('text' | 'image')[] {
+@@ -205,9 +250,12 @@ export class LoomyAdapter extends LlmAdapter {
+     // ⚠️ 无已登录账号时返回 `[]` → DSH 的 buildModelCatalog 把整个 provider
+     // 分组隐藏。**必须返回空数组而不能抛错**（抛错会被归入 catalog 的
+     // failures，界面上反而多一条 provider 报错）。
+-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
++    if (!providerCatalogVisibleSync(this.options.accountPool, this.product.id)) return []
+ 
+-    const all = await this.loadModels()
++    // ⚠ **刻意不 await**（修复前是 `await this.loadModels()`）：首帧用当前已知
++    // 目录，远端拉取转后台；完成后 `CatalogRefresh` 经 `onCatalogChanged` 广播
++    // `llm/adapters-updated`，选择器重读并替换掉兜底表那一帧。
++    const all = this.currentModels()
+     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
+     const listed = disabled === undefined || disabled.size === 0
+       ? all
+@@ -223,7 +271,10 @@ export class LoomyAdapter extends LlmAdapter {
+   }
+ 
+   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+-    const all = await this.loadModels()
++    // 非 UI 热路径：需要准确元数据，故等待目录落地（与 listModels 相反）。
++    this.remote.start()
++    await this.remote.settled()
++    const all = this.remote.get() ?? this.product.fallbackModels.map(fallbackToRemote)
+     const entry = all.find((item) => item.id === model)
+     const fallback = this.fallbackIndex.get(model)
+     // ⚠️ name **不带倍率**（与 qoder/trae 一致）：价格只属于选择列表语境。
+@@ -268,7 +319,10 @@ export class LoomyAdapter extends LlmAdapter {
+     for (const message of options.messages) {
+       if (Array.isArray(message.content)) collectImages(message.content, imageRefs)
+     }
+-    const all = await this.loadModels()
++    // ⚠ stream 前必须等目录落地：图片能力由它决定（同 raccoon 的既有注释）。
++    this.remote.start()
++    await this.remote.settled()
++    const all = this.remote.get() ?? this.product.fallbackModels.map(fallbackToRemote)
+     const entry = all.find((item) => item.id === options.model)
+     let imageUrls: Map<string, string> | undefined
+     if (imageRefs.size > 0) {
+diff --git a/src/qoder-adapter.ts b/src/qoder-adapter.ts
+index 75d250d..f16555b 100644
+--- a/src/qoder-adapter.ts
++++ b/src/qoder-adapter.ts
+@@ -27,7 +27,7 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+ import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
+ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+ import { randomUUID } from 'node:crypto'
+-import { AccountPool, providerCatalogVisible } from './account-pool.js'
++import { AccountPool, providerCatalogVisibleSync } from './account-pool.js'
+ import { settingsNamespaceFor } from './settings-compat.js'
+ import { isQoderExpired, type QoderCredential } from './qoder.js'
+ import { QoderEncryptedInfer, type QoderInferMessage, type QoderInferRequest, type QoderInferTool, type QoderInferToolCall } from './qoder-wasm.js'
+@@ -167,6 +167,17 @@ export interface QoderAdapterOptions {
+   refresh: () => Promise<void>
+   /** 多账号池（用于限流时切换账号与模型黑名单）。 */
+   accountPool?: AccountPool
++  /**
++   * 后台刷新**改变了目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ 本适配器的目录**恒为静态表**（远端 `/algo/api/v2/model/list` 需 WASM
++   * 签名，故不拉取），因此当前这个回调不会被调用。保留它是为了：
++   * ① 与其余 13 个 provider 的注入点保持同形（`index.ts` 里统一注入，
++   * 少一个例外就少一处「加新 provider 时忘了接」）；
++   * ② 万一将来 Qoder 也能拉远端目录，非阻塞化所需的广播通路已经就位。
++   */
++  onCatalogChanged?: () => void
+   /**
+    * 补齐凭据缺失的 **`uid`**（加密推理必需）。
+    *
+@@ -250,6 +261,13 @@ export class QoderAdapter extends LlmAdapter {
+    * 黑名单过滤掉它们 —— RPC 层只能凭裸 id 补回，展示名与倍率随之丢失
+    * （用户报障：「关闭的就没有显示倍率」）。详见 `model.list` 端点的注释。
+    */
++  /**
++   * 等待目录就绪（**本适配器恒为静态表，故为无操作**）。
++   *
++   * 保留它是为了与其余适配器的 ModelCatalogSource 契约同形 ——
++   * model.list 端点会对所有 provider 统一调用它，缺一个就要在那里写例外。
++   */
++  async whenCatalogReady(): Promise<void> {}
+   listAllModels(): readonly { id: string; name: string }[] {
+     return this.product.fallbackModels.map((model) => ({ id: model.id, name: qoderDisplayName(model) }))
+   }
+@@ -259,7 +277,10 @@ export class QoderAdapter extends LlmAdapter {
+     // provider 分组隐藏（它显式 `.filter(group => group.models.length > 0)`）。
+     // ⚠️ 必须返回 `[]` 而**不能抛错**（抛错会被归入 catalog 的 `failures`，
+     // 界面上反而多出一条 provider 报错）。
+-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
++    // ⚠ 用**同步**版门控：本方法是模型选择器的 UI 热路径，任何 await 都会让
++    // 返回的 Promise 挂起。同步版读上次已知可见性并后台刷新，冷启动无缓存时
++    // 保守放行。见 `providerCatalogVisibleSync` 的注释。
++    if (!providerCatalogVisibleSync(this.options.accountPool, this.product.id)) return []
+     // 用户在 Jet Hub 关闭的模型（黑名单制：不在表里即默认打开）。
+     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
+     const source = this.product.fallbackModels
+diff --git a/src/raccoon-adapter.ts b/src/raccoon-adapter.ts
+index 313f704..ae00e48 100644
+--- a/src/raccoon-adapter.ts
++++ b/src/raccoon-adapter.ts
+@@ -29,7 +29,8 @@ import type {
+   LlmResolvedModelInfo,
+   StreamChunk,
+ } from '@deepseek-ai/dsh-llm'
+-import { AccountPool, providerCatalogVisible } from './account-pool.js'
++import { AccountPool, providerCatalogVisibleSync } from './account-pool.js'
++import { CatalogRefresh } from './catalog-refresh.js'
+ import { settingsNamespaceFor } from './settings-compat.js'
+ import { isRaccoonExpired, type RaccoonCredential } from './raccoon.js'
+ import { RACCOON, type RaccoonFallbackModel, type RaccoonProduct } from './raccoon-product.js'
+@@ -88,6 +89,13 @@ export interface RaccoonAdapterOptions {
+   refresh: () => Promise<void>
+   /** 拉取远端模型目录；失败时适配器回退兜底表。 */
+   fetchRemoteModels?: () => Promise<RaccoonRemoteModel[]>
++  /**
++   * 后台刷新**改变了目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ **必须注入**，否则 `listModels()` 非阻塞化会引入回归。见 `catalog-refresh.ts`。
++   */
++  onCatalogChanged?: () => void
+   /** 读取图片附件的原始字节（内联为 data URL 用）。 */
+   readImage?: (attachment: unknown) => Promise<{ data: Uint8Array; mediaType: string } | undefined>
+   /** 账号池（目录门控与黑名单）。 */
+@@ -104,14 +112,34 @@ export class RaccoonAdapter extends LlmAdapter {
+   private readonly fetchImpl: typeof fetch
+   /** 兜底模型索引（id → 条目）。 */
+   private readonly fallbackIndex: ReadonlyMap<string, RaccoonFallbackModel>
+-  /** 远端模型缓存；未拉取时为 undefined。 */
+-  private remoteModels: RaccoonRemoteModel[] | undefined
++  /**
++   * 远端模型目录的**非阻塞**加载器（修复前是裸的 `remoteModels` 字段 +
++   * `await this.loadModels()`）。
++   *
++   * ⚠ `listModels()` 是模型选择器的 UI 热路径，原先在那里 `await` 一次网络
++   * 往返 —— 多个 provider 的 await 串行叠加就是用户看到的
++   * 「装 JetHub 后模型选择器要加载很久」。详见 `catalog-refresh.ts`。
++   */
++  private readonly remote: CatalogRefresh<RaccoonRemoteModel[]>
++
++  /** 远端模型目录（未拉取到时为 undefined）。 */
++  private get remoteModels(): RaccoonRemoteModel[] | undefined {
++    return this.remote.get()
++  }
+ 
+   constructor(private readonly options: RaccoonAdapterOptions) {
+     super()
+     this.product = options.product ?? RACCOON
+     this.fetchImpl = options.fetchImpl ?? fetch
+     this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]))
++    this.remote = new CatalogRefresh(
++      () => this.loadModelsOnce(),
++      options.onCatalogChanged,
++      // ⚠ 恒真：`loadModelsOnce` 自己会把兜底表写进去（保持修复前的语义 ——
++      // 远端不可用时 `remoteModels` 即为兜底表，而不是留 undefined 让
++      // `listAllModels` 每次重复回退）。
++      () => true,
++    )
+   }
+ 
+   /**
+@@ -132,28 +160,47 @@ export class RaccoonAdapter extends LlmAdapter {
+    * 设置页需要它渲染被关闭的模型 —— 否则那些条目只能凭 `disabledMap` 的 key
+    * 补回，而那条路径拿不到展示名，会退化成裸 id（倍率与模型名随之丢失）。
+    */
++  /**
++   * 等待后台目录刷新落定。
++   *
++   * ⚠ **只给非 UI 热路径用**（Jet Hub 设置页显式打开的「显示列表」、
++   * model.list RPC）：那是用户主动发起的操作，需要**准确**目录。
++   * 模型选择器的 listModels() 绝不能调用它 —— 那会退回「首帧等网络」
++   * 的老路（正是本次修复的对象）。
++   */
++  async whenCatalogReady(): Promise<void> {
++    // 先触发（冷缓存时这里才会真的发起拉取），再等它落定。
++    this.remote.start()
++    await this.remote.settled()
++  }
++
+   listAllModels(): readonly { id: string; name: string }[] {
+     const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
+     return source.map((model) => ({ id: model.id, name: model.name }))
+   }
+ 
+-  /** 取（并缓存）远端模型目录；失败时回退兜底表。 */
+-  private async loadModels(): Promise<RaccoonRemoteModel[]> {
+-    if (this.remoteModels !== undefined) return this.remoteModels
++  /**
++   * 取远端模型目录；失败时**回退兜底表并缓存它**。
++   *
++   * ⚠ 与 `CatalogRefresh` 的分工：本方法只负责「拉一次」，缓存/去重/广播
++   * 由 {@link remote} 负责，故这里**不再**自行判断 `remoteModels` 是否已存在。
++   */
++  private async loadModelsOnce(): Promise<RaccoonRemoteModel[]> {
+     if (this.options.fetchRemoteModels !== undefined) {
+       try {
+         const fetched = await this.options.fetchRemoteModels()
+-        if (fetched.length > 0) {
+-          this.remoteModels = fetched
+-          return fetched
+-        }
++        if (fetched.length > 0) return fetched
+       } catch {
+         // 远端失败静默回退兜底表：模型目录是展示信息，不该让整个 provider 报错。
+       }
+     }
+-    const fallback = this.product.fallbackModels.map(fallbackToRemote)
+-    this.remoteModels = fallback
+-    return fallback
++    return this.product.fallbackModels.map(fallbackToRemote)
++  }
++
++  /** 取（并缓存）远端模型目录（**同步**，只读缓存 + 后台预热）。 */
++  private currentModels(): RaccoonRemoteModel[] {
++    if (this.options.fetchRemoteModels !== undefined) this.remote.start()
++    return this.remote.get() ?? this.product.fallbackModels.map(fallbackToRemote)
+   }
+ 
+   private inputModalitiesFor(model: RaccoonRemoteModel | undefined): readonly ('text' | 'image')[] {
+@@ -164,9 +211,12 @@ export class RaccoonAdapter extends LlmAdapter {
+     // ⚠️ 无已登录账号时返回 `[]` → DSH 的 buildModelCatalog 把整个 provider
+     // 分组隐藏。**必须返回空数组而不能抛错**（抛错会被归入 catalog 的
+     // failures，界面上反而多一条 provider 报错）。
+-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
++    if (!providerCatalogVisibleSync(this.options.accountPool, this.product.id)) return []
+ 
+-    const all = await this.loadModels()
++    // ⚠ **刻意不 await**（修复前是 `await this.loadModels()`）：首帧用当前已知
++    // 目录，远端拉取转后台；完成后 `CatalogRefresh` 经 `onCatalogChanged` 广播
++    // `llm/adapters-updated`，选择器重读并替换掉兜底表那一帧。
++    const all = this.currentModels()
+     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
+     const listed = disabled === undefined || disabled.size === 0
+       ? all
+@@ -182,7 +232,10 @@ export class RaccoonAdapter extends LlmAdapter {
+   }
+ 
+   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+-    const all = await this.loadModels()
++    // 非 UI 热路径：需要准确元数据，故等待目录落地（与 listModels 相反）。
++    this.remote.start()
++    await this.remote.settled()
++    const all = this.remote.get() ?? this.product.fallbackModels.map(fallbackToRemote)
+     const entry = all.find((item) => item.id === model)
+     const fallback = this.fallbackIndex.get(model)
+     // ⚠️ name **不带倍率**（与 qoder/trae/loomy 一致）：价格只属于选择列表语境。
+@@ -228,7 +281,11 @@ export class RaccoonAdapter extends LlmAdapter {
+     for (const message of options.messages) {
+       if (Array.isArray(message.content)) collectImages(message.content, imageRefs)
+     }
+-    const all = await this.loadModels()
++    // ⚠ stream 前必须等目录落地：图片能力（`inputModalitiesFor`）由它决定，
++    // 用兜底表估值会把支持图片的模型误判成不支持（同 lobsterai 的既有注释）。
++    this.remote.start()
++    await this.remote.settled()
++    const all = this.remote.get() ?? this.product.fallbackModels.map(fallbackToRemote)
+     const entry = all.find((item) => item.id === options.model)
+     let imageUrls: Map<string, string> | undefined
+     if (imageRefs.size > 0) {
+diff --git a/src/trae-adapter.ts b/src/trae-adapter.ts
+index c70bb2b..52ed1da 100644
+--- a/src/trae-adapter.ts
++++ b/src/trae-adapter.ts
+@@ -22,7 +22,8 @@ import type { CredentialRef } from '@deepseek-ai/dsh-credentials'
+ import { LlmAdapter, LlmError, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+ import type { GenerateOptions, LlmModelInfo, LlmProviderInfo, LlmResolvedModelInfo, StreamChunk } from '@deepseek-ai/dsh-llm'
+ import { ToolCallId } from '@deepseek-ai/dsh-llm'
+-import { AccountPool, providerCatalogVisible } from './account-pool.js'
++import { AccountPool, providerCatalogVisibleSync } from './account-pool.js'
++import { CatalogRefresh } from './catalog-refresh.js'
+ import { settingsNamespaceFor } from './settings-compat.js'
+ import {
+   TRAE_DEFAULT_MODEL,
+@@ -195,6 +196,14 @@ export interface TraeAdapterOptions {
+   refresh: () => Promise<void>
+   /** 动态拉取远端模型列表；失败时回退到 `product.fallbackModels`。 */
+   fetchRemoteModels?: () => Promise<TraeRemoteModel[]>
++  /**
++   * 后台刷新**改变了目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ **必须注入**，否则 `listModels()` 非阻塞化会引入回归：首帧渲染静态
++   * 兜底表，远端目录随后落地却没人通知选择器。见 `catalog-refresh.ts`。
++   */
++  onCatalogChanged?: () => void
+   fetchImpl?: typeof fetch
+   /** 多账号池（用于限流时切换账号）。 */
+   accountPool?: AccountPool
+@@ -540,10 +549,28 @@ export function traeDisplayName(model: TraeRemoteModel): string {
+ export class TraeAdapter extends LlmAdapter {
+   private readonly product: TraeProduct
+   private readonly fetchImpl: typeof fetch
+-  /** 动态模型缓存。 */
+-  private remoteModels: TraeRemoteModel[] | undefined
++  /**
++   * 远端模型目录的**非阻塞**加载器（修复前是裸的 `remoteModels` 字段 +
++   * `await this.ensureRemoteModels()`）。
++   *
++   * ⚠ `listModels()` 是模型选择器的 UI 热路径，原先在那里 `await` 一次网络
++   * 往返。本适配器服务 2 个 provider（trae / trae-intl），各等一次。
++   * 详见 `catalog-refresh.ts`。
++   */
++  private readonly remote: CatalogRefresh<TraeRemoteModel[]>
+   /** 远端模型元数据索引。 */
+   private remoteMeta: ReadonlyMap<string, TraeRemoteModel> = new Map()
++
++  /** 远端模型目录（未拉取到时为 undefined，调用方回退兜底表）。 */
++  private get remoteModels(): TraeRemoteModel[] | undefined {
++    return this.remote.get()
++  }
++
++  /** 把 {@link remote} 的当前值同步到 {@link remoteMeta} 镜像。 */
++  private syncRemoteDerived(): void {
++    const models = this.remote.get()
++    this.remoteMeta = new Map(models?.map((model) => [model.id, model]) ?? [])
++  }
+   /** 产品级兜底模型索引。 */
+   private readonly fallbackIndex: ReadonlyMap<string, TraeFallbackModel>
+   /**
+@@ -559,6 +586,17 @@ export class TraeAdapter extends LlmAdapter {
+     this.fallbackIndex = new Map(
+       (this.product.fallbackModels ?? []).map((model) => [model.id, model]),
+     )
++    this.remote = new CatalogRefresh(
++      async () => {
++        const models = await options.fetchRemoteModels!()
++        // 每次成功落地都刷新镜像：`onCatalogChanged` 只负责广播，
++        // 而广播会因「目录没变」被跳过，不能拿它当镜像同步的时机。
++        this.syncRemoteDerived()
++        return models
++      },
++      options.onCatalogChanged,
++      (models) => models.length > 0,
++    )
+   }
+ 
+   providerInfo(provider: string): LlmProviderInfo {
+@@ -566,16 +604,17 @@ export class TraeAdapter extends LlmAdapter {
+     return { id, name: this.product.displayName }
+   }
+ 
+-  /** 懒加载远端模型目录（仅拉取一次）。 */
++  /**
++   * 懒加载远端模型目录（仅拉取一次）。
++   *
++   * ⚠ **只给非热路径用**（`resolveModel` / stream 前的能力判定）：它等到
++   * 目录落地才返回，保证 `remoteMeta` 准确。`listModels()` 不得调用它。
++   */
+   private async ensureRemoteModels(): Promise<void> {
+-    if (this.remoteModels !== undefined || this.options.fetchRemoteModels === undefined) return
+-    try {
+-      const models = await this.options.fetchRemoteModels()
+-      if (models.length > 0) {
+-        this.remoteModels = models
+-        this.remoteMeta = new Map(models.map((model) => [model.id, model]))
+-      }
+-    } catch { /* 远端不可用：回退兜底目录 */ }
++    if (this.options.fetchRemoteModels === undefined) return
++    this.remote.start()
++    await this.remote.settled()
++    this.syncRemoteDerived()
+   }
+ 
+   /**
+@@ -733,6 +772,22 @@ export class TraeAdapter extends LlmAdapter {
+    * 每个 id 的**真实展示名（含倍率）**，再自行回填 `disabled` 状态。
+    * 对话框模型选择器读的仍是 `listModels`（已过滤），可见性行为不变。
+    */
++  /**
++   * 等待后台目录刷新落定。
++   *
++   * ⚠ **只给非 UI 热路径用**（Jet Hub 设置页显式打开的「显示列表」、
++   * model.list RPC）：那是用户主动发起的操作，需要**准确**目录。
++   * 模型选择器的 listModels() 绝不能调用它 —— 那会退回「首帧等网络」
++   * 的老路（正是本次修复的对象）。
++   */
++  async whenCatalogReady(): Promise<void> {
++    // 先触发（冷缓存时这里才会真的发起拉取），再等它落定。
++    this.remote.start()
++    await this.remote.settled()
++    // 目录落地后同步派生镜像（remoteMeta）—— stream / resolveModel 读它。
++    this.syncRemoteDerived()
++  }
++
+   listAllModels(): readonly { id: string; name: string }[] {
+     // 过滤逻辑与 `listModels` 的第一、二层一致（usage / config_switch /
+     // is_invisible_to_user 已在解析器里剔除；这里再挡 isHidden 与 is_custom_model），
+@@ -750,8 +805,14 @@ export class TraeAdapter extends LlmAdapter {
+     // 把整个 provider 分组隐藏，减少模型选择列表的臃肿（见 providerCatalogVisible）。
+     // ⚠️ 这里必须返回 `[]` 而**不能抛错**：抛错会被归入 catalog 的 `failures`，
+     // 界面上反而多出一条 provider 报错。
+-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
+-    await this.ensureRemoteModels()
++    if (!providerCatalogVisibleSync(this.options.accountPool, this.product.id)) return []
++    // ⚠ **刻意不 await**（修复前是 `await this.ensureRemoteModels()`）：
++    // 只触发后台拉取，首帧用当前已知目录（已缓存远端目录，否则静态兜底表）。
++    // 拉取完成后 `CatalogRefresh` 会经 `onCatalogChanged` 广播
++    // `llm/adapters-updated`，选择器重读并替换掉兜底表那一帧。
++    //
++    // 门控仍放在拉取**之前**（没有已登录账号时连远端目录都不必拉）。
++    if (this.options.fetchRemoteModels !== undefined) this.remote.start()
+     // 过滤逻辑分两层：
+     //
+     // 第一层（解析时，`parseTraeBatchModelList`）：硬性过滤 `usage !==
+@@ -1647,4 +1708,4 @@ export function registerTraeLlm(ctx: Context, options: TraeAdapterOptions): Trae
+   // 影响的全量目录，带最终展示名/倍率）。DSH 的 `ctx.llm` 不透传自定义方法，
+   // 故必须由调用方持有引用。
+   return adapter
+-}
++}
+\ No newline at end of file
+diff --git a/src/zcode-adapter.ts b/src/zcode-adapter.ts
+index 2199957..92f87e1 100644
+--- a/src/zcode-adapter.ts
++++ b/src/zcode-adapter.ts
+@@ -49,7 +49,8 @@ import type {
+   LlmResolvedModelInfo,
+   StreamChunk,
+ } from '@deepseek-ai/dsh-llm'
+-import { AccountPool, providerCatalogVisible } from './account-pool.js'
++import { AccountPool, providerCatalogVisibleSync } from './account-pool.js'
++import { CatalogRefresh } from './catalog-refresh.js'
+ import { settingsNamespaceFor } from './settings-compat.js'
+ import { readBridgeDiscovery, type ZcodeCredential } from './zcode.js'
+ import { ZCODE, type ZcodeFallbackModel, type ZcodeProduct, type ZcodeRemoteModelLike } from './zcode-product.js'
+@@ -105,6 +106,16 @@ export interface ZcodeAdapterOptions {
+   refresh: () => Promise<void>
+   /** 拉取远端模型目录；失败时适配器回退兜底表。 */
+   fetchRemoteModels?: () => Promise<ZcodeRemoteModel[]>
++  /**
++   * 后台刷新**改变了目录**时的回调（由 `index.ts` 注入，广播
++   * `llm/adapters-updated`）。
++   *
++   * ⚠ **必须注入**，否则 `listModels()` 的非阻塞化会引入回归：首帧渲染的是
++   * 静态兜底表，远端目录随后落地却没人通知选择器，用户要等下次打开才看到
++   * 真实模型集合（表现为「模型列表少一大截，重启后才对」）。见
++   * `catalog-refresh.ts` 的说明。
++   */
++  onCatalogChanged?: () => void
+   /** 账号池（目录门控与黑名单）。 */
+   accountPool?: AccountPool
+   /** 产品配置；默认 {@link ZCODE}。 */
+@@ -119,14 +130,27 @@ export class ZcodeAdapter extends LlmAdapter {
+   private readonly fetchImpl: typeof fetch
+   /** 兜底模型索引（id → 条目）。 */
+   private readonly fallbackIndex: ReadonlyMap<string, ZcodeFallbackModel>
+-  /** 远端模型缓存；未拉取时为 undefined。 */
+-  private remoteModels: ZcodeRemoteModel[] | undefined
++  /**
++   * 远端模型目录的**非阻塞**加载器。
++   *
++   * ⚠ 这是本适配器首帧性能的关键：`listModels()` 只读 {@link CatalogRefresh.get}
++   * （纯内存、同步），远端拉取由 {@link CatalogRefresh.start} 转后台。
++   * 修复前它是 `await this.loadModels()` —— 选择器首帧要等一次网络往返。
++   */
++  private readonly remote: CatalogRefresh<ZcodeRemoteModel[]>
+ 
+   constructor(private readonly options: ZcodeAdapterOptions) {
+     super()
+     this.product = options.product ?? ZCODE
+     this.fetchImpl = options.fetchImpl ?? fetch
+     this.fallbackIndex = new Map(this.product.fallbackModels.map((model) => [model.id, model]))
++    this.remote = new CatalogRefresh(
++      () => options.fetchRemoteModels!(),
++      options.onCatalogChanged,
++      // 远端回空数组表示「这次没数据」，不能采信它把已缓存的目录清掉
++      // （与修复前 `if (fetched.length > 0)` 的判据一致）。
++      (models) => models.length > 0,
++    )
+   }
+ 
+   /**
+@@ -148,28 +172,35 @@ export class ZcodeAdapter extends LlmAdapter {
+    * 设置页需要它渲染被关闭的模型 —— 否则那些条目只能凭 `disabledMap` 的 key
+    * 补回，而那条路径拿不到展示名，会退化成裸 id。
+    */
++  /**
++   * 等待后台目录刷新落定。
++   *
++   * ⚠ **只给非 UI 热路径用**（Jet Hub 设置页显式打开的「显示列表」、
++   * model.list RPC）：那是用户主动发起的操作，需要**准确**目录。
++   * 模型选择器的 listModels() 绝不能调用它 —— 那会退回「首帧等网络」
++   * 的老路（正是本次修复的对象）。
++   */
++  async whenCatalogReady(): Promise<void> {
++    // 先触发（冷缓存时这里才会真的发起拉取），再等它落定。
++    this.remote.start()
++    await this.remote.settled()
++  }
++
+   listAllModels(): readonly { id: string; name: string }[] {
+-    const source = this.remoteModels ?? this.product.fallbackModels.map(fallbackToRemote)
++    const source = this.remote.get() ?? this.product.fallbackModels.map(fallbackToRemote)
+     return source.map((model) => ({ id: model.id, name: model.name }))
+   }
+ 
+-  /** 取（并缓存）远端模型目录；失败时回退兜底表。 */
+-  private async loadModels(): Promise<ZcodeRemoteModel[]> {
+-    if (this.remoteModels !== undefined) return this.remoteModels
+-    if (this.options.fetchRemoteModels !== undefined) {
+-      try {
+-        const fetched = await this.options.fetchRemoteModels()
+-        if (fetched.length > 0) {
+-          this.remoteModels = fetched
+-          return fetched
+-        }
+-      } catch {
+-        // 远端失败静默回退兜底表：模型目录是展示信息，不该让整个 provider 报错。
+-      }
+-    }
+-    const fallback = this.product.fallbackModels.map(fallbackToRemote)
+-    this.remoteModels = fallback
+-    return fallback
++  /**
++   * 取当前已知的远端目录（**同步**），并顺手触发一次后台刷新。
++   *
++   * ⚠ 本方法是**同步**的（修复前叫 `loadModels()`，是 `async` 且 `await` 网络）。
++   * 契约要求 `listModels()` 首帧不阻塞，故这里只读缓存。
++   */
++  private currentModels(): ZcodeRemoteModel[] {
++    // 没有已缓存目录时后台预热（`fetchRemoteModels` 未注入则 start() 内部空转）。
++    if (this.options.fetchRemoteModels !== undefined) this.remote.start()
++    return this.remote.get() ?? this.product.fallbackModels.map(fallbackToRemote)
+   }
+ 
+   private inputModalitiesFor(model: ZcodeRemoteModel | undefined): readonly ('text' | 'image')[] {
+@@ -183,9 +214,13 @@ export class ZcodeAdapter extends LlmAdapter {
+     //
+     // 对 ZCode 而言这条尤其自然：**桥不在（实例没跑）= 没有任何模型**，
+     // 正是用户期望的表现。
+-    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return []
++    //
++    // ⚠ 用**同步**版门控（`providerCatalogVisibleSync`）：本方法是 UI 热路径，
++    // 任何 await 都会让返回的 Promise 挂起一个微任务。同步版读「上次已知的
++    // 可见性」并在后台刷新，冷启动无缓存时保守放行（详见其注释）。
++    if (!providerCatalogVisibleSync(this.options.accountPool, this.product.id)) return []
+ 
+-    const all = await this.loadModels()
++    const all = this.currentModels()
+     const disabled = this.options.accountPool?.disabledModelsFor(this.product.id)
+     const listed = disabled === undefined || disabled.size === 0
+       ? all
+@@ -200,7 +235,13 @@ export class ZcodeAdapter extends LlmAdapter {
+   }
+ 
+   async resolveModel(provider: string, model: string, _signal?: AbortSignal): Promise<LlmResolvedModelInfo> {
+-    const all = await this.loadModels()
++    // ⚠ 这里**必须等**远端目录落地（与 `listModels` 相反）：本方法要在
++    // 「所选模型的上下文窗口 / 输出上限」上给 DSH 准确值，采信兜底表估值
++    // 会让 DSH 远未用满窗口就触发压缩。它不是 UI 首帧热路径 —— 只在发消息
++    // 前调用一次，等一次网络是可以接受的代价。
++    this.remote.start()
++    await this.remote.settled()
++    const all = this.remote.get() ?? this.product.fallbackModels.map(fallbackToRemote)
+     const entry = all.find((item) => item.id === model)
+     const fallback = this.fallbackIndex.get(model)
+     const resolved: LlmResolvedModelInfo = {
+diff --git a/tests/unit/buddy-adapter.spec.ts b/tests/unit/buddy-adapter.spec.ts
+index b953875..42f877b 100644
+--- a/tests/unit/buddy-adapter.spec.ts
++++ b/tests/unit/buddy-adapter.spec.ts
+@@ -101,6 +101,27 @@ function makeAdapter(overrides: {
+   })
+ }
+ 
++/**
++ * 预热目录后交给断言。
++ *
++ * ⚠ **为什么需要它**：适配器的 `listModels()` 已改为**非阻塞**（首帧只读缓存，
++ * 远端拉取转后台），以修「模型选择器加载很久」。因此
++ * 「`await listModels()` 之后立即就能看到远端目录」这个前提**不再成立**。
++ *
++ * 本 helper 用 `whenCatalogReady()`（给设置页 / `model.list` 这类非热路径用的
++ * 公开入口）把后台拉取跑完再断言 —— 需要它的用例要验的是**目录内容逻辑**
++ * （白名单校正、兜底、倍率、门控），不是首帧时序。首帧时序由
++ * `tests/unit/catalog-refresh.spec.ts` 与
++ * `scripts/probe-listmodels-nonblocking.mts` 专门覆盖。
++ *
++ * ⚠ 定义在**文件顶层**而非某个 `describe` 内：本文件有多个 `describe` 都
++ * 需要它（曾有版本把它放进第一个块里，导致其余块报 `ready is not defined`）。
++ */
++async function ready(adapter: BuddyAdapter): Promise<BuddyAdapter> {
++  await adapter.whenCatalogReady()
++  return adapter
++}
++
+ describe('BuddyAdapter', () => {
+   it('providerInfo identifies the buddy route', () => {
+     // 展示名改由产品配置驱动（this.product.displayName）。CodeBuddy 的
+@@ -119,12 +140,12 @@ describe('BuddyAdapter', () => {
+ 
+   it('listModels prefers the remote catalog and caches it', async () => {
+     let calls = 0
+-    const adapter = makeAdapter({
++    const adapter = await ready(makeAdapter({
+       fetchRemoteModels: async () => {
+         calls++
+         return [{ id: 'remote-model', name: 'Remote Model' }]
+       },
+-    })
++    }))
+     const first = await adapter.listModels('buddy')
+     const second = await adapter.listModels('buddy')
+     // 产品兜底表是权威白名单：远端多出的 remote-model 被丢弃，
+@@ -135,9 +156,9 @@ describe('BuddyAdapter', () => {
+   })
+ 
+   it('listModels falls back to the product catalog when the remote fetch fails', async () => {
+-    const adapter = makeAdapter({
++    const adapter = await ready(makeAdapter({
+       fetchRemoteModels: async () => { throw new Error('network down') },
+-    })
++    }))
+     const models = await adapter.listModels('buddy')
+     expect(models.map((m) => m.id)).toEqual(CODEBUDDY.fallbackModels!.map((m) => m.id))
+   })
+@@ -150,14 +171,14 @@ describe('BuddyAdapter', () => {
+     //
+     // 判据用 `agentReferenced`（服务端自己的「可选」信号），
+     // 而不是猜 id 后缀（`-f`/`-x`/`-sg` 含义各异，猜错会放进不可用的模型）。
+-    const adapter = makeAdapter({
++    const adapter = await ready(makeAdapter({
+       fetchRemoteModels: async () => [
+         // 不在兜底表、但服务端说可选 → 必须保留
+         { id: 'hy4-preview-f', name: 'Hy4 preview', creditsRate: 'x0.29', discountedCreditsRate: '免费', agentReferenced: true },
+         // 不在兜底表、服务端也没说可选（内部别名）→ 仍应丢弃
+         { id: 'internal-alias', name: 'Internal' },
+       ],
+-    })
++    }))
+     const ids = (await adapter.listModels('buddy')).map((m) => m.id)
+     expect(ids).toContain('hy4-preview-f')
+     expect(ids).not.toContain('internal-alias')
+@@ -182,32 +203,32 @@ describe('BuddyAdapter', () => {
+   // （`selectionOf` 返回 `model: model.id`）。
+   describe('listModels 的计费倍率与同名区分', () => {
+     it('把 credits 追加到 name 后面', async () => {
+-      const adapter = makeAdapter({
++      const adapter = await ready(makeAdapter({
+         product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+         fetchRemoteModels: async () => [
+           { id: 'glm-5.3', name: 'GLM-5.3', creditsRate: 'x0.79' },
+         ],
+-      })
++      }))
+       const models = await adapter.listModels('buddy')
+       expect(models[0]?.name).toBe('GLM-5.3 · x0.79')
+     })
+ 
+     it('有促销时显示 原价→促销价', async () => {
+-      const adapter = makeAdapter({
++      const adapter = await ready(makeAdapter({
+         product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+         fetchRemoteModels: async () => [
+           { id: 'deepseek-v4-flash', name: 'DS', creditsRate: 'x0.17', discountedCreditsRate: 'x0.50' },
+         ],
+-      })
++      }))
+       const models = await adapter.listModels('buddy')
+       expect(models[0]?.name).toBe('DS · x0.17→x0.50')
+     })
+ 
+     it('无倍率信息时 name 保持原样', async () => {
+-      const adapter = makeAdapter({
++      const adapter = await ready(makeAdapter({
+         product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+         fetchRemoteModels: async () => [{ id: 'mystery', name: 'M' }],
+-      })
++      }))
+       const models = await adapter.listModels('buddy')
+       expect(models[0]?.name).toBe('M')
+     })
+@@ -217,13 +238,13 @@ describe('BuddyAdapter', () => {
+     // 两者是不同区域/计费的实体（credits x0.00 vs x0.03），不能简单丢弃其一，
+     // 故对撞车的 name 追加变体标记。
+     it('同名模型追加变体标记以区分', async () => {
+-      const adapter = makeAdapter({
++      const adapter = await ready(makeAdapter({
+         product: { ...WORKBUDDY, fallbackModels: undefined } as never,
+         fetchRemoteModels: async () => [
+           { id: 'deepseek-v4.1-flash', name: 'Deepseek-V4.1-Flash', creditsRate: 'x0.00' },
+           { id: 'deepseek-v4.1-flash-sg', name: 'Deepseek-V4.1-Flash', creditsRate: 'x0.03' },
+         ],
+-      })
++      }))
+       const models = await adapter.listModels('workbuddy')
+       expect(models.map((m) => m.name)).toEqual([
+         'Deepseek-V4.1-Flash · x0.00',
+@@ -236,38 +257,38 @@ describe('BuddyAdapter', () => {
+     // 实测另有 hy3/hy3-x 与 hy4-preview-f/hy4-preview 两组撞车，
+     // 硬编码 `-sg` 会漏掉它们，故用公共前缀的通用算法。
+     it('非 -sg 的同名组同样被区分（公共前缀算法）', async () => {
+-      const adapter = makeAdapter({
++      const adapter = await ready(makeAdapter({
+         product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+         fetchRemoteModels: async () => [
+           { id: 'hy3', name: 'Hy3' },
+           { id: 'hy3-x', name: 'Hy3' },
+         ],
+-      })
++      }))
+       const models = await adapter.listModels('buddy')
+       expect(models.map((m) => m.name)).toEqual(['Hy3', 'Hy3 · X'])
+     })
+ 
+     it('三个以上同名 id 仍能全部区分', async () => {
+-      const adapter = makeAdapter({
++      const adapter = await ready(makeAdapter({
+         product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+         fetchRemoteModels: async () => [
+           { id: 'gpt-5.6', name: 'GPT-5.6' },
+           { id: 'gpt-5.6-sol', name: 'GPT-5.6' },
+           { id: 'gpt-5.6-luna', name: 'GPT-5.6' },
+         ],
+-      })
++      }))
+       const models = await adapter.listModels('buddy')
+       expect(new Set(models.map((m) => m.name)).size).toBe(3)
+     })
+ 
+     it('不同名的模型不追加变体标记', async () => {
+-      const adapter = makeAdapter({
++      const adapter = await ready(makeAdapter({
+         product: { ...CODEBUDDY, fallbackModels: undefined } as never,
+         fetchRemoteModels: async () => [
+           { id: 'gpt-5.6-sol', name: 'GPT-5.6-Sol' },
+           { id: 'gpt-5.6-luna', name: 'GPT-5.6-Luna' },
+         ],
+-      })
++      }))
+       const models = await adapter.listModels('buddy')
+       expect(models.map((m) => m.name)).toEqual(['GPT-5.6-Sol', 'GPT-5.6-Luna'])
+     })
+@@ -276,13 +297,13 @@ describe('BuddyAdapter', () => {
+     // 「计费 x0.00 · 」（孤立分隔符）与重复的「SG」，而且**在切换模型列表里
+     // 根本看不到**（用户报障）。
+     it('倍率不进 description（否则切换菜单看不到）', async () => {
+-      const adapter = makeAdapter({
++      const adapter = await ready(makeAdapter({
+         product: { ...WORKBUDDY, fallbackModels: undefined } as never,
+         fetchRemoteModels: async () => [
+           { id: 'a', name: 'Same', creditsRate: 'x0.10' },
+           { id: 'a-sg', name: 'Same', creditsRate: 'x0.20' },
+         ],
+-      })
++      }))
+       const models = await adapter.listModels('workbuddy')
+       for (const model of models) expect(model).not.toHaveProperty('description')
+       expect(models[0]?.name).toBe('Same · x0.10')
+@@ -2024,7 +2045,7 @@ describe('产品兜底模型目录校正', () => {
+   })
+ 
+   it('远端元数据优先于兜底表（远端更权威）', async () => {
+-    const adapter = new BuddyAdapter({
++    const adapter = await ready(new BuddyAdapter({
+       credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+       resolveCredential: async () => makeCredential(),
+       refresh: async () => {},
+@@ -2032,7 +2053,7 @@ describe('产品兜底模型目录校正', () => {
+       fetchRemoteModels: async () => [
+         { id: 'wanted-a', name: 'Remote A', contextWindow: 999_000 },
+       ],
+-    })
++    }))
+     const models = await adapter.listModels('workbuddy')
+     expect(models[0]!.name).toBe('Remote A')
+     const resolved = await adapter.resolveModel('workbuddy', 'wanted-a')
+@@ -2057,13 +2078,13 @@ describe('产品兜底模型目录校正', () => {
+ 
+   it('没有兜底表的产品不受影响（保持既有远端行为）', async () => {
+     const noFallback = { ...WORKBUDDY, fallbackModels: undefined }
+-    const adapter = new BuddyAdapter({
++    const adapter = await ready(new BuddyAdapter({
+       credentialRef: credentialRef('WORKBUDDY_ACCESS_TOKEN'),
+       resolveCredential: async () => makeCredential(),
+       refresh: async () => {},
+       product: noFallback as never,
+       fetchRemoteModels: async () => [{ id: 'x', name: 'X' }, { id: 'y', name: 'Y' }],
+-    })
++    }))
+     const models = await adapter.listModels('workbuddy')
+     expect(models.map((m) => m.id)).toEqual(['x', 'y'])
+   })
+@@ -2153,11 +2174,19 @@ describe('BuddyAdapter 模型黑名单', () => {
+ // DSH 的 `buildModelCatalog` 显式 `.filter(group => group.models.length > 0)`，
+ // 故返回空数组即让整个 provider 分组消失（用户需求：减少模型选择列表臃肿）。
+ describe('BuddyAdapter 目录门控（无已登录账号时隐藏）', () => {
+-  /** 账号池替身：报告是否有已登录账号。 */
++  /**
++   * 账号池替身：报告是否有已登录账号。
++   *
++   * ⚠ **必须同时提供 `catalogVisibleSync`**：适配器的 `listModels()` 走
++   * **同步**门控（`providerCatalogVisibleSync`），它对该方法做**能力检测** ——
++   * 缺失时保守放行（「判定不可用 ≠ 无账号」，那是给旧替身/headless 的兜底）。
++   * 只给 `hasLoggedInAccount` 的替身会因此**永远可见**，门控用例形同虚设。
++   */
+   function poolWithLogin(loggedIn: boolean) {
+     return {
+       disabledModelsFor: () => new Set<string>(),
+       hasLoggedInAccount: async () => loggedIn,
++      catalogVisibleSync: () => loggedIn,
+     } as never
+   }
+ 
+@@ -2183,4 +2212,4 @@ describe('BuddyAdapter 目录门控（无已登录账号时隐藏）', () => {
+     })
+     expect((await adapter.listModels('buddy')).length).toBeGreaterThan(0)
+   })
+-})
++})
+\ No newline at end of file
+diff --git a/tests/unit/catalog-refresh.spec.ts b/tests/unit/catalog-refresh.spec.ts
+new file mode 100644
+index 0000000..9d8cb62
+--- /dev/null
++++ b/tests/unit/catalog-refresh.spec.ts
+@@ -0,0 +1,245 @@
++import { describe, expect, it, vi } from 'vitest'
++import { CatalogRefresh, FAILURE_COOLDOWN_MS, sameCatalog } from '../../src/catalog-refresh.js'
++
++/**
++ * `CatalogRefresh` 的单测。
++ *
++ * 这是「`listModels()` 非阻塞化」这个修复的核心部件，故在这里把它的四条
++ * 关键契约逐条锁死：**同步返回**、**并发去重**、**变化才广播**、
++ * **失败冷却**。任何一条被改坏都会让那个性能缺陷复发或引入新缺陷。
++ */
++
++/** 造一个可控的拉取：手动决定何时 resolve。 */
++function deferred<T>() {
++  let resolve!: (value: T) => void
++  let reject!: (error: unknown) => void
++  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej })
++  return { promise, resolve, reject }
++}
++
++const models = (...ids: string[]) => ids.map((id) => ({ id, name: id.toUpperCase() }))
++
++describe('CatalogRefresh.start', () => {
++  it('同步返回：即使拉取永不 resolve，也不阻塞调用方', () => {
++    const never = deferred<ReturnType<typeof models>>()
++    const refresh = new CatalogRefresh(() => never.promise)
++    const started = Date.now()
++    refresh.start()
++    // 本方法**不返回 Promise**（TypeScript 层面就杜绝了 await 的可能）。
++    expect(refresh.start()).toBeUndefined()
++    expect(Date.now() - started).toBeLessThan(20)
++    expect(refresh.get()).toBeUndefined()
++  })
++
++  it('落地后 get() 能读到结果', async () => {
++    const refresh = new CatalogRefresh(async () => models('a', 'b'))
++    refresh.start()
++    await refresh.settled()
++    expect(refresh.get()?.map((m) => m.id)).toEqual(['a', 'b'])
++  })
++
++  it('并发去重：进行中时重复 start 不会打出第二次拉取', async () => {
++    const d = deferred<ReturnType<typeof models>>()
++    const fetch = vi.fn(() => d.promise)
++    const refresh = new CatalogRefresh(fetch)
++    refresh.start()
++    refresh.start()
++    refresh.start()
++    expect(fetch).toHaveBeenCalledTimes(1)
++    d.resolve(models('a'))
++    await refresh.settled()
++    expect(fetch).toHaveBeenCalledTimes(1)
++  })
++
++  it('已有缓存时不再重复拉取', async () => {
++    const fetch = vi.fn(async () => models('a'))
++    const refresh = new CatalogRefresh(fetch)
++    refresh.start()
++    await refresh.settled()
++    refresh.start()
++    await refresh.settled()
++    expect(fetch).toHaveBeenCalledTimes(1)
++  })
++
++  it('force 时忽略缓存强制重拉', async () => {
++    const fetch = vi.fn(async () => models('a'))
++    const refresh = new CatalogRefresh(fetch)
++    refresh.start()
++    await refresh.settled()
++    refresh.start({ force: true })
++    await refresh.settled()
++    expect(fetch).toHaveBeenCalledTimes(2)
++  })
++})
++
++describe('CatalogRefresh 失败冷却（防热路径请求风暴）', () => {  it('拉取抛错后，冷却期内重复 start 不再发请求', async () => {
++    const fetch = vi.fn(async () => { throw new Error('boom') })
++    const refresh = new CatalogRefresh(fetch)
++    refresh.start()
++    await refresh.settled()
++    // 模拟「用户在冷却期内反复打开模型选择器」。
++    for (let i = 0; i < 10; i++) {
++      refresh.start()
++      await refresh.settled()
++    }
++    expect(fetch).toHaveBeenCalledTimes(1)
++  })
++
++  it('远端回空数组同样进入冷却（否则热路径每次都要打一次网络）', async () => {
++    const fetch = vi.fn(async () => [])
++    const refresh = new CatalogRefresh(
++      fetch as unknown as () => Promise<Array<{ id: string; name: string }>>,
++      undefined,
++      (value) => value.length > 0,
++    )
++    refresh.start()
++    await refresh.settled()
++    for (let i = 0; i < 5; i++) {
++      refresh.start()
++      await refresh.settled()
++    }
++    expect(fetch).toHaveBeenCalledTimes(1)
++  })
++
++  it('冷却结束后允许重试（用注入的时钟跳过等待）', async () => {
++    let clock = 0
++    const fetch = vi.fn(async () => { throw new Error('boom') })
++    const refresh = new CatalogRefresh(fetch, undefined, () => true, () => clock)
++    refresh.start()
++    await refresh.settled()
++    expect(fetch).toHaveBeenCalledTimes(1)
++    // 冷却未过：不重试。
++    clock = FAILURE_COOLDOWN_MS - 1
++    refresh.start()
++    await refresh.settled()
++    expect(fetch).toHaveBeenCalledTimes(1)
++    // 冷却已过：重试。
++    clock = FAILURE_COOLDOWN_MS
++    refresh.start()
++    await refresh.settled()
++    expect(fetch).toHaveBeenCalledTimes(2)
++  })
++
++  it('invalidate 清除缓存与冷却（账号切换后要能立刻重拉）', async () => {
++    let clock = 0
++    const fetch = vi.fn(async () => { throw new Error('boom') })
++    const refresh = new CatalogRefresh(fetch, undefined, () => true, () => clock)
++    refresh.start()
++    await refresh.settled()
++    refresh.invalidate()
++    refresh.start()
++    await refresh.settled()
++    expect(fetch).toHaveBeenCalledTimes(2)
++  })
++})
++
++describe('CatalogRefresh 变化广播', () => {
++  it('首次落地即广播（「兜底表 → 远端目录」那一次必须通知）', async () => {
++    const onChanged = vi.fn()
++    const refresh = new CatalogRefresh(async () => models('a'), onChanged)
++    refresh.start()
++    await refresh.settled()
++    expect(onChanged).toHaveBeenCalledTimes(1)
++  })
++
++  it('内容相同的重复刷新**不**广播（避免选择器无谓重读）', async () => {
++    const onChanged = vi.fn()
++    const refresh = new CatalogRefresh(async () => models('a', 'b'), onChanged)
++    refresh.start()
++    await refresh.settled()
++    refresh.start({ force: true })
++    await refresh.settled()
++    expect(onChanged).toHaveBeenCalledTimes(1)
++  })
++
++  it('内容真的变了才再广播一次', async () => {
++    const onChanged = vi.fn()
++    let payload = models('a')
++    const refresh = new CatalogRefresh(async () => payload, onChanged)
++    refresh.start()
++    await refresh.settled()
++    payload = models('a', 'b')
++    refresh.start({ force: true })
++    await refresh.settled()
++    expect(onChanged).toHaveBeenCalledTimes(2)
++  })
++
++  it('名称变化也算「变了」（展示名/倍率会进 name）', async () => {
++    const onChanged = vi.fn()
++    let payload = [{ id: 'a', name: 'A' }]
++    const refresh = new CatalogRefresh(async () => payload, onChanged)
++    refresh.start()
++    await refresh.settled()
++    payload = [{ id: 'a', name: 'A · x0.5' }]
++    refresh.start({ force: true })
++    await refresh.settled()
++    expect(onChanged).toHaveBeenCalledTimes(2)
++  })
++})
++
++describe('sameCatalog', () => {
++  it('长度不同即不同', () => {
++    expect(sameCatalog([{ id: 'a', name: 'A' }], [])).toBe(false)
++  })
++
++  it('id 或 name 不同即不同', () => {
++    expect(sameCatalog([{ id: 'a', name: 'A' }], [{ id: 'b', name: 'A' }])).toBe(false)
++    expect(sameCatalog([{ id: 'a', name: 'A' }], [{ id: 'a', name: 'B' }])).toBe(false)
++  })
++
++  it('逐项相同即相同（与引用无关）', () => {
++    expect(sameCatalog([{ id: 'a', name: 'A' }], [{ id: 'a', name: 'A' }])).toBe(true)
++  })
++})
++
++describe('回归：同步抛错的 fetch 不得让 settled() 死锁', () => {
++  /**
++   * **真实缺陷**（写本模块时实测踩到，把一次测试跑变成无限挂起）：
++   *
++   * `start()` 早先写成 `this.loading = this.run()`，而 `run()` 是 async 函数
++   * —— 它可能在**第一个 await 之前**就同步跑完（例如 `fetch()` 同步抛错，
++   * 那正是 `fetchRemoteModels` 未注入时的情形）。执行顺序于是变成：
++   *
++   *   ① 调 `run()` → 同步走到 `finally`，把 `this.loading` 设为 undefined
++   *   ② **然后**赋值语句才把 `this.loading` 写回那个已 settle 的 Promise
++   *
++   * ⇒ `loading` 永远非 undefined ⇒ `settled()` 的 while **死锁**。
++   *
++   * 下面两条用例用 `Promise.race` 加超时把「死锁」变成「可读的失败」，
++   * 否则挂起只会表现为 vitest 整体超时，极难定位。
++   */
++  it('fetch 同步抛错时 settled() 仍能返回', async () => {
++    const refresh = new CatalogRefresh<Array<{ id: string; name: string }>>(() => {
++      throw new Error('sync boom')
++    })
++    refresh.start()
++    await expect(Promise.race([
++      refresh.settled(),
++      new Promise((_, reject) => setTimeout(() => reject(new Error('settled 死锁')), 1_000)),
++    ])).resolves.toBeUndefined()
++  })
++
++  it('fetch 返回已 resolve 的值时 settled() 仍能返回', async () => {
++    const refresh = new CatalogRefresh(async () => models('a'))
++    refresh.start()
++    await expect(Promise.race([
++      refresh.settled(),
++      new Promise((_, reject) => setTimeout(() => reject(new Error('settled 死锁')), 1_000)),
++    ])).resolves.toBeUndefined()
++    expect(refresh.get()?.map((m) => m.id)).toEqual(['a'])
++  })
++
++  it('同步失败后 repeatedly start/settled 不累积（冷却生效且不死锁）', async () => {
++    let calls = 0
++    const refresh = new CatalogRefresh<Array<{ id: string; name: string }>>(() => {
++      calls++
++      throw new Error('sync boom')
++    })
++    for (let i = 0; i < 5; i++) {
++      refresh.start()
++      await refresh.settled()
++    }
++    // 冷却期内的重复 start 不重试。
++    expect(calls).toBe(1)
++  })
++})
+diff --git a/tests/unit/cline-adapter.spec.ts b/tests/unit/cline-adapter.spec.ts
+index cecf0e7..ad00395 100644
+--- a/tests/unit/cline-adapter.spec.ts
++++ b/tests/unit/cline-adapter.spec.ts
+@@ -70,6 +70,22 @@ async function collect(
+   return out
+ }
+ 
++/**
++ * 预热模型目录后交给断言。
++ *
++ * ⚠ 为什么必须预热：适配器的 `listModels()` 已改为**非阻塞**（首帧只读缓存，
++ * 远端拉取转后台），以修「模型选择器加载很久」。因此
++ * 「`await listModels()` 之后立即就能看到远端目录」不再成立。
++ *
++ * `whenCatalogReady()` 是给设置页 / `model.list` 这类非热路径用的公开入口，
++ * 会把后台拉取跑完。**只给验「目录内容」的用例用** —— 首帧时序由
++ * `tests/unit/catalog-refresh.spec.ts` 与
++ * `scripts/probe-listmodels-nonblocking.mts` 专门覆盖。
++ */
++async function ready<T extends { whenCatalogReady(): Promise<void> }>(adapter: T): Promise<T> {
++  await adapter.whenCatalogReady()
++  return adapter
++}
+ describe('ClineAdapter 模型目录', () => {
+   it('免费模型在 name 里标出（远端 free 集合驱动）', async () => {
+     const adapter = makeAdapter()
+@@ -83,7 +99,7 @@ describe('ClineAdapter 模型目录', () => {
+   })
+ 
+   it('付费模型不标免费（同名但不同命名空间）', async () => {
+-    const adapter = makeAdapter()
++    const adapter = await ready(makeAdapter())
+     const models = await adapter.listModels('cline')
+     const byId = new Map(models.map((m) => [m.id, m]))
+     // ⚠️ 核心不变式：`deepseek/deepseek-v4.1-flash` 是**另一个**计费实体
+@@ -92,7 +108,7 @@ describe('ClineAdapter 模型目录', () => {
+   })
+ 
+   it('目录含远端全部模型（用户要求「全部列出」）', async () => {
+-    const adapter = makeAdapter()
++    const adapter = await ready(makeAdapter())
+     const models = await adapter.listModels('cline')
+     const ids = models.map((m) => m.id)
+     expect(ids).toContain('cline-free/deepseek-v4.1-flash')
+@@ -118,6 +134,7 @@ describe('ClineAdapter 模型目录', () => {
+     const adapter = makeAdapter({
+       loadModels: async () => ({ models: [], warnings: ['recommended-models boom', 'models boom'] }),
+     })
++    await ready(adapter)
+     const models = await adapter.listModels('cline')
+     expect(models.length).toBe(CLINE.fallbackModels.length)
+     expect(models.filter((m) => m.name.includes('免费'))).toHaveLength(5)
+@@ -142,8 +159,12 @@ describe('ClineAdapter 模型目录', () => {
+       accountPool: {
+         disabledModelsFor: () => new Set<string>(),
+         hasLoggedInAccount: async () => false,
++        // ⚠ 必须给同步版：`listModels` 走 `providerCatalogVisibleSync`，
++        // 而它对同步方法做能力检测 —— 缺失时保守放行，门控用例会形同虚设。
++        catalogVisibleSync: () => false,
+       } as never,
+     })
++    await ready(adapter)
+     expect(await adapter.listModels('cline')).toEqual([])
+   })
+ 
+@@ -582,4 +603,4 @@ describe('Cline 接线（源码级回归）', () => {
+     const source = read('plugin-src/client/credits-capabilities.js')
+     expect(source).toMatch(/cline:\s*Object\.freeze\(\{\s*balance:\s*true,\s*dailyCheckin:\s*false\s*\}\)/)
+   })
+-})
++})
+\ No newline at end of file
+diff --git a/tests/unit/listmodels-nonblocking.spec.ts b/tests/unit/listmodels-nonblocking.spec.ts
+new file mode 100644
+index 0000000..5b9c0a2
+--- /dev/null
++++ b/tests/unit/listmodels-nonblocking.spec.ts
+@@ -0,0 +1,178 @@
++import { describe, expect, it } from 'vitest'
++import { credentialRef } from '@deepseek-ai/dsh-credentials'
++
++import { CodeArtsAdapter } from '../../src/llm-adapter.js'
++import { BuddyAdapter } from '../../src/buddy-adapter.js'
++import { CODEBUDDY } from '../../src/product.js'
++import { LobsteraiAdapter } from '../../src/lobsterai-adapter.js'
++import { LOBSTERAI } from '../../src/lobsterai-product.js'
++import { TraeAdapter } from '../../src/trae-adapter.js'
++import { TRAE } from '../../src/trae-product.js'
++import { ZcodeAdapter } from '../../src/zcode-adapter.js'
++import { ZCODE } from '../../src/zcode-product.js'
++import { RaccoonAdapter } from '../../src/raccoon-adapter.js'
++import { RACCOON } from '../../src/raccoon-product.js'
++import { LoomyAdapter } from '../../src/loomy-adapter.js'
++import { LOOMY } from '../../src/loomy-product.js'
++import { ClineAdapter } from '../../src/cline-adapter.js'
++import { CLINE } from '../../src/cline-product.js'
++import { QoderAdapter } from '../../src/qoder-adapter.js'
++import { QODER } from '../../src/qoder-product.js'
++import { AntigravityAdapter } from '../../src/antigravity-adapter.js'
++import { AntigravityLocalAdapter } from '../../src/antigravity-local-adapter.js'
++
++/**
++ * **行为证明：`listModels()` 不得等待网络**（真实性能缺陷的回归锁）。
++ *
++ * ## 缺陷
++ *
++ * 用户报障「装了 JetHub 后，会话框右下角的模型选择器要加载很久才出来」。
++ * 根因是多个适配器在 `listModels()`（模型选择器的 UI 热路径）里**同步 await
++ * 网络**，而 DSH 逐个 provider 收集目录 ⇒ 首帧耗时 = 所有 provider 的网络
++ * 往返之和。
++ *
++ * ## 判据（机制性，不是时间性的）
++ *
++ * 把每个适配器的远端拉取换成**永不 settle** 的 Promise：
++ *
++ * - **修复前**：`listModels()` 里有 `await`，那个 Promise 永不 resolve
++ *   ⇒ 本用例**必然超时**（vitest 的 5 秒），不是「变慢」而是「永不返回」。
++ * - **修复后**：只读缓存 ⇒ 立即返回兜底目录。
++ *
++ * 故「耗时 < 50ms」这个阈值不依赖机器快慢：50ms 对本地内存读取是千倍余量，
++ * 对任何真实网络往返都不够。**已做反向验证** —— 把任何一个适配器改回
++ * `await`，对应用例立刻从毫秒级变成超时失败。
++ *
++ * ⚠ 这里刻意用**真实适配器类**（不是桩）：本文件要防的正是「有人后来给某个
++ * 适配器的 `listModels` 加回一个 `await`」，而那只会在真实实现里发生。
++ */
++
++/** 永不 settle 的 Promise —— 任何 `await` 到它的代码都会永久挂起。 */
++const never = <T,>(): Promise<T> => new Promise<T>(() => {})
++
++/** 本地内存读取的合理上限；真实网络往返远超它。 */
++const BUDGET_MS = 50
++
++const base = {
++  credentialRef: credentialRef('LISTMODELS_PROBE_ACCOUNT'),
++  resolveCredential: async () => undefined,
++  refresh: async () => {},
++}
++
++/**
++ * 11 个适配器与它们「永不返回」的远端拉取入口。
++ *
++ * ⚠ 新增 provider 时**必须**在这里补一行 —— 这是「listModels 不许等网络」
++ * 这条契约的唯一系统性守卫。
++ */
++const cases: Array<{
++  name: string
++  make: () => { listModels(provider: string): Promise<readonly unknown[]>; provider: string }
++}> = [
++  {
++    name: 'codearts',
++    make: () => {
++      const adapter = new CodeArtsAdapter({ ...base, fetchRemoteModels: () => never() })
++      return { listModels: (p) => adapter.listModels(p), provider: 'codearts' }
++    },
++  },
++  {
++    name: 'buddy',
++    make: () => {
++      const adapter = new BuddyAdapter({ ...base, product: CODEBUDDY, fetchRemoteModels: () => never() })
++      return { listModels: (p) => adapter.listModels(p), provider: CODEBUDDY.id }
++    },
++  },
++  {
++    name: 'lobsterai',
++    make: () => {
++      const adapter = new LobsteraiAdapter({ ...base, product: LOBSTERAI, fetchRemoteModels: () => never() })
++      return { listModels: (p) => adapter.listModels(p), provider: LOBSTERAI.id }
++    },
++  },
++  {
++    name: 'trae',
++    make: () => {
++      const adapter = new TraeAdapter({ ...base, product: TRAE, fetchRemoteModels: () => never() })
++      return { listModels: (p) => adapter.listModels(p), provider: TRAE.id }
++    },
++  },
++  {
++    name: 'zcode',
++    make: () => {
++      const adapter = new ZcodeAdapter({ ...base, product: ZCODE, fetchRemoteModels: () => never() })
++      return { listModels: (p) => adapter.listModels(p), provider: ZCODE.id }
++    },
++  },
++  {
++    name: 'raccoon',
++    make: () => {
++      const adapter = new RaccoonAdapter({ ...base, product: RACCOON, fetchRemoteModels: () => never() })
++      return { listModels: (p) => adapter.listModels(p), provider: RACCOON.id }
++    },
++  },
++  {
++    name: 'loomy',
++    make: () => {
++      const adapter = new LoomyAdapter({ ...base, product: LOOMY, fetchRemoteModels: () => never() })
++      return { listModels: (p) => adapter.listModels(p), provider: LOOMY.id }
++    },
++  },
++  {
++    name: 'cline',
++    make: () => {
++      // cline 的拉取入口是 `loadModels`（返回 models + warnings）。
++      const adapter = new ClineAdapter({ ...base, product: CLINE, loadModels: () => never() })
++      return { listModels: (p) => adapter.listModels(p), provider: CLINE.id }
++    },
++  },
++  {
++    name: 'qoder（静态目录）',
++    make: () => {
++      const adapter = new QoderAdapter({ ...base, product: QODER })
++      return { listModels: (p) => adapter.listModels(p), provider: QODER.id }
++    },
++  },
++  {
++    name: 'antigravity（公版）',
++    make: () => {
++      const adapter = new AntigravityAdapter({
++        readCredential: () => undefined,
++        fetchImpl: (() => never()) as unknown as typeof fetch,
++      })
++      return { listModels: (p) => adapter.listModels(p), provider: 'antigravity' }
++    },
++  },
++  {
++    name: 'antigravity-local',
++    make: () => {
++      const adapter = new AntigravityLocalAdapter({
++        // 实例发现永不返回：修复前 listModels 会 await 它。
++        discover: () => never(),
++        fetchImpl: (() => never()) as unknown as typeof fetch,
++        allowPublicFallback: false,
++      })
++      return { listModels: (p) => adapter.listModels(p), provider: 'antigravity' }
++    },
++  },
++]
++
++describe('listModels 不得等待网络（首帧非阻塞）', () => {
++  for (const testCase of cases) {
++    it(`${testCase.name}：远端永不返回时 listModels 仍在 ${BUDGET_MS}ms 内返回`, async () => {
++      const { listModels, provider } = testCase.make()
++      const started = Date.now()
++      const models = await listModels(provider)
++      const elapsed = Date.now() - started
++      // 目录必须仍然可用（回退兜底表）—— 非阻塞不等于返回空。
++      expect(models.length).toBeGreaterThan(0)
++      expect(elapsed).toBeLessThan(BUDGET_MS)
++    })
++  }
++
++  it('覆盖全部适配器（新增 provider 时别忘了往 cases 里补一行）', () => {
++    // 这条断言的作用是「提醒」而非穷举：新增适配器若忘了登记，
++    // 它就不受「listModels 不许等网络」这条契约保护。
++    expect(cases.length).toBeGreaterThanOrEqual(11)
++  })
++})
+diff --git a/tests/unit/llm-adapter.spec.ts b/tests/unit/llm-adapter.spec.ts
+index bcf800e..37c8af5 100644
+--- a/tests/unit/llm-adapter.spec.ts
++++ b/tests/unit/llm-adapter.spec.ts
+@@ -19,14 +19,30 @@ const streamOptions = {
+   signal: new AbortController().signal,
+ } as never
+ 
+-function makeAdapter(overrides: {
++/**
++ * 造适配器并**预热模型目录**。
++ *
++ * ⚠ 为什么必须预热：适配器的 `listModels()` 已改为**非阻塞**（首帧只读缓存，
++ * 远端拉取转后台），以修「模型选择器加载很久」。因此
++ * 「`await listModels()` 之后立即就能看到远端目录」不再成立。
++ *
++ * `whenCatalogReady()` 是给设置页 / `model.list` 这类非热路径用的公开入口，
++ * 会把后台拉取跑完。本文件的用例验的都是**目录内容逻辑**（VL 过滤、黑名单、
++ * 门控、兜底），不是首帧时序；首帧时序由
++ * `tests/unit/catalog-refresh.spec.ts` 与
++ * `scripts/probe-listmodels-nonblocking.mts` 专门覆盖。
++ *
++ * ⚠ 未传 `fetchRemoteModels` 时 `whenCatalogReady()` 是**空操作**（适配器内部
++ * 有 `fetchRemoteModels === undefined` 守卫），故对只测兜底表的用例无副作用。
++ */
++async function makeAdapter(overrides: {
+   credential?: CodeArtsCredential | undefined
+   refresh?: () => Promise<void>
+   fetchImpl?: typeof fetch
+   fetchRemoteModels?: () => Promise<Array<{ id: string; name: string }>>
+   /** 多账号池替身；本文件只用到模型黑名单（listModels 的过滤输入）。 */
+   accountPool?: unknown
+-} = {}) {
++} = {}): Promise<CodeArtsAdapter> {
+   let credential = 'credential' in overrides ? overrides.credential : validCredential
+   const refresh = overrides.refresh ?? (async () => {})
+   const fetchImpl = overrides.fetchImpl ?? (async () => new Response('not found', { status: 404 }))
+@@ -38,6 +54,7 @@ function makeAdapter(overrides: {
+     fetchRemoteModels: overrides.fetchRemoteModels,
+     ...overrides.accountPool !== undefined ? { accountPool: overrides.accountPool as never } : {},
+   })
++  await adapter.whenCatalogReady()
+   return adapter
+ }
+ 
+@@ -61,12 +78,17 @@ function poolWithCredentials(loggedInRefs: readonly string[]) {
+   return {
+     disabledModelsFor: () => new Set<string>(),
+     hasLoggedInAccount: async (_provider: string) => pool.size > 0,
++    // ⚠ 必须**同时**给同步版：`listModels` 走 `providerCatalogVisibleSync`，
++    // 而它对同步方法做**能力检测** —— 缺失时保守放行（那是给旧替身/headless
++    // 的兜底）。只 mock `hasLoggedInAccount` 的门控用例会**永远可见**、
++    // 形同虚设。
++    catalogVisibleSync: () => pool.size > 0,
+   }
+ }
+ 
+ describe('CodeArtsAdapter', () => {
+-  it('providerInfo identifies the codearts route', () => {
+-    expect(makeAdapter().providerInfo('codearts')).toMatchObject({ id: 'codearts', name: 'CodeArts Agent' })
++  it('providerInfo identifies the codearts route', async () => {
++    expect((await makeAdapter()).providerInfo('codearts')).toMatchObject({ id: 'codearts', name: 'CodeArts Agent' })
+   })
+ 
+   it('listModels advertises the openpangu-2.0 and deepseek-v4 models alongside the GLM family', async () => {    // 对齐 deveco-code-rust 参考实现 codearts.rs：新增盘古模型
+@@ -78,7 +100,7 @@ describe('CodeArtsAdapter', () => {
+     // （2026-09-23 修正，对齐 deveco-code-rust fb1b4a2）：它返回 404 的真实原因是
+     // **缺少 maas_type: benefit 头**，带上即成功；带日期后缀与无后缀是后端上两个
+     // 不同的模型，不能互相替代。
+-    const models = await makeAdapter().listModels('codearts')
++    const models = await (await makeAdapter()).listModels('codearts')
+     const ids = models.map(model => model.id)
+     expect(ids).toContain('openpangu-2.0-flash')
+     expect(ids).toContain('openpangu-2.0-pro')
+@@ -102,7 +124,7 @@ describe('CodeArtsAdapter', () => {
+     // deepseek-v4-flash/pro：1048576（1M）；deepseek-v4.1-flash：1000000
+     // （对齐 IDE 下发的 inferhub-provider 模型配置，2026-09 kernel 日志）。
+     // 其余模型（GLM-5.1/GLM-5/openpangu-*）未公开容量，context 应为 undefined。
+-    const adapter = makeAdapter()
++    const adapter = await makeAdapter()
+     const glm52 = await adapter.resolveModel('codearts', 'GLM-5.2')
+     expect(glm52.context).toEqual({ contextWindow: 202752 })
+     const glm53flash = await adapter.resolveModel('codearts', 'glm-5.3-flash')
+@@ -124,7 +146,7 @@ describe('CodeArtsAdapter', () => {
+   // 的 LlmAdapter 基类没有该方法——缺少时每轮请求都以
+   // `registration.adapter.prepareCall is not a function` 失败。
+   it('prepareCall resolves the model and binds its stream', async () => {
+-    const adapter = makeAdapter()
++    const adapter = await makeAdapter()
+     expect(typeof adapter.prepareCall).toBe('function')
+     const call = await adapter.prepareCall('codearts', 'GLM-5.2')
+     expect(call.model).toMatchObject({
+@@ -143,7 +165,7 @@ describe('CodeArtsAdapter', () => {
+       + 'data: [DONE]\n\n',
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const chunks: string[] = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+       if (chunk.type === 'text-delta') chunks.push(chunk.text)
+@@ -162,7 +184,7 @@ describe('CodeArtsAdapter', () => {
+       expect(refreshed).toBe(true)
+       return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+     })
+-    const adapter = makeAdapter({
++    const adapter = await makeAdapter({
+       credential: { ...validCredential, expires_at: '2020-01-01T00:00:00Z' },
+       refresh: async () => { refreshed = true },
+       fetchImpl,
+@@ -178,7 +200,7 @@ describe('CodeArtsAdapter', () => {
+   it('listModels advertises glm-5.3-flash with the GLM family', async () => {
+     // 对齐 deveco-code-rust 90aeb17d：CodeArts Agent 后端新增 GLM-5.3 Flash
+     // （benefit 免费额度模型，后端注册 id 为全小写 glm-5.3-flash）。
+-    const models = await makeAdapter().listModels('codearts')
++    const models = await (await makeAdapter()).listModels('codearts')
+     expect(models.map((model) => model.id)).toContain('glm-5.3-flash')
+     // 默认模型仍是 GLM-5.2（新增模型不应改变默认模型）。
+     expect(models[0]!.id).toBe('GLM-5.2')
+@@ -196,7 +218,7 @@ describe('CodeArtsAdapter', () => {
+       expect(auth).toContain('maas_type')
+       return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const texts: string[] = []
+     for await (const chunk of adapter.stream({ ...streamOptions, model: 'glm-5.3-flash' } as never)) {
+       if (chunk.type === 'text-delta') texts.push(chunk.text)
+@@ -210,7 +232,7 @@ describe('CodeArtsAdapter', () => {
+       expect(headers.get('maas_type')).toBeNull()
+       return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
+     expect(fetchImpl).toHaveBeenCalled()
+   })
+@@ -231,7 +253,7 @@ describe('CodeArtsAdapter', () => {
+         expect(headers.get('Authorization') ?? '').toContain('maas_type')
+         return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+       })
+-      const adapter = makeAdapter({ fetchImpl })
++      const adapter = await makeAdapter({ fetchImpl })
+       const texts: string[] = []
+       for await (const chunk of adapter.stream({ ...streamOptions, model: 'deepseek-v4.1-flash' } as never)) {
+         if (chunk.type === 'text-delta') texts.push(chunk.text)
+@@ -252,7 +274,7 @@ describe('CodeArtsAdapter', () => {
+         expect(new Headers(init?.headers).get('maas_type')).toBeNull()
+         return new Response('data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+       })
+-      const adapter = makeAdapter({ fetchImpl })
++      const adapter = await makeAdapter({ fetchImpl })
+       for await (const _ of adapter.stream({ ...streamOptions, model: 'deepseek-v4-flash' } as never)) { /* drain */ }
+       expect(fetchImpl).toHaveBeenCalled()
+     } finally {
+@@ -283,7 +305,7 @@ describe('CodeArtsAdapter', () => {
+       expect(refreshed).toBe(true)
+       return new Response('data: {"choices":[{"delta":{"content":"recovered"}}]}\n\ndata: [DONE]\n\n', { status: 200 })
+     })
+-    const adapter = makeAdapter({
++    const adapter = await makeAdapter({
+       refresh: async () => { refreshed = true },
+       fetchImpl,
+     })
+@@ -309,7 +331,7 @@ describe('CodeArtsAdapter', () => {
+       chatCalls += 1
+       return new Response(JSON.stringify({ error_code: 'APIG.0602', error_msg: 'Invalid token' }), { status: 401 })
+     })
+-    const adapter = makeAdapter({
++    const adapter = await makeAdapter({
+       refresh: async () => { refreshCount += 1 },
+       fetchImpl,
+     })
+@@ -335,7 +357,7 @@ describe('CodeArtsAdapter', () => {
+   })
+ 
+   it('normalizes a non-2xx response to an LlmError', async () => {
+-    const adapter = makeAdapter({ fetchImpl: async () => new Response('nope', { status: 500 }) })
++    const adapter = await makeAdapter({ fetchImpl: async () => new Response('nope', { status: 500 }) })
+     await expect(async () => {
+       for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
+     }).rejects.toBeInstanceOf(LlmError)
+@@ -368,7 +390,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const texts: string[] = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+       if (chunk.type === 'text-delta') texts.push(chunk.text)
+@@ -404,7 +426,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const texts: string[] = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+       if (chunk.type === 'text-delta') texts.push(chunk.text)
+@@ -444,7 +466,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const blocks: string[] = []
+     const texts: string[] = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+@@ -486,7 +508,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const blocks: string[] = []
+     const texts: string[] = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+@@ -528,7 +550,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textEnds: string[] = []
+     const reasoningEnds: string[] = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+@@ -572,7 +594,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const reasoning: string[] = []
+     const texts: string[] = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+@@ -601,7 +623,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 400, headers: { 'content-type': 'application/json' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     await expect(async () => {
+       for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
+     }).rejects.toThrow(/peak hours, try later/)
+@@ -612,7 +634,7 @@ describe('CodeArtsAdapter', () => {
+       JSON.stringify({ error_code: 'OTHER', error_msg: 'bad request' }),
+       { status: 400, headers: { 'content-type': 'application/json' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     await expect(async () => {
+       for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
+     }).rejects.toMatchObject({ code: 'INVALID_REQUEST' })
+@@ -624,7 +646,7 @@ describe('CodeArtsAdapter', () => {
+       + 'data: [DONE]\n\n',
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const seen: string[] = []
+     let toolCallBlock: { type: 'tool-call'; id: string; name: string; arguments: string } | undefined
+     let finishKind: string | undefined
+@@ -655,7 +677,7 @@ describe('CodeArtsAdapter', () => {
+       + 'data: [DONE]\n\n',
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     let toolCallBlock: { type: 'tool-call'; id: string; name: string; arguments: string } | undefined
+     for await (const chunk of adapter.stream(streamOptions)) {
+       if (chunk.type === 'tool-call-delta') expect(chunk.name).toBe('bash')
+@@ -690,7 +712,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const opts = {
+       provider: 'codearts',
+       model: 'GLM-5.2',
+@@ -709,7 +731,7 @@ describe('CodeArtsAdapter', () => {
+   it('hides vision-only (VL) models from listModels so they cannot be used as the agent model', async () => {
+     // VL 多模态模型（如 Qwen3-VL-235B）上下文小、不支持工具调用，不适合当
+     // agent 主模型，从模型列表屏蔽。它们只通过 analyzeImage 工具间接调用。
+-    const adapter = makeAdapter({
++    const adapter = await makeAdapter({
+       fetchRemoteModels: async () => [
+         { id: 'GLM-5.2', name: 'GLM-5.2' },
+         { id: 'Qwen3-VL-235B', name: 'Qwen3-VL-235B' },
+@@ -731,7 +753,7 @@ describe('CodeArtsAdapter', () => {
+    * listModels 的播报里消失 —— 对话框模型选择器读的正是这份数据。
+    */
+   it('hides models the user disabled from listModels', async () => {
+-    const adapter = makeAdapter({
++    const adapter = await makeAdapter({
+       fetchRemoteModels: async () => [
+         { id: 'GLM-5.2', name: 'GLM-5.2' },
+         { id: 'deepseek-v4-flash', name: 'deepseek-v4-flash' },
+@@ -746,7 +768,7 @@ describe('CodeArtsAdapter', () => {
+   })
+ 
+   it('an empty disabled set leaves listModels untouched', async () => {
+-    const adapter = makeAdapter({ accountPool: poolWithDisabled('codearts', []) })
++    const adapter = await makeAdapter({ accountPool: poolWithDisabled('codearts', []) })
+     const ids = (await adapter.listModels('codearts')).map((m) => m.id)
+     expect(ids).toContain('GLM-5.2')
+     expect(ids).toContain('deepseek-v4-flash')
+@@ -754,12 +776,12 @@ describe('CodeArtsAdapter', () => {
+ 
+   it('blacklist is keyed by provider: another route\'s entries do not leak in', async () => {
+     // 池里只有 buddy 的黑名单，codearts 路由不该被它影响
+-    const adapter = makeAdapter({ accountPool: poolWithDisabled('buddy', ['GLM-5.2']) })
++    const adapter = await makeAdapter({ accountPool: poolWithDisabled('buddy', ['GLM-5.2']) })
+     expect((await adapter.listModels('codearts')).map((m) => m.id)).toContain('GLM-5.2')
+   })
+ 
+   it('a disabled model still resolves and remains requestable (catalog is advisory)', async () => {
+-    const adapter = makeAdapter({ accountPool: poolWithDisabled('codearts', ['GLM-5.2']) })
++    const adapter = await makeAdapter({ accountPool: poolWithDisabled('codearts', ['GLM-5.2']) })
+     expect((await adapter.listModels('codearts')).map((m) => m.id)).not.toContain('GLM-5.2')
+     // DSH 契约：listModels 的结果仅供参考，缺省不构成请求拒绝。
+     const resolved = await adapter.resolveModel('codearts', 'GLM-5.2')
+@@ -774,24 +796,24 @@ describe('CodeArtsAdapter', () => {
+   // `CODEARTS_ACCESS_TOKEN` 不会再被写入或读取，判据与其余五个 provider 一致。
+   describe('无已登录账号时隐藏整个 provider 目录', () => {
+     it('没有已登录账号 → 返回空数组', async () => {
+-      const adapter = makeAdapter({ accountPool: poolWithCredentials([]) })
++      const adapter = await makeAdapter({ accountPool: poolWithCredentials([]) })
+       expect(await adapter.listModels('codearts')).toEqual([])
+     })
+ 
+     it('⚠️ 单凭据 ref 有值但账号池为空 → 仍隐藏（单凭据模式已移除）', async () => {
+       // 这是本次变更的核心断言：老用户若只用固定 ref 登录过，模型会消失、
+       // 需要在 Jet Hub 重新登录一次（用户已确认接受该行为）。
+-      const adapter = makeAdapter({ accountPool: poolWithCredentials([]) })
++      const adapter = await makeAdapter({ accountPool: poolWithCredentials([]) })
+       expect(await adapter.listModels('codearts')).toEqual([])
+     })
+ 
+     it('账号池里有已登录账号 → 正常返回目录', async () => {
+-      const adapter = makeAdapter({ accountPool: poolWithCredentials(['CODEARTS_ACCOUNT_1']) })
++      const adapter = await makeAdapter({ accountPool: poolWithCredentials(['CODEARTS_ACCOUNT_1']) })
+       expect((await adapter.listModels('codearts')).map((m) => m.id)).toContain('GLM-5.2')
+     })
+ 
+     it('未提供 accountPool 时保守放行（headless / CLI 场景）', async () => {
+-      expect((await makeAdapter().listModels('codearts')).length).toBeGreaterThan(0)
++      expect((await (await makeAdapter()).listModels('codearts')).length).toBeGreaterThan(0)
+     })
+   })
+ 
+@@ -830,7 +852,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     let finishKind: string | undefined
+     const opts = {
+@@ -878,7 +900,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const deltas: Array<{ id: string; name?: string }> = []
+     const opts = {
+       provider: 'codearts',
+@@ -921,7 +943,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     const textDeltas: string[] = []
+     let finishKind: string | undefined
+@@ -975,7 +997,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textDeltas: string[] = []
+     const reasoningDeltas: string[] = []
+     const toolCallBlocks: Array<{ name: string }> = []
+@@ -1030,7 +1052,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     const textDeltas: string[] = []
+     let finishKind: string | undefined
+@@ -1072,7 +1094,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textDeltas: string[] = []
+     const reasoningDeltas: string[] = []
+     let finishKind: string | undefined
+@@ -1109,7 +1131,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     const opts = {
+       provider: 'codearts',
+@@ -1163,7 +1185,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     const opts = {
+       provider: 'codearts',
+@@ -1214,7 +1236,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     const opts = {
+       provider: 'codearts',
+@@ -1264,7 +1286,7 @@ describe('CodeArtsAdapter', () => {
+       `data: {"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}\n\ndata: [DONE]\n\n`,
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     const opts = {
+       provider: 'codearts',
+@@ -1323,7 +1345,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const texts: string[] = []
+     const opts = {
+       provider: 'codearts',
+@@ -1363,7 +1385,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     const opts = {
+       provider: 'codearts',
+@@ -1412,7 +1434,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const opts = {
+       provider: 'codearts',
+       model: 'GLM-5.2',
+@@ -1448,7 +1470,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const opts = {
+       provider: 'codearts',
+       model: 'GLM-5.2',
+@@ -1478,7 +1500,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const opts = {
+       provider: 'codearts',
+       model: 'GLM-5.2',
+@@ -1511,7 +1533,7 @@ describe('CodeArtsAdapter', () => {
+         { status: 200, headers: { 'content-type': 'text/event-stream' } },
+       )
+     })
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const opts = {
+       provider: 'codearts',
+       model: 'deepseek-v4-flash',
+@@ -1546,7 +1568,7 @@ describe('CodeArtsAdapter', () => {
+       },
+     })
+     const fetchImpl = vi.fn(async () => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const chunks: string[] = []
+     let caught: LlmError | undefined
+     try {
+@@ -1574,7 +1596,7 @@ describe('CodeArtsAdapter', () => {
+         },
+       })
+       const fetchImpl = vi.fn(async () => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+-      const adapter = makeAdapter({ fetchImpl })
++      const adapter = await makeAdapter({ fetchImpl })
+       const chunks: string[] = []
+       let caught: LlmError | undefined
+       try {
+@@ -1605,7 +1627,7 @@ describe('CodeArtsAdapter', () => {
+         },
+       })
+       const fetchImpl = vi.fn(async () => new Response(body, { status: 200, headers: { 'content-type': 'text/event-stream' } }))
+-      const adapter = makeAdapter({ fetchImpl })
++      const adapter = await makeAdapter({ fetchImpl })
+       let caught: LlmError | undefined
+       try {
+         for await (const _ of adapter.stream(streamOptions)) { /* drain */ }
+@@ -1632,7 +1654,7 @@ describe('CodeArtsAdapter', () => {
+       `data: {"choices":[{"delta":{"content":${JSON.stringify(dsml)}}}]}\n\ndata: [DONE]\n\n`,
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textDeltas: string[] = []
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     let finishKind: string | undefined
+@@ -1665,7 +1687,7 @@ describe('CodeArtsAdapter', () => {
+       sse,
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textDeltas: string[] = []
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+@@ -1691,7 +1713,7 @@ describe('CodeArtsAdapter', () => {
+       `data: {"choices":[{"delta":{"content":${JSON.stringify(text + dsml)}}}]}\n\ndata: [DONE]\n\n`,
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textDeltas: string[] = []
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+@@ -1715,7 +1737,7 @@ describe('CodeArtsAdapter', () => {
+       `data: {"choices":[{"delta":{"content":${JSON.stringify(incomplete)}},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n`,
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textDeltas: string[] = []
+     let finishKind: string | undefined
+     for await (const chunk of adapter.stream(streamOptions)) {
+@@ -1737,7 +1759,7 @@ describe('CodeArtsAdapter', () => {
+       `data: {"choices":[{"delta":{"content":${JSON.stringify(thought + visible)}}}]}\n\ndata: [DONE]\n\n`,
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textDeltas: string[] = []
+     const reasoningDeltas: string[] = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+@@ -1763,7 +1785,7 @@ describe('CodeArtsAdapter', () => {
+       sse,
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textDeltas: string[] = []
+     const reasoningDeltas: string[] = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+@@ -1785,7 +1807,7 @@ describe('CodeArtsAdapter', () => {
+       `data: {"choices":[{"delta":{"content":${JSON.stringify(thought + dsml)}}}]}\n\ndata: [DONE]\n\n`,
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textDeltas: string[] = []
+     const reasoningDeltas: string[] = []
+     const toolCallBlocks: Array<{ name: string; arguments: string }> = []
+@@ -1814,7 +1836,7 @@ describe('CodeArtsAdapter', () => {
+       `data: {"choices":[{"delta":{"content":${JSON.stringify(incompleteThought)}},"finish_reason":"length"}]}\n\ndata: [DONE]\n\n`,
+       { status: 200, headers: { 'content-type': 'text/event-stream' } },
+     ))
+-    const adapter = makeAdapter({ fetchImpl })
++    const adapter = await makeAdapter({ fetchImpl })
+     const textDeltas: string[] = []
+     const reasoningDeltas: string[] = []
+     for await (const chunk of adapter.stream(streamOptions)) {
+diff --git a/tests/unit/lobsterai-adapter.spec.ts b/tests/unit/lobsterai-adapter.spec.ts
+index e41618b..4943a9d 100644
+--- a/tests/unit/lobsterai-adapter.spec.ts
++++ b/tests/unit/lobsterai-adapter.spec.ts
+@@ -82,6 +82,22 @@ async function collect(options: GenerateOptions, adapter: LobsteraiAdapter) {
+   return chunks
+ }
+ 
++/**
++ * 预热模型目录后交给断言。
++ *
++ * ⚠ 为什么必须预热：适配器的 `listModels()` 已改为**非阻塞**（首帧只读缓存，
++ * 远端拉取转后台），以修「模型选择器加载很久」。因此
++ * 「`await listModels()` 之后立即就能看到远端目录」不再成立。
++ *
++ * `whenCatalogReady()` 是给设置页 / `model.list` 这类非热路径用的公开入口，
++ * 会把后台拉取跑完。**只给验「目录内容」（能力/倍率/门控/兜底）的用例用** ——
++ * 首帧时序由 `tests/unit/catalog-refresh.spec.ts` 与
++ * `scripts/probe-listmodels-nonblocking.mts` 专门覆盖。
++ */
++async function ready<T extends { whenCatalogReady(): Promise<void> }>(adapter: T): Promise<T> {
++  await adapter.whenCatalogReady()
++  return adapter
++}
+ describe('LobsterAI 模型列表解析', () => {
+   /**
+    * **真实线上形态**（2026-09-17 实测，`{code:0, message:'success', data:[...]}`）。
+@@ -310,6 +326,7 @@ describe('LobsteraiAdapter 模型目录', () => {
+         { id: 'unknown', name: 'Unknown' },
+       ],
+     })
++    await ready(adapter)
+     const models = await adapter.listModels('lobsterai')
+     expect(models.find((m) => m.id === 'vision')!.inputModalities).toEqual(['text', 'image'])
+     expect(models.find((m) => m.id === 'plain')!.inputModalities).toEqual(['text'])
+@@ -323,6 +340,7 @@ describe('LobsteraiAdapter 模型目录', () => {
+     const { adapter } = makeAdapter(() => textSse('x'), {
+       fetchRemoteModels: async () => [{ id: 'remote-only', name: 'Remote Only' }],
+     })
++    await ready(adapter)
+     const models = await adapter.listModels('lobsterai')
+     expect(models).toEqual([{ provider: 'lobsterai', id: 'remote-only', name: 'Remote Only', inputModalities: ['text'] }])
+   })
+@@ -332,14 +350,20 @@ describe('LobsteraiAdapter 模型目录', () => {
+   // DSH 的 `buildModelCatalog` 显式 `.filter(group => group.models.length > 0)`，
+   // 故返回空数组即让整个 provider 分组消失（减少模型选择列表臃肿）。
+   describe('目录门控（无已登录账号时隐藏）', () => {
++    // ⚠ 替身必须**同时**提供 `catalogVisibleSync`：适配器的 `listModels()`
++    // 走**同步**门控（`providerCatalogVisibleSync`），而它对同步方法做**能力
++    // 检测** —— 缺失时保守放行（那是给旧替身/headless 的兜底）。只给
++    // `hasLoggedInAccount` 的替身会因此**永远可见**，门控用例形同虚设。
+     it('没有已登录账号 → 返回空数组', async () => {
+       const { adapter } = makeAdapter(() => textSse('x'), {
+         fetchRemoteModels: async () => [{ id: 'm', name: 'M' }],
+         accountPool: {
+           disabledModelsFor: () => new Set<string>(),
+           hasLoggedInAccount: async () => false,
++          catalogVisibleSync: () => false,
+         } as never,
+       })
++      await ready(adapter)
+       expect(await adapter.listModels('lobsterai')).toEqual([])
+     })
+ 
+@@ -349,8 +373,10 @@ describe('LobsteraiAdapter 模型目录', () => {
+         accountPool: {
+           disabledModelsFor: () => new Set<string>(),
+           hasLoggedInAccount: async () => true,
++          catalogVisibleSync: () => true,
+         } as never,
+       })
++      await ready(adapter)
+       expect((await adapter.listModels('lobsterai')).map((m) => m.id)).toEqual(['m'])
+     })
+   })
+@@ -364,6 +390,7 @@ describe('LobsteraiAdapter 模型目录', () => {
+       const { adapter } = makeAdapter(() => textSse('x'), {
+         fetchRemoteModels: async () => [{ id: 'm', name: 'M', costMultiplier: 0.05 }],
+       })
++      await ready(adapter)
+       const models = await adapter.listModels('lobsterai')
+       expect(models[0]?.name).toBe('M · x0.05')
+     })
+@@ -372,6 +399,7 @@ describe('LobsteraiAdapter 模型目录', () => {
+       const { adapter } = makeAdapter(() => textSse('x'), {
+         fetchRemoteModels: async () => [{ id: 'm', name: 'M', costMultiplier: 1.08, description: '很强大的模型' }],
+       })
++      await ready(adapter)
+       const models = await adapter.listModels('lobsterai')
+       // 倍率只在 name 里出现一次，description 保持远端原文。
+       expect(models[0]?.name).toBe('M · x1.08')
+@@ -382,6 +410,7 @@ describe('LobsteraiAdapter 模型目录', () => {
+       const { adapter } = makeAdapter(() => textSse('x'), {
+         fetchRemoteModels: async () => [{ id: 'm', name: 'M' }],
+       })
++      await ready(adapter)
+       const models = await adapter.listModels('lobsterai')
+       expect(models[0]?.name).toBe('M')
+     })
+@@ -1149,4 +1178,4 @@ describe('registerLobsteraiLlm', () => {
+     }])
+     expect(adapters).toEqual(['lobsterai'])
+   })
+-})
++})
+\ No newline at end of file
+diff --git a/tests/unit/loomy-adapter.spec.ts b/tests/unit/loomy-adapter.spec.ts
+index 76dc872..7b6ada5 100644
+--- a/tests/unit/loomy-adapter.spec.ts
++++ b/tests/unit/loomy-adapter.spec.ts
+@@ -34,6 +34,26 @@ function makeAdapter(over: Partial<ConstructorParameters<typeof LoomyAdapter>[0]
+   })
+ }
+ 
++/**
++ * 预热目录后交给断言。
++ *
++ * ⚠ **为什么需要它**：适配器的 `listModels()` 已改为**非阻塞**（首帧只读缓存，
++ * 远端拉取转后台），这是为了修「模型选择器加载很久」。因此
++ * 「`await listModels()` 之后立即就能看到远端目录」这个前提**不再成立**。
++ *
++ * 本 helper 用 `whenCatalogReady()`（那是给设置页/`model.list` 这类非热路径用
++ * 的公开入口）把后台拉取跑完，再交给断言 —— 测试要验的是**目录内容逻辑**
++ * （过滤、兜底、倍率），不是首帧时序；首帧时序由
++ * `tests/unit/catalog-refresh.spec.ts` 专门覆盖。
++ */
++async function readyAdapter(
++  over: Partial<ConstructorParameters<typeof LoomyAdapter>[0]> = {},
++): Promise<LoomyAdapter> {
++  const adapter = makeAdapter(over)
++  await adapter.whenCatalogReady()
++  return adapter
++}
++
+ describe('parseLoomyRemoteModels', () => {
+   it('只保留 type=chat，并把倍率规范化进 name', () => {
+     const models = parseLoomyRemoteModels({
+@@ -76,7 +96,7 @@ describe('parseLoomyRemoteModels', () => {
+ 
+ describe('LoomyAdapter.listModels', () => {
+   it('远端可用时用远端（带倍率）', async () => {
+-    const adapter = makeAdapter({
++    const adapter = await readyAdapter({
+       fetchRemoteModels: async () => parseLoomyRemoteModels({
+         data: [remoteEntry(), remoteEntry({ id: 'spark-x', name: 'Spark X2.5（x0.1）' })],
+       }),
+@@ -88,38 +108,58 @@ describe('LoomyAdapter.listModels', () => {
+   })
+ 
+   it('远端失败时回退兜底表（8 个，兜底表名已含倍率）', async () => {
+-    const adapter = makeAdapter({ fetchRemoteModels: async () => { throw new Error('boom') } })
++    const adapter = await readyAdapter({
++      fetchRemoteModels: async () => { throw new Error('boom') },
++    })
+     const models = await adapter.listModels('loomy')
+     expect(models).toHaveLength(8)
+     expect(models.map((m) => m.id)).toContain('qwen3.8-flash')
+   })
+ 
+   it('无账号池时目录可见（headless/单测保守放行）', async () => {
+-    const adapter = makeAdapter()
++    const adapter = await readyAdapter()
+     expect((await adapter.listModels('loomy')).length).toBeGreaterThan(0)
+   })
+ 
+   it('有账号池但未登录时返回空数组（不抛错）', async () => {
+-    const adapter = makeAdapter({
++    const adapter = await readyAdapter({
+       accountPool: {
+         disabledModelsFor: () => new Set<string>(),
+         hasLoggedInAccount: async () => false,
++        catalogVisibleSync: () => false,
+       } as never,
+     })
+     expect(await adapter.listModels('loomy')).toEqual([])
+   })
+ 
+   it('黑名单里的模型被过滤', async () => {
+-    const adapter = makeAdapter({
++    const adapter = await readyAdapter({
+       accountPool: {
+         disabledModelsFor: () => new Set(['spark-x']),
+         hasLoggedInAccount: async () => true,
++        catalogVisibleSync: () => true,
+       } as never,
+     })
+     const ids = (await adapter.listModels('loomy')).map((m) => m.id)
+     expect(ids).not.toContain('spark-x')
+     expect(ids.length).toBe(7)
+   })
++
++  it('首帧不等待网络：拉取未落定也立即返回兜底表', async () => {
++    // 远端**延迟很久**才 resolve（不永挂，否则会拖住 vitest 的事件循环）。
++    // 若 listModels 仍会 await 网络，本用例的 50ms 断言必然失败。
++    const adapter = makeAdapter({
++      fetchRemoteModels: () => new Promise((resolve) => {
++        setTimeout(() => resolve([]), 3_000)
++      }),
++    })
++    const started = Date.now()
++    const models = await adapter.listModels('loomy')
++    expect(models.length).toBeGreaterThan(0)
++    expect(Date.now() - started).toBeLessThan(50)
++    // 首帧给的是静态兜底表（远端还没回来）。
++    expect(models.map((m) => m.id)).toContain('qwen3.8-flash')
++  })
+ })
+ 
+ describe('LoomyAdapter.listAllModels', () => {
+diff --git a/tests/unit/qoder-adapter.spec.ts b/tests/unit/qoder-adapter.spec.ts
+index bb35241..26969f9 100644
+--- a/tests/unit/qoder-adapter.spec.ts
++++ b/tests/unit/qoder-adapter.spec.ts
+@@ -92,11 +92,16 @@ describe('QoderAdapter 模型目录', () => {
+   // 目录门控：没有已登录账号时不显示该 provider 的任何模型。
+   // 见 `providerCatalogVisible`（src/account-pool.ts）。
+   describe('无已登录账号时隐藏整个 provider 目录', () => {
++    // ⚠ 替身必须**同时**提供 `catalogVisibleSync`：适配器的 `listModels()` 走
++    // **同步**门控（`providerCatalogVisibleSync`），而它对同步方法做**能力检测**
++    // —— 缺失时保守放行（那是给旧替身/headless 的兜底）。只给
++    // `hasLoggedInAccount` 的替身会因此**永远可见**，门控用例形同虚设。
+     it('没有已登录账号 → 返回空数组', async () => {
+       const adapter = makeAdapter({
+         accountPool: {
+           disabledModelsFor: () => new Set<string>(),
+           hasLoggedInAccount: async () => false,
++          catalogVisibleSync: () => false,
+         } as never,
+       })
+       expect(await adapter.listModels('qoder')).toEqual([])
+@@ -107,6 +112,7 @@ describe('QoderAdapter 模型目录', () => {
+         accountPool: {
+           disabledModelsFor: () => new Set<string>(),
+           hasLoggedInAccount: async () => true,
++          catalogVisibleSync: () => true,
+         } as never,
+       })
+       expect((await adapter.listModels('qoder')).length).toBe(QODER.fallbackModels.length)
+diff --git a/tests/unit/raccoon-adapter.spec.ts b/tests/unit/raccoon-adapter.spec.ts
+index 978c176..731607c 100644
+--- a/tests/unit/raccoon-adapter.spec.ts
++++ b/tests/unit/raccoon-adapter.spec.ts
+@@ -99,6 +99,22 @@ async function collect(adapter: RaccoonAdapter, options: Partial<GenerateOptions
+   return chunks
+ }
+ 
++/**
++ * 预热模型目录后交给断言。
++ *
++ * ⚠ 为什么必须预热：适配器的 `listModels()` 已改为**非阻塞**（首帧只读缓存，
++ * 远端拉取转后台），以修「模型选择器加载很久」。因此
++ * 「`await listModels()` 之后立即就能看到远端目录」不再成立。
++ *
++ * `whenCatalogReady()` 是给设置页 / `model.list` 这类非热路径用的公开入口，
++ * 会把后台拉取跑完。**只给验「目录内容」的用例用** —— 首帧时序由
++ * `tests/unit/catalog-refresh.spec.ts` 与
++ * `scripts/probe-listmodels-nonblocking.mts` 专门覆盖。
++ */
++async function ready<T extends { whenCatalogReady(): Promise<void> }>(adapter: T): Promise<T> {
++  await adapter.whenCatalogReady()
++  return adapter
++}
+ describe('providerInfo', () => {
+   it('返回 id 与显示名', () => {
+     const info = makeAdapter().providerInfo('raccoon')
+@@ -114,7 +130,7 @@ describe('providerInfo', () => {
+ 
+ describe('listModels', () => {
+   it('无账号池时返回全部模型（门控保守放行）', async () => {
+-    const models = await makeAdapter().listModels('raccoon')
++    const models = await (await ready(makeAdapter())).listModels('raccoon')
+     expect(models.map((m) => m.id)).toEqual(['sn-glm-5-3'])
+     expect(models[0]?.name).toBe('GLM-5-3 · x0.75')
+   })
+@@ -122,27 +138,32 @@ describe('listModels', () => {
+   it('**无已登录账号时返回空数组且不抛错**（DSH 据此隐藏整个分组）', async () => {
+     const pool = {
+       hasLoggedInAccount: async () => false,
++      // ⚠ 必须同时给同步版：`listModels` 走 `providerCatalogVisibleSync`，
++      // 而它对同步方法做能力检测 —— 缺失时保守放行，门控用例会形同虚设。
++      catalogVisibleSync: () => false,
+       disabledModelsFor: () => new Set<string>(),
+     } as unknown as AccountPool
+-    const models = await makeAdapter({ pool }).listModels('raccoon')
++    const models = await (await ready(makeAdapter({ pool }))).listModels('raccoon')
+     expect(models).toEqual([])
+   })
+ 
+   it('应用黑名单', async () => {
+     const pool = {
+       hasLoggedInAccount: async () => true,
++      catalogVisibleSync: () => true,
+       disabledModelsFor: () => new Set(['sn-glm-5-3']),
+     } as unknown as AccountPool
+-    const models = await makeAdapter({ pool }).listModels('raccoon')
++    const models = await (await ready(makeAdapter({ pool }))).listModels('raccoon')
+     expect(models).toEqual([])
+   })
+ 
+   it('黑名单只影响目录，不影响 resolveModel（路由契约）', async () => {
+     const pool = {
+       hasLoggedInAccount: async () => true,
++      catalogVisibleSync: () => true,
+       disabledModelsFor: () => new Set(['sn-glm-5-3']),
+     } as unknown as AccountPool
+-    const adapter = makeAdapter({ pool })
++    const adapter = await ready(makeAdapter({ pool }))
+     const resolved = await adapter.resolveModel('raccoon', 'sn-glm-5-3')
+     expect(resolved.id).toBe('sn-glm-5-3')
+   })
+@@ -152,12 +173,10 @@ describe('listAllModels', () => {
+   it('**不套黑名单**（设置页要显示被关闭的模型）', async () => {
+     const pool = {
+       hasLoggedInAccount: async () => true,
++      catalogVisibleSync: () => true,
+       disabledModelsFor: () => new Set(['sn-glm-5-3']),
+     } as unknown as AccountPool
+-    const adapter = makeAdapter({ pool })
+-    // 远端目录是**惰性加载**的（首次 listModels/resolveModel 时拉取），
+-    // 故先触发一次加载，再断言 listAllModels。
+-    await adapter.listModels('raccoon')
++    const adapter = await ready(makeAdapter({ pool }))
+     const all = adapter.listAllModels()
+     expect(all.map((m) => m.id)).toEqual(['sn-glm-5-3'])
+     // 且带**最终展示名（含倍率）**，不是裸 id —— 这正是 listAllModels 的价值：
+diff --git a/tests/unit/trae-adapter.spec.ts b/tests/unit/trae-adapter.spec.ts
+index cf97560..213084d 100644
+--- a/tests/unit/trae-adapter.spec.ts
++++ b/tests/unit/trae-adapter.spec.ts
+@@ -103,6 +103,22 @@ function makeAdapter(options: {
+   return { adapter, fetcher, refresh }
+ }
+ 
++/**
++ * 预热模型目录后交给断言。
++ *
++ * ⚠ 为什么必须预热：适配器的 `listModels()` 已改为**非阻塞**（首帧只读缓存，
++ * 远端拉取转后台），以修「模型选择器加载很久」。因此
++ * 「`await listModels()` 之后立即就能看到远端目录」不再成立。
++ *
++ * `whenCatalogReady()` 是给设置页 / `model.list` 这类非热路径用的公开入口，
++ * 会把后台拉取跑完。**只给验「目录内容」（能力/倍率/门控/兜底）的用例用** ——
++ * 首帧时序由 `tests/unit/catalog-refresh.spec.ts` 与
++ * `scripts/probe-listmodels-nonblocking.mts` 专门覆盖。
++ */
++async function ready<T extends { whenCatalogReady(): Promise<void> }>(adapter: T): Promise<T> {
++  await adapter.whenCatalogReady()
++  return adapter
++}
+ /** 收集 stream() 产出的全部 chunk。 */
+ async function collect(adapter: TraeAdapter, options: GenerateOptions): Promise<StreamChunk[]> {
+   const chunks: StreamChunk[] = []
+@@ -133,6 +149,7 @@ describe('TRAE 适配器 · listModels', () => {
+     const { adapter } = makeAdapter({
+       remoteModels: [{ id: 'remote-1', name: 'Remote One' }],
+     })
++    await ready(adapter)
+     const models = await adapter.listModels('trae')
+     expect(models).toEqual([
+       { provider: 'trae', id: 'remote-1', name: 'Remote One', inputModalities: ['text'] },
+@@ -167,6 +184,7 @@ describe('TRAE 适配器 · listModels', () => {
+         { id: 'unknown', name: 'Unknown' },
+       ],
+     })
++    await ready(adapter)
+     const models = await adapter.listModels('trae')
+     const byId = new Map(models.map((m) => [m.id, m.inputModalities]))
+     expect(byId.get('deepseek-v4.1-flash')).toEqual(['text', 'image'])
+@@ -182,6 +200,7 @@ describe('TRAE 适配器 · listModels', () => {
+         disabledModelsFor: () => new Set(['a']),
+       },
+     })
++    await ready(adapter)
+     const models = await adapter.listModels('trae')
+     expect(models.map((m) => m.id)).toEqual(['b'])
+   })
+@@ -191,6 +210,7 @@ describe('TRAE 适配器 · listModels', () => {
+       remoteModels: [{ id: 'a', name: 'A' }],
+       accountPool: { disabledModelsFor: () => new Set<string>() },
+     })
++    await ready(adapter)
+     expect((await adapter.listModels('trae')).length).toBe(1)
+   })
+ 
+@@ -201,11 +221,19 @@ describe('TRAE 适配器 · listModels', () => {
+    * 故 adapter 返回 `[]` 即可让整个 provider 分组从模型选择器消失。
+    */
+   describe('无已登录账号时隐藏整个 provider 目录', () => {
+-    /** 复刻真实账号池的替身（带 hasLoggedInAccount）。 */
++    /**
++     * 复刻真实账号池的替身（带 hasLoggedInAccount）。
++     *
++     * ⚠ **必须同时提供 `catalogVisibleSync`**：适配器的 `listModels()` 走
++     * **同步**门控（`providerCatalogVisibleSync`），而它对同步方法做**能力检测**
++     * —— 缺失时保守放行（那是给旧替身/headless 的兜底）。只给
++     * `hasLoggedInAccount` 的替身会因此**永远可见**，门控用例形同虚设。
++     */
+     function poolWithLogin(loggedIn: boolean) {
+       return {
+         disabledModelsFor: () => new Set<string>(),
+         hasLoggedInAccount: async () => loggedIn,
++        catalogVisibleSync: () => loggedIn,
+       }
+     }
+ 
+@@ -214,6 +242,7 @@ describe('TRAE 适配器 · listModels', () => {
+         remoteModels: [{ id: 'a', name: 'A' }],
+         accountPool: poolWithLogin(false),
+       })
++      await ready(adapter)
+       expect(await adapter.listModels('trae')).toEqual([])
+     })
+ 
+@@ -222,6 +251,7 @@ describe('TRAE 适配器 · listModels', () => {
+         remoteModels: [{ id: 'a', name: 'A' }],
+         accountPool: poolWithLogin(true),
+       })
++      await ready(adapter)
+       expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual(['a'])
+     })
+ 
+@@ -248,6 +278,7 @@ describe('TRAE 适配器 · listModels', () => {
+         remoteModels: [{ id: 'a', name: 'A' }],
+         accountPool: poolWithLogin(false),
+       })
++      await ready(adapter)
+       await expect(adapter.listModels('trae')).resolves.toEqual([])
+     })
+ 
+@@ -262,6 +293,7 @@ describe('TRAE 适配器 · listModels', () => {
+         remoteModels: [{ id: 'a', name: 'A' }],
+         accountPool: poolWithLogin(false),
+       })
++      await ready(adapter)
+       // 门控生效：对话框目录为空
+       expect(await adapter.listModels('trae')).toEqual([])
+       // 但设置页仍能看到它（模拟真实调用顺序：先 resolveModel 加载目录）
+@@ -275,11 +307,13 @@ describe('TRAE 适配器 · listModels', () => {
+         remoteModels: [{ id: 'a', name: 'A' }],
+         accountPool: { disabledModelsFor: () => new Set<string>() },
+       })
++      await ready(adapter)
+       expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual(['a'])
+     })
+ 
+     it('未提供 accountPool 时保守放行（headless / CLI 场景）', async () => {
+       const { adapter } = makeAdapter({ remoteModels: [{ id: 'a', name: 'A' }] })
++      await ready(adapter)
+       expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual(['a'])
+     })
+   })
+@@ -295,6 +329,8 @@ describe('TRAE 适配器 · listModels', () => {
+       const { adapter } = makeAdapter({
+         remoteModels: [{ id: 'qwen3.8-flash', name: 'Qwen3.8-Flash', creditsRate: 0.08 }],
+       })
++      await ready(adapter)
++      await ready(adapter)
+       const models = await adapter.listModels('trae')
+       expect(models[0]!.name).toBe('Qwen3.8-Flash · x0.08')
+     })
+@@ -306,6 +342,7 @@ describe('TRAE 适配器 · listModels', () => {
+           creditsRate: 0.08, originalCreditsRate: 0.8, discountEndsAtSec: 1790265540,
+         }],
+       })
++      await ready(adapter)
+       const models = await adapter.listModels('trae')
+       expect(models[0]!.name).toBe('Doubao Seed 2.1 Pro · x0.8→x0.08')
+     })
+@@ -314,6 +351,7 @@ describe('TRAE 适配器 · listModels', () => {
+       const { adapter } = makeAdapter({
+         remoteModels: [{ id: 'free', name: 'Free Model', creditsRate: 0 }],
+       })
++      await ready(adapter)
+       const models = await adapter.listModels('trae')
+       expect(models[0]!.name).toBe('Free Model · 免费')
+     })
+@@ -322,6 +360,7 @@ describe('TRAE 适配器 · listModels', () => {
+       const { adapter } = makeAdapter({
+         remoteModels: [{ id: 'unknown', name: 'Unknown Model' }],
+       })
++      await ready(adapter)
+       const models = await adapter.listModels('trae')
+       expect(models[0]!.name).toBe('Unknown Model')
+     })
+@@ -330,6 +369,7 @@ describe('TRAE 适配器 · listModels', () => {
+       const { adapter } = makeAdapter({
+         remoteModels: [{ id: 'x', name: 'X', creditsRate: 0.5, originalCreditsRate: 0.5 }],
+       })
++      await ready(adapter)
+       const models = await adapter.listModels('trae')
+       expect(models[0]!.name).toBe('X · x0.5')
+     })
+@@ -359,6 +399,7 @@ describe('TRAE 适配器 · listModels', () => {
+         { id: 'glm-5.2', name: 'GLM-5.2' },
+       ],
+     })
++    await ready(adapter)
+     expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual([
+       'DeepSeek-V4-Flash-Official',
+       'glm-5.2',
+@@ -374,6 +415,7 @@ describe('TRAE 适配器 · listModels', () => {
+         { id: 'explicit-false', name: 'Explicit False', isCustomModel: false },
+       ],
+     })
++    await ready(adapter)
+     expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual(['no-flag', 'explicit-false'])
+   })
+ 
+@@ -401,6 +443,7 @@ describe('TRAE 适配器 · listModels', () => {
+         { id: 'glm-5.1', name: 'GLM-5.1', isHidden: true, function: 'solo_agent_remote' },
+       ],
+     })
++    await ready(adapter)
+     expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual(['visible'])
+   })
+ 
+@@ -411,6 +454,7 @@ describe('TRAE 适配器 · listModels', () => {
+         { id: 'retired', name: 'R', isEnabled: false },
+       ],
+     })
++    await ready(adapter)
+     expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual(['live'])
+   })
+ 
+@@ -421,6 +465,7 @@ describe('TRAE 适配器 · listModels', () => {
+         { id: 'b', name: 'B', isHidden: false, isEnabled: true, isCustomModel: false },
+       ],
+     })
++    await ready(adapter)
+     expect((await adapter.listModels('trae')).map((m) => m.id)).toEqual(['a', 'b'])
+   })
+ })
+@@ -1564,4 +1609,4 @@ describe('TRAE 适配器 · OpenAI chunk 常量导出', () => {
+   it('OPENAI_DONE 用于非流式聚合场景', () => {
+     expect(OPENAI_DONE).toBe('data: [DONE]\n\n')
+   })
+-})
++})
+\ No newline at end of file
