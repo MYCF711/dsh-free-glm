@@ -538,9 +538,46 @@ export function renderModelToggles(
   deps: ModelToggleDeps,
   ctx: ClientCtx,
 ): HTMLElement | null {
+  /**
+   * 【自检】组件被调用时留下全局痕迹。
+   *
+   * ## 为什么需要
+   *
+   * 「槽没渲染」有两种完全不同的成因，从界面上看**一模一样**：
+   *
+   *   ① renderer 没找到我们的 entry（`key` 不匹配）→ 组件**从未被调用**
+   *   ② 组件被调用了，但 `isOurCard()` 返回 false → 组件**返回 null**
+   *
+   * 没有这个痕迹就只能靠猜。挂了 `window.__zcbProbe` 之后，
+   * 在浏览器控制台看这个对象即可区分：
+   *
+   * ```js
+   * window.__zcbProbe
+   * // { calls: 3, matched: 1, lastProvider: "zcode-bridge",
+   * //   lastSettingsNs: "zcode-bridge", keys: ["zcode-bridge"] }
+   * ```
+   *
+   * ⚠ 这是**诊断设施**，不是功能代码：只累积计数与字符串，不持有 DOM 引用
+   *（持有会阻止卡片卸载时回收）。开销可忽略（每张卡片每次渲染一次）。
+   */
+  const probe = ((): ZcbProbe => {
+    const w = globalThis as unknown as { __zcbProbe?: ZcbProbe };
+    if (w.__zcbProbe === undefined) {
+      w.__zcbProbe = { calls: 0, matched: 0, keys: [], lastProvider: undefined, lastSettingsNs: undefined };
+    }
+    return w.__zcbProbe;
+  })();
+  probe.calls += 1;
+  probe.lastProvider = props?.provider?.provider;
+  probe.lastSettingsNs = props?.provider?.settingsNs;
+  if (typeof probe.lastProvider === "string" && !probe.keys.includes(probe.lastProvider)) {
+    probe.keys.push(probe.lastProvider);
+  }
+
   if (!isOurCard(props, deps)) {
     return null;
   }
+  probe.matched += 1;
 
   installStyles();
 
@@ -553,6 +590,20 @@ export function renderModelToggles(
     { id: "models", label: "模型", content: modelPanel },
     { id: "accounts", label: "账号管理", content: accountPanel },
   ]);
+}
+
+/** 自检痕迹的形状（挂在 `window.__zcbProbe`）。 */
+interface ZcbProbe {
+  /** 组件被调用的总次数。 */
+  calls: number;
+  /** 其中判定为「我们的卡片」的次数。 */
+  matched: number;
+  /** 见过的所有 provider 名（判断 renderer 到底把哪些卡片递给了我们）。 */
+  keys: string[];
+  /** 最近一次拿到的 provider 名。 */
+  lastProvider: string | undefined;
+  /** 最近一次拿到的 settingsNs（这是 key 匹配的判据）。 */
+  lastSettingsNs: string | undefined;
 }
 
 /**
