@@ -1,6 +1,6 @@
 {
   "name": "dsh-free-glm",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "ZCode quota access for DSH: manage models and accounts from the Models settings page, with check-in and automatic claiming.",
   "type": "module",
   "main": "lib/index.js",
@@ -26,7 +26,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && node scripts/bundle-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node scripts/test-tool-bridge.mjs"
+    "test": "node scripts/test-tool-bridge.mjs",
+    "prepare": "pnpm run build"
   },
   "dsh": {
     "bundle": {
