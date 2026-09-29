@@ -47,11 +47,12 @@
 
 import { randomUUID } from "node:crypto";
 
-import { LlmAdapter, LlmError, attributionHeaders, ToolCallId } from "@deepseek-ai/dsh-llm";
+import { LlmAdapter, LlmError, attributionHeaders, ReasoningEffortId, ToolCallId } from "@deepseek-ai/dsh-llm";
 import type {
   GenerateOptions,
   LlmModelInfo,
   LlmProviderInfo,
+  LlmReasoningEffortInfo,
   LlmResolvedModelInfo,
   StreamChunk,
   ToolCallBlock,
@@ -139,6 +140,46 @@ export interface ZCodeBridgeAdapterOptions {
  * 太长则用户取消后要干等。
  */
 const DEFAULT_REQUEST_TIMEOUT_MS = 240_000;
+
+/**
+ * GLM-5.3 / GLM-5.3-Flash 在 z.ai 通道上的**可选思考档位**。
+ *
+ * ## 取值依据（两处独立证据）
+ *
+ * ① `E:\ZCode\resources\config\provider\zcode-builtin.json`
+ *    `config.modelConfigRules.modelRules[6]`
+ *      `modelMatch = .*glm-5\.3(?:-flash)?(?:[.\-:/\[].*)?`
+ *      `optionSpecs.reasoningLevel.values = ["low","high","max"]`
+ *
+ * ② 同文件 `modelApiRules[9]` —— 档位到线上字段的映射：
+ *    `reasoningLevel.map = { thinking:{type:"enabled"}, output_config:{effort:reasoningLevel} }`
+ *
+ * ## 展示名用官方中文
+ *
+ * 来自官方 asar 的 i18n 语料（`chat.toolbar.thoughtLevel.value.*`）。
+ * **不自造词** —— 用户在 ZCode 界面看到「最高」，在这里就该看到「最高」。
+ *
+ * ## 顺序
+ *
+ * 按**思考深度递增**排（低 → 高 → 最高），与官方选择器的呈现顺序一致。
+ */
+const ZCODE_REASONING_EFFORTS: readonly LlmReasoningEffortInfo[] = [
+  { id: ReasoningEffortId("low"), name: "低", description: "思考最浅，响应最快" },
+  { id: ReasoningEffortId("high"), name: "高", description: "平衡思考深度与响应速度" },
+  { id: ReasoningEffortId("max"), name: "最高", description: "思考最深（官方默认档）" },
+];
+
+/**
+ * 权益探测的单模型超时（毫秒）。
+ *
+ * 探测是 `max_tokens: 1` 的极小请求，正常应在数百毫秒内返回 —— 但**有权益**
+ * 的模型会真的走一趟上游（思考链也可能被触发），故给足余量。
+ *
+ * ⚠ 超时**不等于**无权益：超时按「保守放行」处理（见 `probeModelEntitlement`），
+ *   所以这个值偏大是安全的 —— 最坏情况只是模型选择器多列一个模型，
+ *   而偏小会让好模型在实例繁忙时被误剔出目录。
+ */
+const PROBE_TIMEOUT_MS = 20_000;
 
 /**
  * ★★★ 可见输出的最小 token 预算（2026-09-28）。
@@ -602,6 +643,19 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
   private lastEnsureAt = 0;
   private lastEnsureOk = false;
 
+  /**
+   * 本次 `stream()` 请求的模型 id。
+   *
+   * ⚠ 空回复的错误文案需要报出**是哪个模型**无权益 —— 多模型 provider 下
+   * 「换个模型」是唯一的处置动作，不报模型名等于让用户自己猜。
+   *
+   * 存成字段而不是透传参数：`consumeSse` / 空回复判据都在 `stream()` 的
+   * 调用链深处，逐层加参数会污染一串与模型无关的函数签名。
+   * 并发请求下本字段可能被另一请求覆盖 —— 但代价仅是错误文案里的模型名
+   * 不精确（判据本身只用耗时，不依赖本字段），可以接受。
+   */
+  private lastRequestedModelId: string | undefined;
+
   constructor(options: ZCodeBridgeAdapterOptions = {}) {
     super();
     this.product = options.product ?? ZCODE_BRIDGE;
@@ -1033,9 +1087,132 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
       return false;
     }
     this.lastResolvedSource = endpoint.source;
-    this.advertisedModelIds =
+    const advertised =
       endpoint.models.length > 0 ? new Set(endpoint.models) : undefined;
+    // 按权益过滤 —— 见下方 `probeEntitlements()` 的说明。
+    this.advertisedModelIds = await this.filterByEntitlement(advertised);
     return true;
+  }
+
+  /**
+   * 剔除**当前账号无权益**的模型。
+   *
+   * ## 为什么必须做（2026-09-29 实测）
+   *
+   * 桥硬编码播报 `["GLM-5.3", "GLM-5.3-Flash"]`，但**账号权益不覆盖全部**：
+   *
+   * ```
+   * entitlement_id: "zcode-v3-start-plan-trust-0929-1"
+   * show_name:      "GLM-5.3-Flash"          ← 权益只挂了这一个
+   *
+   * POST /v1/chat/completions {model:"GLM-5.3"}       → 12/12 次 ~160ms 空响应
+   * POST /v1/chat/completions {model:"GLM-5.3-Flash"} → 正常返回
+   * ```
+   *
+   * `GLM-5.3` 的请求在壳日志里**从未出现** `provider runtime headers` 请求，
+   * 而 Flash 每次都完整走 —— 即实例拿不到该模型的鉴权材料，**根本没发往上游**。
+   *
+   * ## 为什么在适配器侧探测而不是让桥报
+   *
+   * 桥的 `ALLOWED_MODELS` 是编译期常量，改它要动壳侧源码并重打包；
+   * 而权益是**账号属性**，同一份桥在不同账号下边界不同 —— 只有运行时探测
+   * 才能反映真实边界。探测成本极低（loopback，实测 ~160ms/模型）。
+   *
+   * ## 探测失败的处置
+   *
+   * ⚠ **探测出错时保守放行全部模型**（返回原集合），不因探测本身故障而
+   * 让模型选择器变空 —— 那会让整个 provider 从设置页消失，比"多列一个
+   * 用不了的模型"严重得多。
+   */
+  private async filterByEntitlement(
+    advertised: Set<string> | undefined,
+  ): Promise<Set<string> | undefined> {
+    const candidates = [...(advertised ?? new Set(MODELS.map((m) => m.id)))];
+    if (candidates.length <= 1) {
+      // 只有一个候选时无需探测（没有"换一个"的余地，过滤也没意义）。
+      return advertised;
+    }
+    const usable: string[] = [];
+    for (const id of candidates) {
+      if (await this.probeModelEntitlement(id)) {
+        usable.push(id);
+      }
+    }
+    if (usable.length === 0) {
+      // 全不可用：可能是探测链路本身的问题（桥刚起、实例忙）。
+      // 保守放行全部，让用户在真实请求时拿到精确错误。
+      this.logger?.warn?.(
+        `[zcode-bridge] 权益探测：${candidates.length} 个模型全部无响应，保守放行全部`,
+      );
+      return advertised;
+    }
+    if (usable.length < candidates.length) {
+      const dropped = candidates.filter((id) => !usable.includes(id));
+      this.logger?.info?.(
+        `[zcode-bridge] 权益探测：已从模型目录移除无权益的 ${dropped.join(", ")}`
+          + `（保留 ${usable.join(", ")}）`,
+      );
+    }
+    return new Set(usable);
+  }
+
+  /**
+   * 探测单个模型是否有权益 —— 发一次**最小**请求，看是否秒回空内容。
+   *
+   * ⚠ 判据是**「秒回 + 空」的组合**，不是「空」本身：
+   *   - 秒回（<3s）且空 ⇒ 实例没发出请求（无权益）
+   *   - 慢回且空     ⇒ 会话链路卡住（有权益但链路故障，不该从目录里剔除）
+   *
+   * 与 `EMPTY_REPLY_FAST_MS` 同一判据 —— 两者必须保持一致，否则会出现
+   * 「目录里还在、但选中就报无权益」的不一致。
+   *
+   * ⚠ 探测请求要**尽可能小**（`max_tokens: 1`）：这只是问"能不能起来"，
+   *   不是要答案。真实用户额度有限，探测不该消耗可见额度。
+   */
+  private async probeModelEntitlement(modelId: string): Promise<boolean> {
+    const endpoint = await resolveLiveBridgeEndpoint();
+    if (endpoint === undefined) {
+      return false;
+    }
+    const startedAt = Date.now();
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
+      let response: Response;
+      try {
+        response = await fetch(`${endpoint.baseUrl}${CHAT_COMPLETIONS_PATH}`, {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            authorization: `Bearer ${endpoint.token}`,
+          },
+          body: JSON.stringify({
+            model: modelId,
+            messages: [{ role: "user", content: "hi" }],
+            max_tokens: 1,
+            stream: false,
+          }),
+          signal: controller.signal,
+        });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!response.ok) {
+        // HTTP 层报错（401/429/5xx）不代表无权益 —— 保守放行。
+        return true;
+      }
+      const payload = (await response.json()) as BridgeChatResponse;
+      const text = extractText(payload);
+      const calls = payload.choices?.[0]?.message?.tool_calls;
+      if (text.length > 0 || (Array.isArray(calls) && calls.length > 0)) {
+        return true;
+      }
+      // 空内容：按耗时判 —— 秒回即无权益。
+      return Date.now() - startedAt >= EMPTY_REPLY_FAST_MS;
+    } catch {
+      // 超时/网络异常都不该让模型消失 —— 保守放行，让真实请求去报错。
+      return true;
+    }
   }
 
   /** 解析单个模型的能力与窗口。 */
@@ -1057,6 +1234,48 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     if (known?.maxTokens !== undefined) {
       resolved.defaultMaxTokens = known.maxTokens;
     }
+    /**
+     * ★ 声明可选思考档位（2026-09-29 实测驱动）。
+     *
+     * ## 为什么必须声明
+     *
+     * DSH 的档位选择器**只从 `resolveModel().reasoning` 渲染** ——
+     * 不声明就等于用户完全看不到这个模型有档位可调。
+     *
+     * ## 档位取值来自官方，不是我们编的
+     *
+     * 证据链（两处独立来源，互相印证）：
+     *
+     * ① `E:\ZCode\resources\config\provider\zcode-builtin.json`
+     *    `config.modelConfigRules.modelRules[6]`
+     *      modelMatch = `.*glm-5\.3(?:-flash)?(?:[.\-:/\[].*)?`
+     *      optionSpecs.reasoningLevel.values = `["low","high","max"]`
+     *
+     * ② 同文件 `modelApiRules[9]`（档位的**线上映射**）：
+     *      `reasoningLevel.map = { thinking:{type:"enabled"},
+     *                              output_config:{effort:reasoningLevel} }`
+     *
+     * ## 中文名与官方界面一致
+     *
+     * 官方 asar 的 i18n 语料（`chat.toolbar.thoughtLevel.value.*`）里
+     * `low`/`high`/`max` 对应「低 / 高 / 最高」。**用官方词，不自造**
+     * —— 用户在 ZCode 里看到什么，在这里就看到什么。
+     *
+     * ## 默认档 = max
+     *
+     * 两个独立证据：
+     *   - 壳日志 `modelCurrent` 形如 `...GLM-5.3-Flash$max`
+     *   - 桥的会话链路**硬编码** `deps.reasoningLevel ?? "max"`
+     *     （`zcodeBridgeServer.ts`）—— 即不指定时上游就是按 max 跑
+     *
+     * ⚠ **不要臆造 `supportsDisable`** —— DSH 的 `LlmModelReasoningInfo`
+     *   只有 `efforts` 与 `defaultEffort` 两个字段，「能否关闭思考」在契约里
+     *   不存在这个概念（已全量 grep 确认）。
+     */
+    resolved.reasoning = {
+      efforts: ZCODE_REASONING_EFFORTS,
+      defaultEffort: ReasoningEffortId("max"),
+    };
     return resolved;
   }
 
@@ -1104,6 +1323,19 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
    * finish 之后不得再 yield。
    */
   async *stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    /**
+     * 本次请求的起始时刻。
+     *
+     * ⚠ 用于**区分空回复的两种成因**（见 `EMPTY_REPLY_FAST_MS`）：
+     *   - 秒回（<3s）⇒ 模型无权益，实例拿不到鉴权材料
+     *   - 慢回（≈180s）⇒ 会话链路卡住
+     * 两者的错误分类与处置**完全不同**，旧代码因无法区分而统一报后者，
+     * 把用户引向"重启实例"这个无效方向。
+     */
+    const callStartedAt = Date.now();
+    // 记下模型 id 供空回复文案使用（见字段注释）。
+    this.lastRequestedModelId = options.model;
+
     // 1. 解析端点。缺失即明确报错 —— stream 是请求路径，
     //    静默产空流会让用户看到"模型不说话"而无从排查。
     //
@@ -1372,6 +1604,40 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     }
     if (opts["thinking"] !== null && typeof opts["thinking"] === "object") {
       body.thinking = opts["thinking"];
+    }
+    /**
+     * ★ 思考档位透传（2026-09-29 实测驱动）。
+     *
+     * ## 为什么必须和 `resolveModel().reasoning` 一起做
+     *
+     * 两者是**一条链的两端**，缺任何一端都无效：
+     *   - 只声明 `reasoning` → 用户能看到档位选择器，选了之后值被**静默丢弃**
+     *   - 只透传不给声明 → 用户根本没有选择器，透传逻辑永远收不到值
+     *
+     * ## ⚠ 两侧字段名不同，这里就是翻译层
+     *
+     * | 侧 | 字段名 | 证据 |
+     * |---|---|---|
+     * | DSH | `reasoningEffort` | `@deepseek-ai/dsh-llm` 的 `GenerateOptions` |
+     * | 桥 | **`reasoningLevel`** | `zcodeBridgeServer.ts` 的两处诊断端点读 `body["reasoningLevel"]` |
+     *
+     * 名字不一样**不是笔误**：`reasoningLevel` 是官方
+     * `zcode-builtin.json` 的配置字段名（桥沿用），`reasoningEffort`
+     * 是 DSH 的契约名。中间层负责翻译，**不要求两边改名**
+     *（改桥要动壳侧源码并重打包，代价远高于这里加一行映射）。
+     *
+     * ## 为什么原样透传档位值、不做二次映射
+     *
+     * 桥按官方 `modelApiRules[9]` 把档位翻成线上字段：
+     *   `reasoningLevel.map = { thinking:{type:"enabled"},
+     *                           output_config:{effort:reasoningLevel} }`
+     * 我们在这里再映射一次只会造成两处不一致。档位集合由
+     * `resolveModel()` 声明（`low`/`high`/`max`），桥负责翻译。
+     *
+     * ⚠ 类型是 branded string，运行时就是普通字符串。
+     */
+    if (typeof opts["reasoningEffort"] === "string" && (opts["reasoningEffort"] as string).length > 0) {
+      body.reasoningLevel = opts["reasoningEffort"];
     }
 
     // 3. 发请求（带超时 + 取消传播）。
@@ -1662,12 +1928,13 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
     if (text.length === 0 && !hasNativeToolCalls) {
       const finish = payload.choices?.[0]?.finish_reason;
       throw new LlmError(
-        "zcode-bridge: 桥返回了空回复"
-          + (typeof finish === "string" && finish.length > 0 ? `（finish_reason=${finish}）` : "")
-          + "。常见原因：ZCode 实例的会话链路卡住并触发了 180 秒超时"
-          + "（看壳日志里的 bridge.chat.completed：durationMs 接近 180000 且 textLength 为 0）。"
-          + "可尝试重启 ZCode 实例。",
-        "SERVER",
+        describeEmptyReply({
+          finish,
+          elapsedMs: Date.now() - callStartedAt,
+          model: this.lastRequestedModelId,
+          ok: true,
+        }),
+        emptyReplyCode(Date.now() - callStartedAt),
       );
     }
 
@@ -1717,9 +1984,16 @@ export class ZCodeBridgeAdapter extends LlmAdapter {
       // 此时保留原文当普通回复，总比发一个空回合好。
       const fallback = text.trim().length > 0 ? text : "";
       if (fallback.length === 0) {
+        // 与上面那处共用同一判据：秒回 ⇒ 无权益，慢回 ⇒ 链路卡住。
+        // （本处是"解析后为空"，成因与"桥直接回空"同源，处置也相同。）
         throw new LlmError(
-          "zcode-bridge: 桥返回了空回复（解析后无可呈现内容）。可尝试重启 ZCode 实例。",
-          "SERVER",
+          describeEmptyReply({
+            finish: payload.choices?.[0]?.finish_reason,
+            elapsedMs: Date.now() - callStartedAt,
+            model: this.lastRequestedModelId,
+            ok: true,
+          }),
+          emptyReplyCode(Date.now() - callStartedAt),
         );
       }
     }
@@ -1822,4 +2096,92 @@ function httpErrorCodeForBridge(status: number): string {
     return "SERVER";
   }
   return "BAD_REQUEST";
+}
+
+/**
+ * 「快速空回复」的耗时阈值（毫秒）。
+ *
+ * ## 为什么需要这个判据（2026-09-29 实测驱动）
+ *
+ * 空回复有**两种成因完全不同**的形态，而旧代码把它们混为一谈，统一报
+ * 「会话链路卡住并触发了 180 秒超时，可尝试重启实例」—— 于是**把用户
+ * 引向错误的方向**（重启实例解决不了权益问题）。
+ *
+ * | 成因 | 耗时 | 日志特征 | 正确处置 |
+ * |---|---|---|---|
+ * | 会话链路卡住 | **接近 180000ms** | `durationMs≈180000, textLength:0` | 重启实例 |
+ * | **模型无权益** | **150-200ms** | 只有 `bridge.chat.completed`，**没有** `provider runtime headers` 请求 | 换模型 |
+ *
+ * 第二种的实测证据（本机 2026-09-29，账号权益 `zcode-v3-start-plan-trust-0929-1`
+ * 的 `show_name` 只有 `GLM-5.3-Flash`）：
+ *
+ * ```
+ * POST /v1/chat/completions {model:"GLM-5.3"}        → 12 次全部 ~160ms, textLength:0
+ * POST /v1/chat/completions {model:"GLM-5.3-Flash"}  → 正常返回内容
+ *
+ * 壳日志里 GLM-5.3 的请求**从未出现** "收到 ZCode provider runtime headers 请求"，
+ * 而 Flash 每次都完整走：收到 headers 请求 → 捕获 auth 材料 → headers 已应用。
+ * ```
+ *
+ * ⇒ 桥拿不到该模型的 auth 材料，立刻回一个空 content，**根本没过 captcha**。
+ * 这个「秒回 + 空」的组合是无权益的**指纹**。
+ *
+ * 取值 3000ms：远高于实测的 200ms，又远低于卡住形态的 180000ms，
+ * 中间留足余量以容纳慢机器上的瞬时抖动。
+ */
+const EMPTY_REPLY_FAST_MS = 3_000;
+
+/**
+ * 判定空回复的错误分类。
+ *
+ * ⚠ **`QUOTA_EXCEEDED` 而非 `SERVER`**：后者在 harness 的
+ * `DEFAULT_RETRYABLE_CODES` 里（`[EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT]`），
+ * 会让「这个模型你的账号没权益」这种**确定性**错误被白重试 5 次
+ * （500/1000/2000/4000/8000 ≈ 15.5 秒）—— 重试再多次也不会有权益。
+ *
+ * 与本仓库 `buddy-adapter.ts` / `cline-adapter.ts` / qoder 的
+ * `110 billing` 处理同思路：**确定性失败必须归为不可重试**。
+ */
+function emptyReplyCode(elapsedMs: number): string {
+  return elapsedMs < EMPTY_REPLY_FAST_MS ? "QUOTA_EXCEEDED" : "SERVER";
+}
+
+/**
+ * 构造空回复的错误文案 —— **按耗时区分成因**，给出可执行的处置。
+ *
+ * 见 {@link EMPTY_REPLY_FAST_MS} 的说明：两种形态的处置完全不同，
+ * 文案必须让用户一眼看出该做哪件事。
+ */
+function describeEmptyReply(input: {
+  finish: unknown;
+  elapsedMs: number;
+  model: string | undefined;
+  ok: boolean;
+}): string {
+  const finishSuffix =
+    typeof input.finish === "string" && input.finish.length > 0
+      ? `（finish_reason=${input.finish}）`
+      : "";
+  const modelLabel = input.model === undefined ? "该模型" : `模型「${input.model}」`;
+
+  if (input.elapsedMs < EMPTY_REPLY_FAST_MS) {
+    // 秒回 + 空 ⇒ 无权益（见 EMPTY_REPLY_FAST_MS）
+    return (
+      `zcode-bridge: ${modelLabel}无可用权益${finishSuffix}`
+      + `（${input.elapsedMs}ms 秒回空内容）。`
+      + "ZCode 实例拿不到该模型的鉴权材料，请求未真正发往上游。"
+      + "常见原因：当前账号的免费额度只覆盖部分模型"
+      + "（例如权益只含 GLM-5.3-Flash 而不含 GLM-5.3）。"
+      + "处置：改用账号权益覆盖的模型。"
+      + "可在 ZCode 客户端里查看当前套餐包含哪些模型。"
+    );
+  }
+
+  return (
+    "zcode-bridge: 桥返回了空回复"
+    + finishSuffix
+    + "。常见原因：ZCode 实例的会话链路卡住并触发了 180 秒超时"
+    + "（看壳日志里的 bridge.chat.completed：durationMs 接近 180000 且 textLength 为 0）。"
+    + "可尝试重启 ZCode 实例。"
+  );
 }

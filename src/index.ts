@@ -32,7 +32,7 @@ import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
 import { ZCodeBridgeAdapter } from "./adapter.js";
-import { PROVIDER } from "./product.js";
+import { MODELS, PROVIDER } from "./product.js";
 import { ModelVisibility } from "./model-visibility.js";
 import { probeBridge, resolveBridgeEndpoint, resolveLiveBridgeEndpoint } from "./bridge-endpoint.js";
 import {
@@ -44,6 +44,7 @@ import {
   type ClaimData,
 } from "./bridge-ops.js";
 import { createQuotaGuard, type QuotaGuard } from "./quota-guard.js";
+import { autoClaimState, registerZcodeBridgeRpc } from "./bridge-rpc.js";
 import {
   installInstanceLifecycleHooks,
   killOwnedInstance,
@@ -903,6 +904,44 @@ export async function apply(ctx: Context): Promise<void> {
       settingsNs: SETTINGS_NS,
       settingsPath: [],
     },
+    /**
+     * ★ 声明式镜像 route（2026-09-29 新增）。
+     *
+     * ## 为什么必须在这里也声明一次
+     *
+     * `syncDeclarativeMirror()` 只是把配置**写进** settings 的
+     * `llm-pi-ai.providers.zcode-free` —— 但**写不等于声明**。
+     * 官方的 `joinProviderDirectory()` 对"已注册但未声明"的 route 一律给
+     * `settingsNs: ""`：
+     *
+     * ```js
+     * for (const provider of registered) {
+     *   if (declared.has(provider.id)) continue;
+     *   rows.push({ provider: provider.id, displayName: provider.name,
+     *               settingsNs: "", settingsPath: [], active: true });   // ← 空串
+     * }
+     * ```
+     *
+     * 而 `settingsNs` 为空串的 route 在设置页里**渲染不出编辑器**
+     *（没有可寻址的配置段）。所以必须在这里把镜像 route 也登记进
+     * `registerConfigurableProviders`，并给出它真实的 settings 地址
+     * `["providers", MIRROR_ROUTE]`（相对 `llm-pi-ai` 命名空间）。
+     *
+     * ## 与第一个条目的分工
+     *
+     * | provider | settingsNs | settingsPath | 设置页表现 |
+     * |---|---|---|---|
+     * | `zcode-bridge`（插件注册） | `zcode-bridge` | `[]` | 卡片可显示；**扩展槽**承载我们的 UI |
+     * | `zcode-free`（声明式镜像） | `llm-pi-ai` | `["providers","zcode-free"]` | **官方原生**可编辑卡片 |
+     *
+     * 两者共存不冲突：route id 不同，各自注册各自的 adapter。
+     */
+    {
+      provider: MIRROR_ROUTE,
+      displayName: "ZCode Bridge (声明式)",
+      settingsNs: "llm-pi-ai",
+      settingsPath: ["providers", MIRROR_ROUTE],
+    },
   ]);
 
   const adapter = new ZCodeBridgeAdapter({
@@ -919,6 +958,61 @@ export async function apply(ctx: Context): Promise<void> {
 
   llm.registerAdapter([PROVIDER], adapter);
   adapter.start();
+
+  /**
+   * ★ 声明式镜像 provider（2026-09-29 新增）。
+   *
+   * ## 为什么要额外声明一个 provider
+   *
+   * 插件注册的 `zcode-bridge` 在模型设置页里**没有 settings 地址**
+   *（`joinProviderDirectory` 给已注册未声明的 route 一律 `settingsNs: ""`），
+   * 于是官方的编辑器渲染不出来、扩展槽也认领不到那张卡片。
+   *
+   * 而 `llm-pi-ai` 的**声明式 provider** 天然有这个地址 —— 它由 settings
+   * 驱动，`providers.<route>` 就是可编辑的配置，卡片、编辑器、模型列表
+   * 全部由官方原生渲染。
+   *
+   * ## ⚠ 必须换新 id（不能复用 zcode-bridge）
+   *
+   * `dsh-llm/lib/index.js` 的 `registerAdapter`：
+   *
+   * ```js
+   * if (unique.has(provider) || this.adapters.has(provider) && !owned.has(provider))
+   *   throw new LlmError(`an adapter for provider "${provider}" is already registered`,
+   *                      "DUPLICATE_ADAPTER");
+   * ```
+   *
+   * 插件已经注册了 `zcode-bridge`，再声明同名 route 会**抛 DUPLICATE_ADAPTER**
+   *（而且是启动期直接抛，不在 try 里 —— 会打断整个 profile 加载）。
+   * 故声明用 `zcode-free`（满足官方 `ROUTE_PATTERN`
+   * `/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/`）。
+   *
+   * ## 两个 provider 的分工
+   *
+   * | route | 来源 | 特点 |
+   * |---|---|---|
+   * | `zcode-bridge` | 插件 `registerAdapter` | 功能全（工具透传、思考档位、流式），但卡片无编辑器 |
+   * | `zcode-free` | `llm-pi-ai` 声明 | 官方原生卡片与编辑器，走同一座桥 |
+   *
+   * 两者**共用同一座桥**，只是入口不同 —— 用户可以按习惯选。
+   *
+   * ## 为什么要动态写
+   *
+   * 桥用 `server.listen({ port: 0 })` 由**系统分配端口**，且没有环境变量可固定
+   *（实测 `zcodeBridgeServer.ts` 只有 body/concurrency/backoff 等开关，无 PORT）。
+   * 因此 `baseURL` 每次都不同 —— 静态写死在 `cordis.patch.yml` 里一重启就失效。
+   *
+   * 好在 `providers` 是 `.volatile()` 字段
+   *（`dsh-llm-pi-ai/lib/index.js`：`z.dict(profile).default({}).volatile()`），
+   * **写下去即生效，不需要重启 DSH**。
+   *
+   * ⚠ 本函数**只尽力而为**：写失败只 warn，绝不影响主 provider 工作。
+   */
+  void syncDeclarativeMirror(ctx).catch((error: unknown) => {
+    ctx.logger?.warn?.(
+      `[zcode-bridge] 声明式镜像 provider 同步失败（不影响 zcode-bridge 本身）：${String(error)}`,
+    );
+  });
 
   ctx.effect(() => () => {
     adapter.dispose();
@@ -988,6 +1082,32 @@ export async function apply(ctx: Context): Promise<void> {
     quotaGuard.stop();
   });
   registeredQuotaGuard = quotaGuard;
+
+  /**
+   * ★ 设置页的账号 RPC（2026-09-29 新增）。
+   *
+   * 客户端 UI（设置 → 模型 → 本 provider 卡片 → 账号管理 tab）的三个按钮
+   * 跑在**浏览器**里，而它们要做的三件事都只能在 Host 侧完成：
+   *
+   *   - 添加账号 → `requestCliLogin()`（调实例的 `/oauth/cli-login`）
+   *   - 签到     → `requestClaim()`（调实例的 `/diagnostics/claim`）
+   *   - 持续领取 → 查询下方这个 `quotaGuard` 的运行状态
+   *
+   * 通道形态照抄 `dsh-codearts-auth`（`connection.fetch.register` → `/api/<ns>`），
+   * **不自己发明协议**。
+   */
+  registerZcodeBridgeRpc(ctx);
+
+  /**
+   * 把持续领取的运行状态同步给 RPC。
+   *
+   * ⚠ 判据是**配置**而不是「guard 对象存在」：`quotaGuardDisabled` 为真时
+   *   guard 依然被创建（`createQuotaGuard` 内部据配置决定是否真跑），
+   *   所以只看对象存在会把「已关闭」误报成「运行中」。
+   *
+   * 设置页改了这个开关后需重载插件才生效 —— 与其它配置项一致。
+   */
+  autoClaimState.running = bridgeConfig?.quotaGuardDisabled !== true;
 
   /**
    * ★ 注册斜杠命令（2026-09-28 新增）—— 这才是「用户点一下」的正确载体。
@@ -1292,3 +1412,137 @@ function registerSlashCommands(ctx: Context): void {
  * 挂成静态属性是两种传法下都成立的写法，因此无副作用地消除这个不确定性。
  */
 apply.Config = Config;
+
+/**
+ * 声明式镜像 provider 的 route id。
+ *
+ * ⚠ **不能等于 `PROVIDER`（`zcode-bridge`）** —— 那个 route 已被
+ * `llm.registerAdapter` 占用，再声明会抛 `DUPLICATE_ADAPTER`。
+ * 详见 `apply()` 里调用点的长注释。
+ *
+ * 命名满足官方 `ROUTE_PATTERN` `/^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$/`，
+ * 且派生出的凭据 ref 是合法的 POSIX 标识符：`ZCODE_FREE_API_KEY`
+ *（官方 `deriveKeyRef`：大写 + 非字母数字段替换为 `_`）。
+ */
+const MIRROR_ROUTE = "zcode-free";
+
+/** 镜像 provider 用的凭据 ref。 */
+const MIRROR_KEY_REF = "ZCODE_FREE_API_KEY";
+
+/**
+ * 把当前桥的地址写进 `llm-pi-ai.providers.zcode-free`。
+ *
+ * ## 为什么是「同步」而不是「一次性写入」
+ *
+ * 桥每次重启都换端口（`server.listen({ port: 0 })`），所以这不是一次性配置 ——
+ * 每次插件加载（通常伴随壳重启）都要按**当前**端口重写一次。
+ * 因为 `providers` 是 `.volatile()`，重写即生效，无需重启 DSH。
+ *
+ * ## ⚠ 不写凭据（token）的原因
+ *
+ * `apiKeyEnv` 指向的凭据需要 `credentials.set(ref, token)` 写入。本函数
+ * **刻意不做**这件事，理由是：
+ *
+ *   1. `ctx.credentials` 的写入面在不同 DSH 版本间有差异，写错会污染
+ *      整个凭据库（而这是用户级持久数据，不是可重建的缓存）；
+ *   2. 桥的 token 是**每次启动随机生成**的（`randomBytes(24)`），
+ *      与端口同生命周期 —— 意味着每轮都要重写，风险面比收益大；
+ *   3. 镜像 provider 是**便利入口**，主入口 `zcode-bridge` 已完整可用。
+ *
+ * 因此本函数只声明 profile（含 `apiKeyEnv` 引用名），token 由用户在
+ * 设置页填入或由后续版本补上 —— **声明本身不会破坏任何现有功能**。
+ *
+ * ## 失败语义
+ *
+ * 全程 try/catch，任何一步失败都只 warn。**镜像 provider 不可用绝不该
+ * 影响 `zcode-bridge`** —— 后者才是主力路径。
+ */
+async function syncDeclarativeMirror(ctx: Context): Promise<void> {
+  const settings = ctx.get("settings") as
+    | {
+        describe?: () => readonly { ns: string; revision?: number }[];
+        mutate?: (
+          ns: string,
+          ops: readonly { op: "set" | "unset"; path: readonly string[]; value?: unknown }[],
+          expectedRevision?: number,
+        ) => Promise<unknown>;
+      }
+    | undefined;
+
+  if (settings === undefined || typeof settings.mutate !== "function") {
+    ctx.logger?.warn?.(
+      "[zcode-bridge] settings 服务不可用，跳过声明式镜像 provider"
+      + "（主体功能不受影响）",
+    );
+    return;
+  }
+
+  // 解析当前桥地址 —— 端口每次重启都变，必须现读。
+  const endpoint = await resolveLiveBridgeEndpoint();
+  if (endpoint === undefined) {
+    ctx.logger?.warn?.(
+      "[zcode-bridge] 桥当前不可达，跳过声明式镜像 provider（壳启动后重载插件即可补上）",
+    );
+    return;
+  }
+
+  /**
+   * 模型列表取**桥当前播报的**，与适配器同一数据源。
+   *
+   * ⚠ 这里刻意**不做权益过滤**：镜像 provider 的模型集合应与桥播报一致，
+   *   而"哪些有权益"由 `zcode-bridge` 的适配器在请求时判定（秒回空 →
+   *   `QUOTA_EXCEEDED`）。两处各过滤一次会让两个入口的模型列表不一致，
+   *   用户会困惑"为什么同一座桥两处模型不一样"。
+   *
+   * 窗口/上限取自 `MODELS` 兜底表 —— 那是本仓库**唯一**的静态能力真相源
+   *（`adapter.resolveModel()` 用的也是它），不另造一份。
+   */
+  const models = (endpoint.models.length > 0 ? endpoint.models : ["GLM-5.3-Flash"]).map(
+    (id) => {
+      const known = MODELS.find((entry) => entry.id === id);
+      return {
+        id,
+        name: known?.name ?? id,
+        ...(known?.contextWindow === undefined ? {} : { contextWindow: known.contextWindow }),
+        ...(known?.maxTokens === undefined ? {} : { maxTokens: known.maxTokens }),
+        input: ["text"],
+      };
+    },
+  );
+
+  const revisionOf = (): number | undefined => {
+    try {
+      return settings.describe?.().find((row) => row.ns === "llm-pi-ai")?.revision;
+    } catch {
+      return undefined;
+    }
+  };
+
+  await settings.mutate(
+    "llm-pi-ai",
+    [
+      {
+        op: "set",
+        path: ["providers", MIRROR_ROUTE],
+        value: {
+          displayName: "ZCode Bridge (声明式)",
+          // ⚠ 声明引用名而非 token 值 —— 见函数注释「不写凭据的原因」。
+          apiKeyEnv: MIRROR_KEY_REF,
+          api: "openai-completions",
+          // 桥的 OpenAI 兼容端点在 `/v1` 下，故 baseURL 以 `/v1` 结尾。
+          // `discoverModels` 是**前缀拼接**（非 URL resolve），
+          // 故它会请求 `{baseURL}/models` = `http://127.0.0.1:<port>/v1/models`
+          // —— 正是桥的模型端点，格式天然匹配。
+          baseURL: `${endpoint.baseUrl}/v1`,
+          models,
+        },
+      },
+    ],
+    revisionOf(),
+  );
+
+  ctx.logger?.info?.(
+    `[zcode-bridge] 已声明镜像 provider「${MIRROR_ROUTE}」→ ${endpoint.baseUrl}/v1`
+    + `（${models.length} 个模型；它需要单独填一次凭据 ref ${MIRROR_KEY_REF}）`,
+  );
+}
