@@ -1,5 +1,18 @@
 # dsh-free-glm
 
+> ## ⛔ 已停止维护（2026-10-28 归档，只读）
+>
+> **为什么停**：ZCode 免费额度这条通道已由 [`dsh-our-free-model`](https://www.npmjs.com/package/dsh-our-free-model)
+> 覆盖 —— 该包的通道表里明确列着 ZCode / Qoder / CodeBuddy / WorkBuddy / Loomy / CodeArts 等
+> （实测 2026-09-27～10-26 月下载 18,576）。同一套账号体系下维护两份登录、续期、赔付逻辑没有意义。
+>
+> **代码停了，但这几个结论没过期**（被推翻了两个错误结论之后才测出来的，别再从零踩一遍）：
+> - 3012 的真根因是 **`system` 身份块的内容与结构**；「前缀是判据」与「3012 不可绕过」都已被实测推翻
+> - `LATENCY-FINDINGS.md` / `LIMITATIONS.md` / `JET-HUB-PR.md` 里的实测数据与失败面
+>
+> **还想用它**：归档只读，`git clone` 照常、代码照常能跑；但 DSH 后续版本可能破坏兼容，不再跟进修复。
+> 新的接入需求请走 `dsh-our-free-model`。
+
 **在 DSH（DeepSeek Harness）里免费用 GLM-5.3 —— 装完即用，无需 API Key。**
 
 把 ZCode 的**免费额度通道**（`account:bigmodel-start-plan`）接进 DSH，作为一个普通模型
