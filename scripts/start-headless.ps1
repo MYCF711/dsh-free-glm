@@ -36,8 +36,8 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$Electron = 'D:\DSH-WEB\ZCode-official\node_modules\electron\dist\electron.exe'
-$AppDir   = 'D:\DSH-WEB\ZCode-official\packages\desktop'
+$Electron = 'D:\dsh-WEB\ZCode-official\node_modules\electron\dist\electron.exe'
+$AppDir   = 'D:\dsh-WEB\ZCode-official\packages\desktop'
 if (-not $DataDir) { $DataDir = 'D:\zcode-glm5.3f\_oss_data' }
 $LogOut   = 'D:\zcode-glm5.3f\_oss_headless.log'
 $LogErr   = 'D:\zcode-glm5.3f\_oss_headless.err'
@@ -75,7 +75,7 @@ Remove-Item Env:\ZCODE_BRIDGE_MCP -ErrorAction SilentlyContinue
 #   - 壳（ZCode 实例）按这个变量决定**写**发现文件的位置；
 #   - DSH 里的插件按同一个变量决定**读**发现文件的位置。
 #   只在脚本进程内设 $env:（旧做法）时，DSH 进程读不到它 → 插件退回
-#   homedir()（C:\Users\Administrator\.zcode）→ 与壳写的路径对不上 → 
+#   homedir()（C:\Users\<user>\.zcode）→ 与壳写的路径对不上 → 
 #   插件永远认为"桥不可用" → provider 分组被隐藏 → 用户看不到 zcode-bridge。
 [Environment]::SetEnvironmentVariable('ZCODE_BRIDGE_ELECTRON_PATH', $Electron, 'User')
 [Environment]::SetEnvironmentVariable('ZCODE_BRIDGE_APP_DIR', $AppDir, 'User')

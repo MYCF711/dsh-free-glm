@@ -90,7 +90,7 @@ GLM-5.3 首次出现在 `17:09:00`（`pid:65968` 那次重启之后）—— 那
 证据②：配置里**硬编码**了默认模型 ——
 
 ```yaml
-# C:\Users\Administrator\AppData\Roaming\in.dsh-plug.dsh-launcher\homes\0.1.7-rc.2\profiles\web\cordis.patch.yml
+# <HOME>\AppData\Roaming\in.dsh-plug.dsh-launcher\homes\0.1.7-rc.2\profiles\web\cordis.patch.yml
 # 第 66-70 行
 - id: agent-default-model
   name: "@deepseek-ai/dsh-agent-default-model"

@@ -71,7 +71,7 @@ function dataDirCandidates(): string[] {
   // ── 顺序很重要：**检出目录优先于家目录**（2026-09-27 实测修正）──────
   //
   // 旧顺序是 `homedir()` 在最前，之后才轮到检出目录。后果实测过：
-  // 插件把壳启动到家目录，壳把发现文件写到 `C:\Users\Administrator\.zcode`，
+  // 插件把壳启动到家目录，壳把发现文件写到 `C:\Users\<user>\.zcode`，
   // 而 `D:\...\_oss_data` 里还留着上一个实例的旧文件 → 两份并存，
   // 端点解析挑错就触发保活误杀（进程树每 10-30 秒整体消失）。
   //
@@ -112,7 +112,7 @@ export function resolveDataBaseDir(): string {
     // 原实现直接 `return fromEnv`，从不验证那个目录里的发现文件是否新鲜。
     // 实测后果：环境变量指向 `D:\...\_oss_data`，里面躺着**上一个已死实例**
     // 写下的发现文件（端口已拒绝连接），而**当前活着的实例**把文件写在了
-    // `C:\Users\Administrator\.zcode`。`candidateDataDirs()` 把环境变量目录
+    // `C:\Users\<user>\.zcode`。`candidateDataDirs()` 把环境变量目录
     // 排在最前 → `readBridgePortFile()` 读到一个格式完全合法的过期对象 →
     // 立即返回 → 插件拿着死端口 → `probeBridge()` false → 保活判「壳死了」
     // → `killResidualInstances()` 杀掉**正在正常服务**的那个实例 → 死循环。
@@ -276,7 +276,7 @@ export function resolveBridgeEndpoint(): ZCodeBridgeEndpoint | undefined {
  *
  * 机器上可能同时存在**多份**发现文件：环境变量指向的目录里躺着**上一个
  * 已死实例**写下的文件，而**当前活着的实例**把文件写在了别处
- * （实测：`D:\...\_oss_data` 里是死端口 57653，`C:\Users\Administrator\.zcode`
+ * （实测：`D:\...\_oss_data` 里是死端口 57653，`C:\Users\<user>\.zcode`
  * 里是活端口 56483）。
  *
  * `resolveBridgeEndpoint()` 会返回**排在最前**的那个，不管它死没死。

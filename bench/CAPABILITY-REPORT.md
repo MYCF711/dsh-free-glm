@@ -220,7 +220,7 @@ node bench/verify-check.mjs                  # 判定器回归（含真实产出
 
 **入口存在**：
 ```
-D:\DSH-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs   (16.7MB, v0.16.9)
+<DSH_HOME>-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs   (16.7MB, v0.16.9)
 node <cli> -p "<任务>" --cwd <目录> --mode yolo --json
 ```
 

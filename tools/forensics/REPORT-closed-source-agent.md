@@ -2,7 +2,7 @@
 
 调查者：独立工程调查员（只读）
 时间：2026-09-27
-范围：`E:\zcoed\ZCode\resources\glm\zcode.cjs`（只读）、`D:\DSH-WEB\ZCode-official`（只读）、
+范围：`E:\zcoed\ZCode\resources\glm\zcode.cjs`（只读）、`<DSH_HOME>-WEB\ZCode-official`（只读）、
 `D:\zcode-glm5.3f\zcode-oss-patches\`（只读）
 
 ---
@@ -181,7 +181,7 @@ I = B.config.features.mcp === false ? void 0 : xmn({ idSalt: q ?? l.traceId, ...
 | `o.alicdn.com` | **0** | 无 SDK CDN 地址 |
 | `captchaVerifyParam` | **0** | 无参数构造 |
 
-对比开源版（`D:\DSH-WEB\ZCode-official\packages\ui\src\captcha\`）：
+对比开源版（`<DSH_HOME>-WEB\ZCode-official\packages\ui\src\captcha\`）：
 
 | 文件 | 行数 | captcha 命中行 |
 |---|---|---|
@@ -495,7 +495,7 @@ import {
 形态是 minify 后的 React 组件（开源版注释里叫 `Xtn`）。
 
 **开源版已经有完整的、可读的等价实现**：
-`D:\DSH-WEB\ZCode-official\packages\ui\src\captcha\`（5 个文件，1756 行，
+`<DSH_HOME>-WEB\ZCode-official\packages\ui\src\captcha\`（5 个文件，1756 行，
 含 `aliyunCaptchaProvider.ts` 1086 行）。
 这套代码**就是**从闭源版逆向+重写出来的（开源版作者在注释里写明"闭源里锚点由
 React 组件 `Xtn` 渲染（本模块的 `AliyunCaptchaAnchor.tsx`）"）。
@@ -624,7 +624,7 @@ AGENTS.md 已记录：「达到原生 API 速度 ❌ **物理不可能**（壳�
 AGENTS.md 记录：**同负载 A/B，3 并发 58.4 → 21.2 秒（省 64%）**。
 那是**并发调度**的功劳（补丁里的 `zcodeBridgeServer.ts` 队列）。
 壳内存 1275 → 949 MB（省 326 MB）是**禁用插件**的功劳，
-闸门在 `C:\Users\Administrator\.zcode\cli\config.json` 的 `plugins.enabledPlugins`。
+闸门在 `<HOME>\.zcode\cli\config.json` 的 `plugins.enabledPlugins`。
 
 **这两项都与"用哪个 agent 二进制"无关。**
 

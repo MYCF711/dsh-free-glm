@@ -64,7 +64,7 @@ locales / resources / .zcode-install-manifest / Uninstall ZCode.exe / uninstalle
 
 ### 1.2 开源版仓库 —— **有，且已构建好**
 
-**【实测】`D:\DSH-WEB\ZCode-official\package.json` 的 scripts 里有 CLI 相关项**：
+**【实测】`<DSH_HOME>-WEB\ZCode-official\package.json` 的 scripts 里有 CLI 相关项**：
 
 ```json
 "build:sea": "pnpm --dir apps/zcode-cli build:sea",
@@ -81,8 +81,8 @@ locales / resources / .zcode-install-manifest / Uninstall ZCode.exe / uninstalle
 **【实测】产物已存在，且是完整的 16.7 MB bundle**：
 
 ```
-D:\DSH-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs   16753187 字节
-D:\DSH-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\provider\zcode-builtin.json  186892 字节
+<DSH_HOME>-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs   16753187 字节
+<DSH_HOME>-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\provider\zcode-builtin.json  186892 字节
 ```
 
 **【实测】`node <该路径> --help` 输出（原文摘要）**：
@@ -185,7 +185,7 @@ sum= NaN          ← 期望 10
 
 ```powershell
 $env:ZCODE_ENV='production'
-$cli='D:\DSH-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs'
+$cli='<DSH_HOME>-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs'
 node $cli -p "Fix the off-by-one bug in sum.mjs so that node sum.mjs prints sum= 10. ..." --cwd <t1> --no-color
 ```
 
@@ -246,7 +246,7 @@ Line 91:   "account:bigmodel-start-plan",   // ALLOWED_PROVIDER_IDS 白名单首
 **【实测】运行痕迹证明 CLI 被大量使用过**：
 
 ```
-C:\Users\Administrator\.zcode\cli\
+<HOME>\.zcode\cli\
   db\db.sqlite          22454272 字节
   debug\                294 个 model-io-sess_*.jsonl
   exec\                 16 个 session 执行目录 + shell-snapshots
@@ -277,7 +277,7 @@ tools 数 | providerId                         | session 数
 ① `provider_config.json` 决定默认模型选择：
 
 ```
-C:\Users\Administrator\.zcode\v2\provider_config.json
+<HOME>\.zcode\v2\provider_config.json
   "defaultModelSelection": {
       "providerId": "account:bigmodel-individual-coding-plan",   ← ★ 就是它
       "modelId": "GLM-5.3"
@@ -569,16 +569,16 @@ foreach ($v in 'HTTPS_PROXY','HTTP_PROXY','ALL_PROXY','https_proxy','http_proxy'
 }
 $env:ZCODE_ENV = 'production'
 
-$cli = 'D:\DSH-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs'
+$cli = '<DSH_HOME>-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs'
 
 # 单次无头任务
-node $cli -p "你的任务描述" --cwd "D:\目标目录" --no-color
+node $cli -p "你的任务描述" --cwd "<TARGET>" --no-color
 
 # 机器可读输出
-node $cli -p "你的任务描述" --cwd "D:\目标目录" --json --no-color
+node $cli -p "你的任务描述" --cwd "<TARGET>" --json --no-color
 
 # 流式 JSON
-node $cli -p "你的任务描述" --cwd "D:\目标目录" --output-format stream-json --no-color
+node $cli -p "你的任务描述" --cwd "<TARGET>" --output-format stream-json --no-color
 
 # 诊查
 node $cli doctor --json
@@ -591,7 +591,7 @@ node $cli doctor --json
 
 ```powershell
 # 方向 A（未验证）：用 ~/.zcode 那套已被使用过的数据目录
-$env:ZCODE_DATA_BASE_DIR = 'C:\Users\Administrator\.zcode'
+$env:ZCODE_DATA_BASE_DIR = '<HOME>\.zcode'
 node $cli -p "..." --cwd "..." --no-color
 # 实测结果：Error: Model creation failed  （缺 ~/.zcode/v2/config.json 的 provider 段）
 
@@ -668,7 +668,7 @@ node $cli tui
 三条结论：
 
 **第一，入口有。** 原生 CLI 就在我们自己的开源版仓库里：
-`D:\DSH-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs`（v0.16.9），
+`<DSH_HOME>-WEB\ZCode-official\apps\zcode-cli\packages\cli\dist\zcode.cjs`（v0.16.9），
 `-p` 无头模式一行命令就能跑。`run-cli.ps1` 指向的官方版路径是个**不存在的死目标**，
 把脚本的 `$cli` 换成上面这个路径即可（但见第二点）。
 

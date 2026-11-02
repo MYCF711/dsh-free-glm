@@ -103,7 +103,7 @@ if (skipped > 0) {
 }
 
 console.log('\n=== 5. 退避参数（从源码确认，不依赖运行态）===')
-const src = readFileSync('D:/DSH-WEB/ZCode-official/packages/desktop/out/host/index.js', 'utf8')
+const src = readFileSync('D:/dsh-WEB/ZCode-official/packages/desktop/out/host/index.js', 'utf8')
 for (const [label, needle] of [
   ['连续失败阈值 3', 'BACKOFF_THRESHOLD'],
   ['基础冷却 60000ms', '60_000'],

@@ -477,7 +477,7 @@ DSH 是由 `dsh-launcher.exe` 这个**长驻进程**拉起的，它持有**创�
 
 **① 路径硬编码 → 动态探测**
 
-早先候选路径是**写死的绝对路径**（作者本机的 `D:\DSH-WEB\ZCode-official\...`）。
+早先候选路径是**写死的绝对路径**（作者本机的 `<DSH_HOME>-WEB\ZCode-official\...`）。
 别人装了 → 候选全不存在 → `resolveSpawnConfig()` 返回 undefined →
 **不报错、不提示**，只是 provider 分组永远空着。
 

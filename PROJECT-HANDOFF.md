@@ -51,7 +51,7 @@ D:\zcode-glm5.3f                     工作区（可写）
 ├── AGENTS.md                         DSH 会话自动读取的指令
 └── HANDOFF-CURRENT.md                上一版交接（部分内容已被本文件取代）
 
-D:\DSH-WEB\ZCode-official             开源版源码（已含全部改动）
+<DSH_HOME>-WEB\ZCode-official             开源版源码（已含全部改动）
 ├── packages\desktop\src\host\
 │   ├── zcodeBridgeServer.ts          ★ 桥的实现（HTTP 服务）
 │   └── index.ts                      ★ 桥的构造与接线
@@ -93,14 +93,14 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$($b.port)/v1/chat/complet
 ### 3.3 改壳源码后
 
 ```powershell
-cd D:\DSH-WEB\ZCode-official\packages\desktop
+cd <DSH_HOME>-WEB\ZCode-official\packages\desktop
 npx tsup --config tsup.config.ts          # 构建（约 1 秒）
 pwsh -File D:\zcode-glm5.3f\scripts\start-headless.ps1 -NoAutostart   # 重启
 ```
 
 **改了 `packages/services` 下的东西**要先：
 ```powershell
-cd D:\DSH-WEB\ZCode-official\packages\services
+cd <DSH_HOME>-WEB\ZCode-official\packages\services
 npx tsc -p tsconfig.json
 ```
 

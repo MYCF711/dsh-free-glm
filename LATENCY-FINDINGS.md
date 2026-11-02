@@ -237,10 +237,10 @@ duration=15691ms  queueWait=0ms  run=15691ms  并发上限=4  文本=1字
 
 **改动涉及两侧，都要重建重启：**
 
-### 壳侧（`D:\DSH-WEB\ZCode-official`）
+### 壳侧（`<DSH_HOME>-WEB\ZCode-official`）
 
 ```powershell
-cd D:\DSH-WEB\ZCode-official\packages\desktop
+cd <DSH_HOME>-WEB\ZCode-official\packages\desktop
 npx tsup --config tsup.config.ts          # 产出 out/host/index.js 等
 pwsh -File D:\zcode-glm5.3f\scripts\start-headless.ps1 -NoAutostart
 ```
@@ -692,7 +692,7 @@ Select-String -Path 'D:\zcode-glm5.3f\_oss_data\.zcode\v2\logs\2026-09-27.log' `
 
 ## 十二、内存：插件裁剪（**省 326 MB**，2026-09-27 第十三轮）
 
-**闸门不在代码里，在用户配置**：`C:\Users\Administrator\.zcode\cli\config.json`
+**闸门不在代码里，在用户配置**：`<HOME>\.zcode\cli\config.json`
 
 ```json
 {"plugins":{"enabledPlugins":{
@@ -1881,7 +1881,7 @@ const legacyRootSchema = z.object({
 }).passthrough();
 ```
 
-**③ 写入 `C:\Users\Administrator\.zcode\cli\config.json`**（已备份原文件）：
+**③ 写入 `<HOME>\.zcode\cli\config.json`**（已备份原文件）：
 
 ```json
 {
@@ -2413,7 +2413,7 @@ Today's date is YYYY-MM-DD.
 ### 资产位置（本项目）
 
 ```
-D:\DSH-WEB\ZCode-official\packages\desktop\src\host\zcode-official-identity.ts
+<DSH_HOME>-WEB\ZCode-official\packages\desktop\src\host\zcode-official-identity.ts
 ```
 含全部原文常量 + `buildOfficialSystemBlocks()`。
 

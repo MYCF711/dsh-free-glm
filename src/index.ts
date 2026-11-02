@@ -238,7 +238,7 @@ interface SpawnConfig {
  *
  * ## 为什么必须动态生成（2026-09-27 修正）
  *
- * 早先这里是**写死的绝对路径**（作者本机的 `D:\DSH-WEB\ZCode-official\...`）。
+ * 早先这里是**写死的绝对路径**（作者本机的 `D:\dsh-WEB\ZCode-official\...`）。
  * 后果：**任何别人装这个插件都会静默不可用** —— 三个候选全部不存在，
  * `resolveSpawnConfig()` 返回 `undefined`，插件不报错、不提示，
  * 只是 provider 分组永远空着（因为桥不可用就隐藏分组）。
@@ -327,7 +327,7 @@ function appDirCandidates(): string[] {
  *   launcher 环境块过期 → `ZCODE_DATA_BASE_DIR` 读不到
  *     → `firstExisting()` 命中 `homedir()`（它永远存在）
  *     → 插件**把壳启动到家目录**，壳把发现文件写到
- *       `C:\Users\Administrator\.zcode\v2\bridge-port.json`
+ *       `C:\Users\<user>\.zcode\v2\bridge-port.json`
  *     → 而 `D:\...\_oss_data\.zcode\v2\` 里还留着**上一个实例**的旧文件
  *     → 两份并存、一活一死，端点解析挑错就触发保活误杀
  *       （观测现象：实例进程树每 10-30 秒整体消失一次）
@@ -375,7 +375,7 @@ function dataDirCandidates(): string[] {
  *
  * 旧实现在候选表上跑 `firstExisting()` —— 只看**目录在不在**。
  * 实测后果：`homedir()` 永远存在 → 命中它 → 插件把壳启动到家目录 →
- * 壳把发现文件写到 `C:\Users\Administrator\.zcode\v2\bridge-port.json`，
+ * 壳把发现文件写到 `C:\Users\<user>\.zcode\v2\bridge-port.json`，
  * 而 `D:\...\_oss_data` 里还留着上一个实例的旧文件 → 两份并存、一活一死。
  *
  * ## 为什么不是「谁有 bridge-port.json 谁优先」（试过，**是错的**）
@@ -451,7 +451,7 @@ function resolveSpawnConfig(): SpawnConfig | undefined {
   // ⚠ dataBaseDir 必须用 `pickDataBaseDir()`（带「这里有 `.zcode` 数据」校验），
   //   不是 `firstExisting(dataDirCandidates())` ——
   //   旧用法只看"目录在不在"，而 `homedir()` 永远在 → 插件把壳启动到家目录
-  //   → 发现文件写到 `C:\Users\Administrator\.zcode\v2\`，
+  //   → 发现文件写到 `C:\Users\<user>\.zcode\v2\`，
   //   而 `D:\...\_oss_data\.zcode\v2\` 里还留着上一个实例的旧文件 → 两份并存。
   const autoDataBaseDir = pickDataBaseDir();
   const dataBaseDir =

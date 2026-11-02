@@ -28,7 +28,7 @@
  *
  * ## 本脚本做什么
  *
- * 用 **ZCode 仓库自带的 Electron**（`D:\DSH-WEB\ZCode-official\node_modules\electron`）
+ * 用 **ZCode 仓库自带的 Electron**（`D:\dsh-WEB\ZCode-official\node_modules\electron`）
  * 起一个**最小 App**（一个空窗口 + CDP），完全不含 ZCode 的任何代码，
  * 然后跑同一个 captcha 流程。
  *
@@ -44,7 +44,7 @@ import { join } from "node:path";
 const HEADLESS = process.argv.includes("--headless");
 const PORT = HEADLESS ? 9555 : 9556;
 const APP_DIR = "D:\\zcode-glm5.3f\\bench\\_minielectron";
-const ELECTRON = "D:\\DSH-WEB\\ZCode-official\\node_modules\\electron\\dist\\electron.exe";
+const ELECTRON = "D:\\dsh-WEB\\ZCode-official\\node_modules\\electron\\dist\\electron.exe";
 
 console.log(`模式: ${HEADLESS ? "headless" : "有头窗口"}`);
 console.log(`Electron: ${ELECTRON}  存在=${existsSync(ELECTRON)}`);

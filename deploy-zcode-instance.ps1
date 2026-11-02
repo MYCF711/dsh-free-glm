@@ -9,7 +9,7 @@
 #   4. 构建 desktop 包
 #
 # 用法：
-#   pwsh -File deploy-zcode-instance.ps1                    # 默认装到 D:\DSH-WEB\ZCode-official
+#   pwsh -File deploy-zcode-instance.ps1                    # 默认装到 D:\dsh-WEB\ZCode-official
 #   pwsh -File deploy-zcode-instance.ps1 -Target E:\ZCode   # 自定义位置
 #   pwsh -File deploy-zcode-instance.ps1 -SkipInstall       # 已有 node_modules 时跳过装依赖
 #
@@ -17,7 +17,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Target = 'D:\DSH-WEB\ZCode-official',
+    [string]$Target = 'D:\dsh-WEB\ZCode-official',
     [string]$Upstream = 'https://github.com/zai-org/ZCode.git',
     [switch]$SkipInstall,
     [switch]$SkipBuild

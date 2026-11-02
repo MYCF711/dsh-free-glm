@@ -35,7 +35,7 @@
 import { readFileSync } from 'node:fs'
 
 // ── 1. 从桥的源码里抽出真实参数（防止测试与实现漂移）──────────
-const src = readFileSync('D:/DSH-WEB/ZCode-official/packages/desktop/src/host/zcodeBridgeServer.ts', 'utf8')
+const src = readFileSync('D:/dsh-WEB/ZCode-official/packages/desktop/src/host/zcodeBridgeServer.ts', 'utf8')
 
 function grab(label, pattern) {
   const m = src.match(pattern)

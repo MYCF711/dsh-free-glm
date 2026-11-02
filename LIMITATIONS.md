@@ -151,7 +151,7 @@ captcha 只能在真实 Electron renderer 里产出（需要 DOM + 阿里云 CDN
 禁用插件（用于省内存）写的是：
 
 ```
-C:\Users\Administrator\.zcode\cli\config.json
+<HOME>\.zcode\cli\config.json
 ```
 
 **这个路径是用户级的**，官方闭源版 ZCode 若也读它，**它的插件也会一起被禁**。

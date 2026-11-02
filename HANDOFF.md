@@ -82,7 +82,7 @@ pwsh -File D:\zcode-glm5.3f\scripts\start-headless.ps1 -NoAutostart
 
 ### 3.3 内存：怎么省的（**这是本轮最大成果**）
 
-**闸门在 `C:\Users\Administrator\.zcode\cli\config.json`**（我创建的）：
+**闸门在 `<HOME>\.zcode\cli\config.json`**（我创建的）：
 
 ```json
 {"plugins":{"enabledPlugins":{
@@ -286,12 +286,12 @@ $ts = $Matches[1]
 ```
 工作区（可写）        D:\zcode-glm5.3f
 插件源码              D:\zcode-glm5.3f\dsh-plugin-zcode-bridge
-壳源码                D:\DSH-WEB\ZCode-official
+壳源码                <DSH_HOME>-WEB\ZCode-official
 壳数据目录            D:\zcode-glm5.3f\_oss_data
 壳日志                D:\zcode-glm5.3f\_oss_data\.zcode\v2\logs\<日期>.log
-插件禁用配置          C:\Users\Administrator\.zcode\cli\config.json
+插件禁用配置          <HOME>\.zcode\cli\config.json
 发布仓库（GitHub）    D:\dsh-free-glm
-Jet Hub 上游          D:\DSH-WEB\Jet-Hub-upstream
+Jet Hub 上游          <DSH_HOME>-WEB\Jet-Hub-upstream
 ```
 
 ### 常用命令
@@ -303,7 +303,7 @@ pwsh -File D:\zcode-glm5.3f\scripts\start-headless.ps1 -NoAutostart
 pwsh -File D:\zcode-glm5.3f\scripts\start-headless.ps1 -Stop
 
 # 改壳源码后重建（tsup）
-cd D:\DSH-WEB\ZCode-official\packages\desktop
+cd <DSH_HOME>-WEB\ZCode-official\packages\desktop
 npx tsup --config tsup.config.ts
 
 # 改插件后构建 + 装

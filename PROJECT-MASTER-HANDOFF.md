@@ -57,7 +57,7 @@ D:\zcode-glm5.3f                     工作区（可写）
 ├── PROJECT-HANDOFF.md                上一版交接
 └── PROJECT-MASTER-HANDOFF.md         ← 本文件
 
-D:\DSH-WEB\ZCode-official             开源版源码（已含全部改动）
+<DSH_HOME>-WEB\ZCode-official             开源版源码（已含全部改动）
 ├── packages\desktop\src\host\
 │   ├── zcodeBridgeServer.ts          ★ 桥的实现
 │   └── index.ts                      ★ 桥的构造与接线
@@ -116,7 +116,7 @@ Invoke-RestMethod -Method Post -Uri "http://127.0.0.1:$($b.port)/v1/chat/complet
 ### 2.3 改壳源码后
 
 ```powershell
-cd D:\DSH-WEB\ZCode-official\packages\desktop
+cd <DSH_HOME>-WEB\ZCode-official\packages\desktop
 npx tsup --config tsup.config.ts          # 约 1 秒
 pwsh -File D:\zcode-glm5.3f\scripts\start-headless.ps1 -NoAutostart
 ```
@@ -534,7 +534,7 @@ kSa → a.generateText(R)    ← AI SDK 的 generateText（且先 appendEvent）
 ```
 
 **若能让 `generateText` 走 `streamText`，可能成功。** 但那需要改 agent 内部实现
-（`D:\DSH-WEB\ZCode-official\apps\zcode-cli\packages\...`），工作量大且不确定。
+（`<DSH_HOME>-WEB\ZCode-official\apps\zcode-cli\packages\...`），工作量大且不确定。
 
 ### 11.2 产品决策方向
 
